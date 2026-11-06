@@ -437,7 +437,7 @@ A fixed binary layout (big-endian, version 1), 262 bytes plus the caller:
 | 245 to 253 | `issued_at`; 253 to 261 `expires_at` (Unix seconds) |
 | 261 | the caller's length `n` (1 to 64), then the caller's bytes |
 
-The envelope digest is `keccak256("cancho-chain/envelope/v1" \|\| layout)`; the **issuer signs that digest** with secp256k1 (`r \|\| s \|\| recid`, low s, RFC 6979), and the signer recovers the issuer's address from it and compares with the one it was configured with.
+The envelope digest is `keccak256("cancho-chain/envelope/v1" || layout)`; the **issuer signs that digest** with secp256k1 (`r || s || recid`, low s, RFC 6979), and the signer recovers the issuer's address from it and compares with the one it was configured with.
 **[choice]** An issuer signature, and not a MAC under a secret both sides hold: the signer then holds no secret that can *make* an envelope, so a compromised signer cannot authorise anything for itself, and a compromised policy service cannot sign (it has no wallet key).
 The two keys must differ; the signer refuses to start if they do not (a later slice).
 
@@ -459,7 +459,7 @@ and `validate_unsigned` passes on the message. The envelope expires when the **d
 5. `keccak256(message)` is the envelope's transaction digest (`TRANSACTION_DIGEST_MISMATCH`);
 6. `validate_unsigned` against the envelope's expectation (`TRANSACTION_INVALID`, with `txcheck`'s code as the detail).
 
-Single use is **state**, kept by the signer, and is not part of `verify`: a **ledger** of `envelope id \|\| transaction digest` (64 bytes per entry). `ledger_check(ledger, id, digest)` answers *fresh*, *same* or *conflict*.
+Single use is **state**, kept by the signer, and is not part of `verify`: a **ledger** of `envelope id || transaction digest` (64 bytes per entry). `ledger_check(ledger, id, digest)` answers *fresh*, *same* or *conflict*.
 **[choice]** The entry is written and flushed **before** the signature is produced. A crash between the two loses a signature, never lets a second one out. An envelope seen again **with the same transaction digest** is signed again, and gets the same bytes (RFC 6979 is deterministic): a retry after a timeout cannot pay twice, because it is the same
 transaction with the same nonce, and refusing it would leave the caller unable to recover the signature. An envelope id seen with a **different** digest is `AUTHORIZATION_REPLAYED`.
 
