@@ -1,5 +1,7 @@
 # cancho-chain
 
+**[Project page](https://alpibrusl.github.io/cancho-chain/)** (once GitHub Pages is enabled for the `main` branch, `/docs` folder; the source is [`docs/index.html`](docs/index.html)).
+
 An auditable authority and execution layer for autonomous blockchain agents, in pure [cancho](https://github.com/alpibrusl/cancho).
 
 An agent may *propose* a transaction. A separately enforced policy decides whether it is allowed. A signer, in its own process, signs only the exact

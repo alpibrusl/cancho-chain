@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <rect width="1200" height="630" fill="#ffffff"/>
+  <g transform="translate(70 95) scale(7)">
+    <rect x="2" y="2" width="60" height="60" rx="14" fill="#2B5F8F"/>
+    <path d="M16 46 Q14 36 24 34 H44 Q52 36 48 46 Z" fill="#CFC8B8"/>
+    <path d="M20 33 Q18 24 26 22 H40 Q48 24 44 33 Z" fill="#DAD3C3"/>
+    <path d="M27 20 V15 A5 5 0 0 1 37 15 V20" fill="none" stroke="#0D1728" stroke-width="3" stroke-linecap="round"/>
+    <rect x="24" y="19" width="16" height="13" rx="3" fill="#0D1728"/>
+    <circle cx="32" cy="24.5" r="2.2" fill="#E6E0D2"/>
+    <rect x="31" y="25" width="2" height="4.5" rx="1" fill="#E6E0D2"/>
+    <path d="M12 48 H52" stroke="#0D1728" stroke-width="5" stroke-linecap="round"/>
+  </g>
+  <text x="560" y="250" font-family="Helvetica, Arial, sans-serif" font-weight="800" font-size="84" fill="#0D1728" letter-spacing="-2">cancho-chain</text>
+  <text x="564" y="325" font-family="Helvetica, Arial, sans-serif" font-weight="600" font-size="30" fill="#2B5F8F">An agent can propose a payment.</text>
+  <text x="564" y="372" font-family="Helvetica, Arial, sans-serif" font-weight="600" font-size="30" fill="#2B5F8F">It cannot authorise one.</text>
+  <text x="564" y="440" font-family="Helvetica, Arial, sans-serif" font-weight="500" font-size="22" fill="#5b6573">Research. A bounded authority layer, in pure cancho.</text>
+</svg>
