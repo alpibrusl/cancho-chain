@@ -12,6 +12,10 @@ edition 7;
 //   T <chain> <nonce> <prio> <fee> <gas> <to20> <value> <data> [<key32>]
 //                                 type-2 transaction (integers are big-endian hex, `_` is empty)
 //                                                                               -> "0 <unsigned> <signing hash>" and, with a key, " <signed> <tx hash>"
+//   D <hex>                       strict RLP decode: is the input exactly one canonical item?             -> "0" or a refusal
+//   V <raw> <chain> <nonce> <token> <recipient> <amount> <feecap> <gascap>
+//                                 validate an unsigned message against what was authorised (integers big-endian hex) -> "0" or the first refusal
+//   W ...                         the same for a signed transaction
 //   M <body> <sig65>              signed message of a body and a signature (the encoder alone, with any signature the caller crafts) -> "0 <hex>"
 //
 // A refusal prints `E<code>` (the code, positive). Every field is hex except the text of `P`.
@@ -22,6 +26,7 @@ import chain.hex;
 import chain.keccak;
 import chain.rlp;
 import chain.tx1559;
+import chain.txcheck;
 import secp256k1;
 import std.buffer;
 import std.io;
@@ -118,6 +123,13 @@ fn int_of_bytes[&b](b: &b [byte]) -> [] int {
     return v;
 }
 
+fn if_signed_validate[&d, &t, &r, &a, &c](signed: bool, raw: &d [byte], chain_id: int, nonce: int, token: &t [byte], recipient: &r [byte], amount: &a [byte], fee_cap: &c [byte], gas_cap: int) -> [] int {
+    if signed {
+        return txcheck.validate_signed(raw, chain_id, nonce, token, recipient, amount, fee_cap, gas_cap);
+    }
+    return txcheck.validate_unsigned(raw, chain_id, nonce, token, recipient, amount, fee_cap, gas_cap);
+}
+
 // Runs the op. Answers the text length written to `out`, or a negative refusal.
 fn run[&a, &m, &s, &w, &c, &o](op: int, nf: int, arena: &a [byte], meta: &m [int], st: &!s [int], work: &!w [int], scratch: &!c [byte], out: &!o [byte]) -> [] int {
     let f1 = field(arena, meta, 1);
@@ -193,6 +205,20 @@ fn run[&a, &m, &s, &w, &c, &o](op: int, nf: int, arena: &a [byte], meta: &m [int
             return rc;
         }
         return emit_hex(out, p, scratch[0..68]);
+    }
+    if op == 'D' {
+        let rc = rlp.whole(f1, st[0..3]);
+        if rc != 0 {
+            return rc;
+        }
+        return p;
+    }
+    if op == 'V' || op == 'W' {
+        let rc = if_signed_validate(op == 'W', f1, int_of_bytes(f2), int_of_bytes(field(arena, meta, 3)), field(arena, meta, 4), field(arena, meta, 5), field(arena, meta, 6), field(arena, meta, 7), int_of_bytes(field(arena, meta, 8)));
+        if rc != 0 {
+            return rc;
+        }
+        return p;
     }
     if op == 'M' {
         let sm = tx1559.signed_message(scratch[2100..2900], f1, f2);

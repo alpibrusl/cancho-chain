@@ -188,7 +188,80 @@ at its head. `CANCHO=<compiler> CANCHO_PACKAGES=<cancho>/packages python3 -I scr
 **Not claimed.** No decoder, so nothing here yet checks *a transaction someone else built*; that is the final-transaction validator, the next slice. The intent, the policy and the signer
 as a separate process are not built. `secp256k1` is from an unmerged PR (§8.1).
 
-## 9. Open questions for the maintainer
+## 9. The decoder and the final-transaction validator (slice 3)
+
+**Status: built.** Results are in §9.3. The signer must never sign bytes it has not read. The policy engine approves an *intent*; the builder turns it into bytes; this
+module reads those bytes back, with a decoder that shares no code with the encoder, and refuses unless every field is what was authorised (§5: "validate the final serialized
+transaction, not the intent that was meant to produce it").
+
+### 9.1 The decoder (`chain.rlp.item`)
+
+`item(data, pos, end, meta)` reads one item at `pos` within `[pos, end)` and puts its kind (0 string, 1 list), payload start and payload end in `meta[0..3]`; it answers the position
+after the item, or a refusal. **[choice]** It is *strict*: the encoding of a value is unique, so any other is refused, because a transaction whose bytes differ from the canonical ones
+for the same fields hashes differently and could be used to smuggle a second reading past a validator:
+- `rlp-truncated` (-152): the item or its length runs past `end`;
+- `rlp-noncanonical` (-153): a one-byte string below 0x80 written with a header, a long form for a length under 56, a length with a leading zero byte;
+- `rlp-oversized` (-154): a length of more than seven bytes (more than 2^56, which no transaction reaches). Lengths are compared as `len > end - start`, never added, so nothing overflows.
+`rlp.whole(data)` is `item` over all of `data` and answers 0 only when exactly one item fills it (trailing bytes are `rlp-trailing`, -155).
+
+### 9.2 The validator (`chain.txcheck`)
+
+`validate_unsigned(raw, ...)` for the message about to be hashed and signed, and `validate_signed(raw, ...)` for the bytes about to be submitted. The expectation is what the policy authorised:
+chain id, nonce, the token contract, the recipient, the amount (big-endian), a fee cap (max fee per gas, big-endian) and a gas cap. It reads `raw` as `02 || list` of exactly nine fields (twelve
+when signed) and checks, in this order, answering the **first** that fails with a stable code:
+
+| code | tag | when |
+|---|---|---|
+| -180 | `tx-format` | not one canonical list of nine (twelve) items, trailing bytes, a string where a list belongs or the reverse, an integer with a leading zero, an integer wider than its field allows |
+| -181 | `tx-type` | the first byte is not 0x02 |
+| -182 | `tx-chain-id-mismatch` | chain id differs |
+| -183 | `tx-nonce-mismatch` | nonce differs |
+| -184 | `tx-to-mismatch` | `to` is not the token contract (a contract creation, an empty `to`, is this too) |
+| -185 | `tx-value-not-zero` | an ERC-20 transfer sends no native value |
+| -186 | `tx-data-length` | the calldata is not 68 bytes |
+| -187 | `tx-selector` | the first four bytes are not `a9059cbb` |
+| -188 | `tx-recipient-padding` | the 12 bytes before the recipient are not zero |
+| -189 | `tx-recipient-mismatch` | the recipient differs |
+| -190 | `tx-amount-mismatch` | the amount differs |
+| -191 | `tx-access-list` | the access list is not empty |
+| -192 | `tx-fee-cap` | max fee per gas is above the cap |
+| -193 | `tx-gas-cap` | gas limit is above the cap |
+| -194 | `tx-fee-order` | max priority fee is above max fee |
+| -195 | `tx-signature` | (signed) y parity above 1, or r or s zero or wider than 32 bytes |
+
+**[choice]** It does not verify the signature (that is `secp256k1.recover` and a comparison with the signer's address, at the gateway), and it does not judge whether the fee is *sensible*, only
+whether it is within what the policy allowed. The codes are the proposal's `CHAIN_ID_MISMATCH` and `TRANSACTION_DIGEST_MISMATCH` family in the stable kebab form of §5.
+
+### 9.3 How it is checked
+
+`scripts/check_decode.py` against `rlp` (strict mode) and `eth-account`, with the same `--mutants` discipline as the encoders: (1) **accept/reject agreement** with `rlp.decode(strict=True)` on
+random byte strings, on every one-byte mutation of valid encodings and on the length-boundary encodings; (2) every valid transaction the encoders make validates, unsigned and signed; (3) for each of the
+sixteen codes, a transaction tampered in exactly that field is refused with exactly that code; (4) malformed encodings are refused as `tx-format`.
+
+**[measured]** 2026-11-06, Linux x86-64, the self-hosted `cancho` at `162633a7`, `rlp` and `eth-account` from pip, `secp256k1` from alpibrusl/cancho#710 at its head.
+`CANCHO=<compiler> CANCHO_PACKAGES=<cancho>/packages python3 -I scripts/check_decode.py --cases 30`: **1,423 of 1,423** checks agree.
+- **Decoder against `rlp.decode(strict=True)`:** 30 random nested encodings (each valid), and for each a truncation, an appended byte, a duplicated first byte, a replaced byte, a deleted byte and
+  an inserted byte; 60 random byte strings; 36 length-boundary encodings (every long-form edge: 55, 56 and 57 bytes, the two-byte and three-byte lengths, leading zero length bytes, eight-byte lengths).
+  Accept/reject agree on every one. 20 more cases check the *reason* (`rlp-truncated`, `rlp-noncanonical`, `rlp-oversized`, `rlp-trailing`), which `rlp` cannot give.
+- **Validator:** 30 random ERC-20 transfers (chain id, nonce, fees, gas, token, recipient, amounts of 0 to 256 bits) validate unsigned and signed (signed by `eth-account`), and also as built and signed
+  by our own encoder and signer; an amount in the expectation padded to 32 bytes with zeros is the same number; 13 single-field tamperings, each as unsigned and as signed, are refused with exactly
+  the code of that field (chain id, nonce, `to`, a contract creation, value, calldata one byte short and one long, selector, padding, recipient, amount low and high byte, access list); fee and gas above their caps,
+  priority above max fee, and two faults at once answering the first in the table. Also: fee and gas *equal* to their caps (accepted), a token whose first byte is zero (and a 19-byte `to` equal to it
+  without that byte, refused), padding nonzero at its first and last byte, a recipient differing at its first and last byte, chain id, nonce and gas at 2^63 + 5 and of nine bytes, nine signature-field cases
+  (y parity 2 and 255, r or s zero, 33 bytes, a leading zero, a list), 23 malformed encodings (empty, type 1, 3 and 0x7f, a legacy list, truncated, trailing byte, 8, 10, 13 and 20 items, signed given for unsigned
+  and the reverse, `to`/data/chain id as a list, the access list as a string, leading-zero integers, a 33-byte value, a lying header, an outer string holding the items), and a malformed expectation.
+- `--mutants`: 51 deliberate faults (every threshold and base of the decoder, its canonical-form checks, its truncation arithmetic and its trailing-byte check; and, in the validator, the type byte, the
+  list and item-count checks, each width, each of the field-shape checks, the 2^63 edges, every comparison, each selector and padding byte, the cap comparators, the fee order, each signature check, the
+  leading-zero handling of the comparison and the expectation's sizes): **50 killed, 1 equivalent** (a bound that only keeps the field table in range; the item count is compared after, so the same code answers).
+  Reaching that took three runs: a first run killed 39 of 51 and showed that several faults change only the *reason* (so agreement with `rlp` cannot see them), that the harness counted a trap as a
+  plain refusal, and that some inputs were missing (a token starting with a zero byte, `fee == cap`, padding at its first and last byte, an outer string, a long-form length of exactly 55); two mutants
+  did not build and were rewritten.
+
+**Not claimed.** The signature is not verified (that is `secp256k1.recover` and a comparison with the signer's address, at the gateway, next to the single-use authorization). The validator is for one
+shape of transaction, an ERC-20 `transfer` in EIP-1559 form; other shapes (native transfers, approvals, arbitrary calls) are refused as `tx-data-length` or `tx-selector`, not understood. It does not judge
+whether the fee is *sensible*, only that it is within what was authorised.
+
+## 10. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
 2. May `cancho-chain` depend on `cancho-schema` (a package dependency) or is vendoring preferred? How do sibling repos consume each other (`cancho.toml` has no

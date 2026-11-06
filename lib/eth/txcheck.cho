@@ -1,0 +1,354 @@
+edition 7;
+
+module chain.txcheck;
+
+import chain.rlp;
+
+// The final-transaction validator (docs/design.md section 9.2): reads the exact bytes of an EIP-1559 ERC-20 transfer with `chain.rlp`'s strict decoder, which shares no
+// code with the encoder, and refuses unless every field is what was authorised. The first check that fails answers; the codes are stable.
+
+pub fn refused_format() -> [] int {
+    return -180;
+}
+
+pub fn refused_type() -> [] int {
+    return -181;
+}
+
+pub fn refused_chain_id() -> [] int {
+    return -182;
+}
+
+pub fn refused_nonce() -> [] int {
+    return -183;
+}
+
+pub fn refused_to() -> [] int {
+    return -184;
+}
+
+pub fn refused_value() -> [] int {
+    return -185;
+}
+
+pub fn refused_data_length() -> [] int {
+    return -186;
+}
+
+pub fn refused_selector() -> [] int {
+    return -187;
+}
+
+pub fn refused_recipient_padding() -> [] int {
+    return -188;
+}
+
+pub fn refused_recipient() -> [] int {
+    return -189;
+}
+
+pub fn refused_amount() -> [] int {
+    return -190;
+}
+
+pub fn refused_access_list() -> [] int {
+    return -191;
+}
+
+pub fn refused_fee_cap() -> [] int {
+    return -192;
+}
+
+pub fn refused_gas_cap() -> [] int {
+    return -193;
+}
+
+pub fn refused_fee_order() -> [] int {
+    return -194;
+}
+
+pub fn refused_signature() -> [] int {
+    return -195;
+}
+
+// the expectation itself is malformed (a token or recipient that is not 20 bytes, a negative number): the caller's fault, not the transaction's
+pub fn refused_expectation() -> [] int {
+    return -196;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -180 {
+        return "tx-format";
+    }
+    if code == -181 {
+        return "tx-type";
+    }
+    if code == -182 {
+        return "tx-chain-id-mismatch";
+    }
+    if code == -183 {
+        return "tx-nonce-mismatch";
+    }
+    if code == -184 {
+        return "tx-to-mismatch";
+    }
+    if code == -185 {
+        return "tx-value-not-zero";
+    }
+    if code == -186 {
+        return "tx-data-length";
+    }
+    if code == -187 {
+        return "tx-selector";
+    }
+    if code == -188 {
+        return "tx-recipient-padding";
+    }
+    if code == -189 {
+        return "tx-recipient-mismatch";
+    }
+    if code == -190 {
+        return "tx-amount-mismatch";
+    }
+    if code == -191 {
+        return "tx-access-list";
+    }
+    if code == -192 {
+        return "tx-fee-cap";
+    }
+    if code == -193 {
+        return "tx-gas-cap";
+    }
+    if code == -194 {
+        return "tx-fee-order";
+    }
+    if code == -195 {
+        return "tx-signature";
+    }
+    if code == -196 {
+        return "tx-expectation";
+    }
+    return "tx-unknown";
+}
+
+// -1, 0 or 1: the unsigned big-endian number `a` against `b`, leading zeros ignored. Public values.
+fn cmp_uint[&a, &b](a: &a [byte], b: &b [byte]) -> [] int {
+    var i = 0;
+    while i < len(a) && int_of(a[i]) == 0 {
+        i = i + 1;
+    }
+    var j = 0;
+    while j < len(b) && int_of(b[j]) == 0 {
+        j = j + 1;
+    }
+    let la = len(a) - i;
+    let lb = len(b) - j;
+    if la < lb {
+        return -1;
+    }
+    if la > lb {
+        return 1;
+    }
+    var k = 0;
+    while k < la {
+        let x = int_of(a[i + k]);
+        let y = int_of(b[j + k]);
+        if x < y {
+            return -1;
+        }
+        if x > y {
+            return 1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// The field is a canonical unsigned integer of at most `max` bytes: a string, with no leading zero byte (zero is the empty string).
+fn is_uint[&d, &f](raw: &d [byte], f: &f [int], k: int, max: int) -> [] bool {
+    if f[3 * k] != 0 {
+        return false;
+    }
+    let n = f[3 * k + 2] - f[3 * k + 1];
+    if n > max {
+        return false;
+    }
+    if n > 0 && int_of(raw[f[3 * k + 1]]) == 0 {
+        return false;
+    }
+    return true;
+}
+
+// The bytes of field `k`'s payload.
+fn payload[&d, &f](raw: &d [byte], f: &f [int], k: int) -> [] &d [byte] {
+    return raw[f[3 * k + 1]..f[3 * k + 2]];
+}
+
+// The field (an integer of at most 8 bytes, canonical) equals `v`, which is not negative.
+fn equals_int[&d, &f](raw: &d [byte], f: &f [int], k: int, v: int) -> [] bool {
+    let p = payload(raw, f, k);
+    if len(p) == 8 && int_of(p[0]) >= 128 {
+        return false;
+    }
+    var x = 0;
+    var i = 0;
+    while i < len(p) {
+        x = x * 256 + int_of(p[i]);
+        i = i + 1;
+    }
+    return x == v;
+}
+
+// The field (an integer of at most 8 bytes, canonical) is above `v`, which is not negative.
+fn above_int[&d, &f](raw: &d [byte], f: &f [int], k: int, v: int) -> [] bool {
+    let p = payload(raw, f, k);
+    if len(p) == 8 && int_of(p[0]) >= 128 {
+        return true;
+    }
+    var x = 0;
+    var i = 0;
+    while i < len(p) {
+        x = x * 256 + int_of(p[i]);
+        i = i + 1;
+    }
+    return x > v;
+}
+
+// Splits `raw` (02 || list) into its items: field k's kind, payload start and payload end go to f[3k], f[3k + 1], f[3k + 2]. Answers the number of items, or -180 / -181.
+fn parse[&d, &f, &m](raw: &d [byte], f: &!f [int], m: &!m [int]) -> [] int {
+    if len(raw) < 2 {
+        return -180;
+    }
+    if int_of(raw[0]) != 2 {
+        return -181;
+    }
+    let next = rlp.item(raw, 1, len(raw), m);
+    if next < 0 || m[0] != 1 || next != len(raw) {
+        return -180;
+    }
+    let end = m[2];
+    var pos = m[1];
+    var count = 0;
+    while pos < end {
+        if count >= 12 {
+            return -180;
+        }
+        let after = rlp.item(raw, pos, end, m);
+        if after < 0 {
+            return -180;
+        }
+        f[3 * count] = m[0];
+        f[3 * count + 1] = m[1];
+        f[3 * count + 2] = m[2];
+        count = count + 1;
+        pos = after;
+    }
+    return count;
+}
+
+// The checks, in the order of the table in docs/design.md section 9.2. `signed` says the signature items are expected.
+fn check[&d, &f, &t, &r, &a, &c](raw: &d [byte], f: &f [int], signed: bool, chain_id: int, nonce: int, token: &t [byte], recipient: &r [byte], amount: &a [byte], fee_cap: &c [byte], gas_cap: int) -> [] int {
+    // the shape of every field
+    if !is_uint(raw, f, 0, 8) || !is_uint(raw, f, 1, 8) || !is_uint(raw, f, 2, 32) || !is_uint(raw, f, 3, 32) || !is_uint(raw, f, 4, 8) || !is_uint(raw, f, 6, 32) {
+        return -180;
+    }
+    if f[15] != 0 || f[21] != 0 || f[24] != 1 {
+        return -180;
+    }
+    if equals_int(raw, f, 0, chain_id) == false {
+        return -182;
+    }
+    if equals_int(raw, f, 1, nonce) == false {
+        return -183;
+    }
+    let to = payload(raw, f, 5);
+    if cmp_uint(to, token) != 0 || len(to) != 20 {
+        return -184;
+    }
+    if len(payload(raw, f, 6)) != 0 {
+        return -185;
+    }
+    let data = payload(raw, f, 7);
+    if len(data) != 68 {
+        return -186;
+    }
+    if int_of(data[0]) != 0xa9 || int_of(data[1]) != 0x05 || int_of(data[2]) != 0x9c || int_of(data[3]) != 0xbb {
+        return -187;
+    }
+    var i = 4;
+    while i < 16 {
+        if int_of(data[i]) != 0 {
+            return -188;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < 20 {
+        if int_of(data[16 + i]) != int_of(recipient[i]) {
+            return -189;
+        }
+        i = i + 1;
+    }
+    if cmp_uint(data[36..68], amount) != 0 {
+        return -190;
+    }
+    if f[3 * 8 + 2] != f[3 * 8 + 1] {
+        return -191;
+    }
+    if cmp_uint(payload(raw, f, 3), fee_cap) > 0 {
+        return -192;
+    }
+    if above_int(raw, f, 4, gas_cap) {
+        return -193;
+    }
+    if cmp_uint(payload(raw, f, 2), payload(raw, f, 3)) > 0 {
+        return -194;
+    }
+    if signed {
+        // y parity 0 or 1; r and s canonical, non-zero, at most 32 bytes
+        if !is_uint(raw, f, 9, 1) || !is_uint(raw, f, 10, 32) || !is_uint(raw, f, 11, 32) {
+            return -195;
+        }
+        if len(payload(raw, f, 10)) == 0 || len(payload(raw, f, 11)) == 0 {
+            return -195;
+        }
+        if len(payload(raw, f, 9)) == 1 && int_of(payload(raw, f, 9)[0]) > 1 {
+            return -195;
+        }
+    }
+    return 0;
+}
+
+fn run[&d, &t, &r, &a, &c](raw: &d [byte], signed: bool, chain_id: int, nonce: int, token: &t [byte], recipient: &r [byte], amount: &a [byte], fee_cap: &c [byte], gas_cap: int) -> [] int {
+    if len(token) != 20 || len(recipient) != 20 || len(amount) > 32 || len(fee_cap) > 32 || chain_id < 0 || nonce < 0 || gas_cap < 0 {
+        return -196;
+    }
+    var code = 0;
+    region g {
+        let f = alloc_slice[g](48, 0);
+        let m = alloc_slice[g](3, 0);
+        var want = 9;
+        if signed {
+            want = 12;
+        }
+        let n = parse(raw, f, m);
+        if n < 0 {
+            code = n;
+        } else if n != want {
+            code = -180;
+        } else {
+            code = check(raw, f, signed, chain_id, nonce, token, recipient, amount, fee_cap, gas_cap);
+        }
+    }
+    return code;
+}
+
+// The message about to be hashed and signed, `02 || list(nine fields)`, against what was authorised. 0, or the first refusal.
+pub fn validate_unsigned[&d, &t, &r, &a, &c](raw: &d [byte], chain_id: int, nonce: int, token: &t [byte], recipient: &r [byte], amount: &a [byte], fee_cap: &c [byte], gas_cap: int) -> [] int {
+    return run(raw, false, chain_id, nonce, token, recipient, amount, fee_cap, gas_cap);
+}
+
+// The bytes about to be submitted, `02 || list(twelve fields)`, against what was authorised. 0, or the first refusal. The signature is not verified here.
+pub fn validate_signed[&d, &t, &r, &a, &c](raw: &d [byte], chain_id: int, nonce: int, token: &t [byte], recipient: &r [byte], amount: &a [byte], fee_cap: &c [byte], gas_cap: int) -> [] int {
+    return run(raw, true, chain_id, nonce, token, recipient, amount, fee_cap, gas_cap);
+}

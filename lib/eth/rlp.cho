@@ -3,7 +3,7 @@ edition 7;
 module chain.rlp;
 
 // RLP encoding (docs/design.md section 8.1), over a caller-provided output slice and a position. Every function returns the new position, or a negative
-// refusal. There is no decoder yet.
+// refusal. `item` and `whole` decode, strictly (docs/design.md section 9.1).
 //
 // A string of one byte below 0x80 is itself; any other string is a header (0x80 + length, or 0xb7 + the length of the length and the length) and the bytes. A list is
 // 0xc0 + payload length, or 0xf7 + the length of the length and the length, then the payload. An integer is the minimal big-endian string, and zero is the empty string.
@@ -18,7 +18,39 @@ pub fn refused_value() -> [] int {
     return -151;
 }
 
+// the item or its length runs past the end of the data
+pub fn refused_truncated() -> [] int {
+    return -152;
+}
+
+// an encoding that is not the unique one for its value
+pub fn refused_noncanonical() -> [] int {
+    return -153;
+}
+
+// a length of more than seven bytes
+pub fn refused_oversized() -> [] int {
+    return -154;
+}
+
+// bytes after the one item that was expected
+pub fn refused_trailing() -> [] int {
+    return -155;
+}
+
 pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -152 {
+        return "rlp-truncated";
+    }
+    if code == -153 {
+        return "rlp-noncanonical";
+    }
+    if code == -154 {
+        return "rlp-oversized";
+    }
+    if code == -155 {
+        return "rlp-trailing";
+    }
     if code == -150 {
         return "rlp-overflow";
     }
@@ -109,4 +141,96 @@ pub fn put_int[&o](out: &!o [byte], pos: int, v: int) -> [] int {
         i = i - 1;
     }
     return p;
+}
+
+// ---- Decoding (docs/design.md section 9.1) ----
+
+// Reads the item at `pos` within `data[pos..end]`. Puts its kind (0 string, 1 list), the start of its payload and the end of its payload in `meta[0]`, `meta[1]` and `meta[2]`,
+// and answers the position after it, or a refusal. Strict: any encoding that is not the unique one for its value is refused, and no length is added to a position before it is
+// known to fit (`len > end - start`), so nothing overflows. `meta` is zeroed on a refusal.
+pub fn item[&d, &m](data: &d [byte], pos: int, end: int, meta: &!m [int]) -> [] int {
+    if len(meta) < 3 || pos < 0 || end > len(data) {
+        return -151;
+    }
+    meta[0] = 0;
+    meta[1] = 0;
+    meta[2] = 0;
+    if pos >= end {
+        return -152;
+    }
+    let b = int_of(data[pos]);
+    var kind = 0;
+    var start = 0;
+    var n = 0;
+    var code = 0;
+    if b < 128 {
+        meta[0] = 0;
+        meta[1] = pos;
+        meta[2] = pos + 1;
+        return pos + 1;
+    }
+    if b < 184 || b >= 192 && b < 248 {
+        // short form: the length is in the first byte
+        if b < 184 {
+            kind = 0;
+            n = b - 128;
+        } else {
+            kind = 1;
+            n = b - 192;
+        }
+        start = pos + 1;
+    } else {
+        // long form: the first byte says how many bytes of length follow
+        var base = 183;
+        kind = 0;
+        if b >= 248 {
+            base = 247;
+            kind = 1;
+        }
+        let w = b - base;
+        if w > 7 {
+            return -154;
+        }
+        if pos + 1 + w > end {
+            return -152;
+        }
+        if int_of(data[pos + 1]) == 0 {
+            return -153;
+        }
+        var i = 0;
+        while i < w {
+            n = n * 256 + int_of(data[pos + 1 + i]);
+            i = i + 1;
+        }
+        if n < 56 {
+            return -153;
+        }
+        start = pos + 1 + w;
+    }
+    if n > end - start {
+        return -152;
+    }
+    if kind == 0 && n == 1 && int_of(data[start]) < 128 && b < 184 {
+        // one byte below 0x80 must be written as itself
+        code = -153;
+    }
+    if code != 0 {
+        return code;
+    }
+    meta[0] = kind;
+    meta[1] = start;
+    meta[2] = start + n;
+    return start + n;
+}
+
+// Reads exactly one item that fills `data`. Answers 0, or a refusal (`rlp-trailing` when bytes are left over); `meta` as `item` leaves it.
+pub fn whole[&d, &m](data: &d [byte], meta: &!m [int]) -> [] int {
+    let next = item(data, 0, len(data), meta);
+    if next < 0 {
+        return next;
+    }
+    if next != len(data) {
+        return -155;
+    }
+    return 0;
 }

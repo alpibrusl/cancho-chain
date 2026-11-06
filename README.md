@@ -11,6 +11,7 @@ bytes that were approved. Every step leaves evidence. The agent never holds a ke
 |---|---|---|
 | `chain.keccak`, Keccak-256 (Ethereum's padding, not SHA-3's) | built | `scripts/check_keccak.py`: 425 inputs against pycryptodome, 12 of 12 mutants killed |
 | `chain.hex`, `chain.address` (EIP-55), `chain.rlp`, `chain.erc20`, `chain.tx1559` (encoders and the signed type-2 transaction) | built | `scripts/check_eth.py`: 531 checks against eth-account, eth-abi and rlp (signed transactions byte for byte), 29 of 29 mutants killed |
+| `chain.rlp` decoder (strict), `chain.txcheck` (the final-transaction validator, 16 stable reason codes) | built | `scripts/check_decode.py`: 1,423 checks against rlp (strict) and eth-account, 50 of 51 mutants killed (1 equivalent) |
 | everything else in [`docs/design.md`](docs/design.md) | designed, not built | -- |
 
 ```
@@ -19,6 +20,7 @@ cancho build --bin chain && printf abc | build/chain
 4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45
 CHAIN=build/chain python3 -I scripts/check_keccak.py [--mutants]     # --mutants needs CANCHO=the compiler
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages python3 -I scripts/check_eth.py [--mutants]   # needs pip install eth-account coincurve
+CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages python3 -I scripts/check_decode.py [--mutants]
 ```
 
 [`docs/design.md`](docs/design.md) holds the feasibility findings against the actual cancho tree (what exists, what is missing), the trust boundaries, the
