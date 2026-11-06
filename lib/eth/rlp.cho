@@ -1,0 +1,236 @@
+edition 7;
+
+module chain.rlp;
+
+// RLP encoding (docs/design.md section 8.1), over a caller-provided output slice and a position. Every function returns the new position, or a negative
+// refusal. `item` and `whole` decode, strictly (docs/design.md section 9.1).
+//
+// A string of one byte below 0x80 is itself; any other string is a header (0x80 + length, or 0xb7 + the length of the length and the length) and the bytes. A list is
+// 0xc0 + payload length, or 0xf7 + the length of the length and the length, then the payload. An integer is the minimal big-endian string, and zero is the empty string.
+
+// the output slice is too small
+pub fn refused_overflow() -> [] int {
+    return -150;
+}
+
+// a negative integer, or a length too large to encode
+pub fn refused_value() -> [] int {
+    return -151;
+}
+
+// the item or its length runs past the end of the data
+pub fn refused_truncated() -> [] int {
+    return -152;
+}
+
+// an encoding that is not the unique one for its value
+pub fn refused_noncanonical() -> [] int {
+    return -153;
+}
+
+// a length of more than seven bytes
+pub fn refused_oversized() -> [] int {
+    return -154;
+}
+
+// bytes after the one item that was expected
+pub fn refused_trailing() -> [] int {
+    return -155;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -152 {
+        return "rlp-truncated";
+    }
+    if code == -153 {
+        return "rlp-noncanonical";
+    }
+    if code == -154 {
+        return "rlp-oversized";
+    }
+    if code == -155 {
+        return "rlp-trailing";
+    }
+    if code == -150 {
+        return "rlp-overflow";
+    }
+    if code == -151 {
+        return "rlp-value";
+    }
+    return "rlp-unknown";
+}
+
+fn put[&o](out: &!o [byte], pos: int, v: int) -> [] int {
+    if pos < 0 || pos >= len(out) {
+        return -150;
+    }
+    out[pos] = byte_of(v);
+    return pos + 1;
+}
+
+// How many bytes the big-endian form of `n` (0 <= n < 2^56) takes.
+fn width(n: int) -> [] int {
+    var w = 0;
+    var m = n;
+    while m > 0 {
+        w = w + 1;
+        m = m >> 8;
+    }
+    return w;
+}
+
+// The header for a string (`base` 0x80) or a list (`base` 0xc0) of `n` bytes.
+fn put_header[&o](out: &!o [byte], pos: int, base: int, n: int) -> [] int {
+    if n < 0 || n >= 72057594037927936 {
+        return -151;
+    }
+    if n < 56 {
+        return put(out, pos, base + n);
+    }
+    let w = width(n);
+    var p = put(out, pos, base + 55 + w);
+    var i = w - 1;
+    while i >= 0 && p >= 0 {
+        p = put(out, p, n >> 8 * i & 255);
+        i = i - 1;
+    }
+    return p;
+}
+
+// The header of a list whose payload is `payload_len` bytes.
+pub fn put_list_header[&o](out: &!o [byte], pos: int, payload_len: int) -> [] int {
+    return put_header(out, pos, 192, payload_len);
+}
+
+// The string `data`.
+pub fn put_bytes[&o, &d](out: &!o [byte], pos: int, data: &d [byte]) -> [] int {
+    if len(data) == 1 && int_of(data[0]) < 128 {
+        return put(out, pos, int_of(data[0]));
+    }
+    var p = put_header(out, pos, 128, len(data));
+    var i = 0;
+    while i < len(data) && p >= 0 {
+        p = put(out, p, int_of(data[i]));
+        i = i + 1;
+    }
+    return p;
+}
+
+// The unsigned integer whose big-endian bytes are `be` (leading zeros dropped; zero is the empty string).
+pub fn put_uint[&o, &d](out: &!o [byte], pos: int, be: &d [byte]) -> [] int {
+    var at = 0;
+    while at < len(be) && int_of(be[at]) == 0 {
+        at = at + 1;
+    }
+    return put_bytes(out, pos, be[at..len(be)]);
+}
+
+// The non-negative integer `v`.
+pub fn put_int[&o](out: &!o [byte], pos: int, v: int) -> [] int {
+    if v < 0 {
+        return -151;
+    }
+    if v > 0 && v < 128 {
+        return put(out, pos, v);
+    }
+    let w = width(v);
+    var p = put_header(out, pos, 128, w);
+    var i = w - 1;
+    while i >= 0 && p >= 0 {
+        p = put(out, p, v >> 8 * i & 255);
+        i = i - 1;
+    }
+    return p;
+}
+
+// ---- Decoding (docs/design.md section 9.1) ----
+
+// Reads the item at `pos` within `data[pos..end]`. Puts its kind (0 string, 1 list), the start of its payload and the end of its payload in `meta[0]`, `meta[1]` and `meta[2]`,
+// and answers the position after it, or a refusal. Strict: any encoding that is not the unique one for its value is refused, and no length is added to a position before it is
+// known to fit (`len > end - start`), so nothing overflows. `meta` is zeroed on a refusal.
+pub fn item[&d, &m](data: &d [byte], pos: int, end: int, meta: &!m [int]) -> [] int {
+    if len(meta) < 3 || pos < 0 || end > len(data) {
+        return -151;
+    }
+    meta[0] = 0;
+    meta[1] = 0;
+    meta[2] = 0;
+    if pos >= end {
+        return -152;
+    }
+    let b = int_of(data[pos]);
+    var kind = 0;
+    var start = 0;
+    var n = 0;
+    var code = 0;
+    if b < 128 {
+        meta[0] = 0;
+        meta[1] = pos;
+        meta[2] = pos + 1;
+        return pos + 1;
+    }
+    if b < 184 || b >= 192 && b < 248 {
+        // short form: the length is in the first byte
+        if b < 184 {
+            kind = 0;
+            n = b - 128;
+        } else {
+            kind = 1;
+            n = b - 192;
+        }
+        start = pos + 1;
+    } else {
+        // long form: the first byte says how many bytes of length follow
+        var base = 183;
+        kind = 0;
+        if b >= 248 {
+            base = 247;
+            kind = 1;
+        }
+        let w = b - base;
+        if w > 7 {
+            return -154;
+        }
+        if pos + 1 + w > end {
+            return -152;
+        }
+        if int_of(data[pos + 1]) == 0 {
+            return -153;
+        }
+        var i = 0;
+        while i < w {
+            n = n * 256 + int_of(data[pos + 1 + i]);
+            i = i + 1;
+        }
+        if n < 56 {
+            return -153;
+        }
+        start = pos + 1 + w;
+    }
+    if n > end - start {
+        return -152;
+    }
+    if kind == 0 && n == 1 && int_of(data[start]) < 128 && b < 184 {
+        // one byte below 0x80 must be written as itself
+        code = -153;
+    }
+    if code != 0 {
+        return code;
+    }
+    meta[0] = kind;
+    meta[1] = start;
+    meta[2] = start + n;
+    return start + n;
+}
+
+// Reads exactly one item that fills `data`. Answers 0, or a refusal (`rlp-trailing` when bytes are left over); `meta` as `item` leaves it.
+pub fn whole[&d, &m](data: &d [byte], meta: &!m [int]) -> [] int {
+    let next = item(data, 0, len(data), meta);
+    if next < 0 {
+        return next;
+    }
+    if next != len(data) {
+        return -155;
+    }
+    return 0;
+}

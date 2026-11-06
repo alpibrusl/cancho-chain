@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cancho-chain: an agent can propose a payment, not authorise one</title>
+<meta name="description" content="A bounded authority layer for autonomous agents that move assets, in pure cancho: a typed intent, a policy decision, the exact transaction bytes read back, each checked against an independent implementation. Research; no signer yet.">
+<meta property="og:title" content="cancho-chain: an agent can propose a payment, not authorise one">
+<meta property="og:description" content="Typed intents, a policy engine with stable refusal reasons, and a validator that reads the exact transaction bytes back, checked against eth-account, libsecp256k1 and rlp. Research.">
+<meta name="color-scheme" content="light dark">
+<meta property="og:type" content="website">
+<meta property="og:image" content="https://alpibrusl.github.io/cancho-chain/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="cancho-chain: a padlock on a granite outcrop on a blue disc, and the words cancho-chain.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta property="og:url" content="https://alpibrusl.github.io/cancho-chain/">
+<style>
+:root {
+  --bg: #fbfbfd; --fg: #14171c; --muted: #5b6573; --line: #e1e4ea; --surface: #ffffff; --soft: #f1f3f8;
+  --accent: #2f5de0; --accent-fg: #ffffff; --good: #0f7b5f; --warn: #92400e; --warn-bg: #fdf6e7; --warn-line: #e0b765; --bad: #d1362f;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0d1014; --fg: #e8eaee; --muted: #9ba5b3; --line: #232932; --surface: #141920; --soft: #181d25;
+    --accent: #7ea2ff; --accent-fg: #0b1020; --good: #4fd1a5; --warn: #f3c77a; --warn-bg: #1d1a12; --warn-line: #8a6a2a; --bad: #ff6b63; }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; scroll-padding-top: 4rem; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 1rem/1.6 var(--font); }
+a { color: var(--accent); text-underline-offset: .15em; }
+.wrap { width: 100%; max-width: 68rem; margin: 0 auto; padding: 0 20px; }
+.skip { position: absolute; left: 16px; top: -4rem; background: var(--accent); color: var(--accent-fg); padding: .5rem .8rem; border-radius: 6px; z-index: 9; }
+.skip:focus { top: 8px; }
+a:focus-visible, .btn:focus-visible, pre:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+header.top { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+header.top .wrap { display: flex; align-items: center; gap: 1.5rem; height: 3.4rem; }
+.brand { font: 700 1rem var(--mono); color: var(--fg); text-decoration: none; letter-spacing: -.01em; white-space: nowrap; }
+.brand img { height: 1.7rem; width: 1.7rem; vertical-align: middle; margin-right: .5rem; border-radius: 6px; }
+nav { display: flex; gap: 1.2rem; margin-left: auto; }
+nav a { color: var(--muted); text-decoration: none; font-size: .93rem; white-space: nowrap; }
+nav a:hover { color: var(--fg); }
+@media (max-width: 40rem) { nav a.opt { display: none; } }
+
+h1 { font-size: clamp(2.3rem, 6.2vw, 4rem); line-height: 1.04; letter-spacing: -.035em; margin: 0 0 1rem; font-weight: 750; }
+h2 { font-size: clamp(1.6rem, 3.4vw, 2.2rem); line-height: 1.15; letter-spacing: -.025em; margin: 0 0 .5rem; font-weight: 700; }
+h3 { font-size: 1.05rem; margin: 0 0 .25rem; }
+p { margin: 0 0 1rem; }
+section { padding: 4.5rem 0 0; }
+.lead { font-size: 1.2rem; color: var(--muted); max-width: 38rem; }
+.sub { color: var(--muted); max-width: 40rem; }
+code { font-family: var(--mono); font-size: .9em; background: var(--soft); padding: .1em .35em; border-radius: 5px; }
+.center { text-align: center; } .center .sub { margin-left: auto; margin-right: auto; }
+
+.badge { display: inline-flex; gap: .5rem; align-items: center; font-size: .82rem; color: var(--warn); background: var(--warn-bg); border: 1px solid var(--warn-line); padding: .22rem .7rem; border-radius: 999px; margin-bottom: 1.1rem; text-decoration: none; }
+.badge i { width: .5rem; height: .5rem; border-radius: 50%; background: var(--warn-line); display: inline-block; }
+.hero2 { padding: 3.6rem 0 1.6rem; text-align: center; }
+.hero2 h1 { margin: 0 auto 1rem; max-width: 18ch; }
+.hero2 .lead { margin: 0 auto; }
+.cta { display: flex; flex-wrap: wrap; gap: .7rem; margin-top: 1.6rem; justify-content: center; }
+.btn { display: inline-block; padding: .65rem 1.15rem; border-radius: 8px; font-weight: 600; text-decoration: none; border: 1px solid var(--accent); }
+.btn.primary { background: var(--accent); color: var(--accent-fg); }
+.btn.ghost { color: var(--accent); }
+.btn.ghost:hover { background: var(--soft); }
+
+.cards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); margin-top: 2rem; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem 1.2rem; }
+.card p { color: var(--muted); font-size: .94rem; margin: 0; }
+.note { color: var(--muted); font-size: .88rem; margin-top: .9rem; }
+
+.flow { max-width: 62rem; margin: 2rem auto 0; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 1.2rem; }
+.flow svg { width: 100%; height: auto; display: block; }
+.flow text { fill: var(--fg); font: 600 13px var(--font); } .flow .sm { font: 11.5px var(--font); fill: var(--muted); font-weight: 400; }
+.flow .box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+.flow .hot { fill: var(--soft); stroke: var(--accent); stroke-width: 2; }
+.flow .todo { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.flow .ar { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+.flow .zone { fill: none; stroke: var(--warn-line); stroke-width: 1.5; stroke-dasharray: 3 5; }
+.legend { display: flex; flex-wrap: wrap; gap: .4rem 1.4rem; color: var(--muted); font-size: .86rem; margin: .8rem 0 0; }
+.legend i { display: inline-block; width: .9rem; height: .9rem; border-radius: 3px; vertical-align: -.12rem; margin-right: .4rem; border: 2px solid var(--accent); background: var(--soft); }
+.legend i.d { border: 2px dashed var(--muted); background: none; }
+
+.term { background: #0d1117; color: #d6dde8; border: 1px solid #262c36; border-radius: 12px; font: .84rem/1.65 var(--mono); padding: 1rem 1.1rem 1.1rem; box-shadow: 0 18px 50px -24px rgba(20, 30, 70, .55); overflow-x: auto; margin-top: 1.4rem; }
+.term .bar { display: flex; gap: .35rem; margin-bottom: .8rem; }
+.term .bar i { width: .65rem; height: .65rem; border-radius: 50%; background: #2d3440; display: block; }
+.term .c { color: #7d8797; } .term .g { color: #5fd3a6; } .term .b { color: #8cb0ff; } .term .y { color: #e8c170; } .term .r { color: #ff8b82; }
+.term pre { margin: 0; white-space: pre; }
+pre.code { background: var(--soft); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.1rem; font: .86rem/1.65 var(--mono); overflow-x: auto; margin: 1.4rem 0 0; }
+
+table.fit { width: 100%; border-collapse: collapse; margin-top: 1.6rem; font-size: .93rem; }
+table.fit th, table.fit td { text-align: left; padding: .75rem .9rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.fit thead th { color: var(--muted); font-weight: 600; font-size: .85rem; }
+table.fit tbody th { font-weight: 650; }
+table.fit td { color: var(--muted); }
+table.fit td.n { color: var(--fg); font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.fit tr.todo td, table.fit tr.todo th { color: var(--muted); font-weight: 400; }
+.fitwrap { overflow-x: auto; }
+table.fit.wide { min-width: 44rem; }
+
+.stats { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); margin: 2rem 0 0; }
+.stats div { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.1rem; }
+.stats b { display: block; font: 700 1.9rem/1.1 var(--font); letter-spacing: -.03em; }
+.stats span { color: var(--muted); font-size: .88rem; }
+
+.cols { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); margin-top: 1.4rem; }
+.cols > div { border: 1px solid var(--line); border-radius: 14px; padding: 1.1rem 1.3rem; background: var(--surface); }
+.cols ul { margin: .4rem 0 0; padding-left: 1.1rem; color: var(--muted); } .cols li { margin: .25rem 0; }
+.status { margin-top: 4.5rem; background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 14px; padding: 1.3rem 1.5rem; }
+.status h2 { font-size: 1.2rem; letter-spacing: -.01em; }
+.status ul { margin: .4rem 0 0; padding-left: 1.2rem; color: var(--muted); }
+.links { list-style: none; padding: 0; margin: 1rem 0 0; display: grid; gap: .5rem; max-width: 56rem; } .links li { color: var(--muted); }
+footer { margin-top: 4rem; border-top: 1px solid var(--line); padding: 1.6rem 0 2.6rem; color: var(--muted); font-size: .9rem; }
+footer .wrap { display: flex; flex-wrap: wrap; gap: .5rem 1.6rem; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><div class="wrap">
+  <a class="brand" href="#top"><img src="favicon.svg" alt="">cancho-chain</a>
+  <nav aria-label="Sections">
+    <a href="#how" class="opt">How it works</a><a href="#refusals">Refusals</a><a href="#built" class="opt">What is built</a><a href="#not" class="opt">What is not</a><a href="#try" class="opt">Try it</a>
+    <a href="https://github.com/alpibrusl/cancho-chain">GitHub</a>
+  </nav>
+</div></header>
+
+<main id="main" class="wrap">
+
+<div class="hero2" id="top">
+  <a class="badge" href="#status"><i></i>Research &middot; five slices built, no signer yet</a>
+  <h1>An agent can propose a payment. It cannot authorise one.</h1>
+  <p class="lead">cancho-chain makes the authority granted to an autonomous agent that moves assets <b>explicit, bounded, enforceable and auditable</b>: a typed intent, a policy decision outside the model, and the exact transaction bytes read back before anything is signed. Pure <a href="https://github.com/alpibrusl/cancho">cancho</a>, each piece checked against libraries and separate models, then against itself broken on purpose.</p>
+  <div class="cta"><a class="btn primary" href="#refusals">See a decision</a><a class="btn ghost" href="#built">See the evidence</a></div>
+</div>
+
+<section id="why">
+<div class="cards">
+  <div class="card"><h3>The agent's output is data</h3><p>The intent is one JSON object checked against a strict schema. Unknown keys, duplicate keys, escapes, floats written as integers and non-canonical amounts are refused, and an accepted intent has one canonical form and one digest however it was spelled.</p></div>
+  <div class="card"><h3>Authority is decided outside the model</h3><p>The policy engine is a pure function of a policy, the intent, the authenticated caller, the time, the registry and the history. It answers allow, refuse or approval-required, with one of fourteen stable reasons, and a record bound to the intent, the policy version and the time window.</p></div>
+  <div class="card"><h3>The bytes are read back</h3><p>A strict RLP decoder, sharing no code with the encoder, reads the exact transaction that is about to be signed and refuses unless every field is what was authorised: chain, nonce, token, recipient, amount, fee and gas caps.</p></div>
+  <div class="card"><h3>A refusal is a success</h3><p>Each refusal has a stable code and a reason. Nothing falls through to "allowed": a missing registry answer, an expired policy, a replayed request or a malformed input all fail closed, and the test for each is written first.</p></div>
+  <div class="card"><h3>Held to oracles, and to mutants</h3><p>Every slice is compared with an independent implementation (<code>eth-account</code>, libsecp256k1, <code>rlp</code>, <code>jsonschema</code>) and then with itself broken on purpose: each deliberate fault must be caught, or be explained as unreachable.</p></div>
+  <div class="card"><h3>Honest about what is missing</h3><p>There is no signing process, no RPC, no evidence log and no independent review yet. Constant time of the signing code is a design claim, not a measurement. The <a href="#not">list</a> is part of the page.</p></div>
+</div>
+</section>
+
+<section id="how">
+  <div class="center"><h2>How it works.</h2>
+  <p class="sub">The agent is untrusted: its output is data, never authority. Each step has its own check, and the signer, when it exists, will be a separate process that holds the key and the only authority to sign.</p></div>
+  <div class="flow">
+<svg viewBox="0 0 960 300" role="img" aria-labelledby="flowt flowd">
+  <title id="flowt">The pipeline from an agent's intent to a settled transaction</title>
+  <desc id="flowd">An untrusted agent proposes an intent. The intent parser and the policy engine, both built, make a decision. The transaction encoders and the final validator, built, produce and check the exact bytes. The signing gateway, the RPC and lifecycle, and the evidence log are not built yet.</desc>
+  <rect class="zone" x="8" y="8" width="130" height="284" rx="14"/>
+  <text x="73" y="30" text-anchor="middle" class="sm">untrusted</text>
+  <rect class="box" x="22" y="110" width="102" height="64" rx="10"/>
+  <text x="73" y="138" text-anchor="middle">Agent</text><text x="73" y="156" text-anchor="middle" class="sm">proposes</text>
+  <path class="ar" d="M124 142 C146 142 146 78 162 78"/>
+  <rect class="hot" x="162" y="40" width="150" height="76" rx="10"/>
+  <text x="237" y="68" text-anchor="middle">Intent</text><text x="237" y="86" text-anchor="middle" class="sm">strict schema, one</text><text x="237" y="101" text-anchor="middle" class="sm">canonical form, a digest</text>
+  <path class="ar" d="M237 116 V184"/>
+  <rect class="hot" x="162" y="184" width="150" height="76" rx="10"/>
+  <text x="237" y="212" text-anchor="middle">Policy</text><text x="237" y="230" text-anchor="middle" class="sm">allowlists, limits, window,</text><text x="237" y="245" text-anchor="middle" class="sm">revocation: 14 reasons</text>
+  <path class="ar" d="M312 222 C336 222 336 148 350 148"/>
+  <rect class="hot" x="350" y="104" width="190" height="88" rx="10"/>
+  <text x="445" y="132" text-anchor="middle">Transaction</text><text x="445" y="152" text-anchor="middle" class="sm">encoders, then a validator</text><text x="445" y="167" text-anchor="middle" class="sm">that decodes the exact bytes</text>
+  <path class="ar" d="M540 148 H572"/>
+  <rect class="todo" x="572" y="110" width="150" height="76" rx="10"/>
+  <text x="647" y="138" text-anchor="middle">Signing gateway</text><text x="647" y="156" text-anchor="middle" class="sm">separate process, holds</text><text x="647" y="171" text-anchor="middle" class="sm">the key: not built</text>
+  <path class="ar" d="M722 148 H738 M738 78 V222 M738 78 H752 M738 222 H752"/>
+  <rect class="todo" x="752" y="36" width="196" height="84" rx="10"/>
+  <text x="850" y="64" text-anchor="middle">RPC, lifecycle</text><text x="850" y="82" text-anchor="middle" class="sm">submitted, included, final;</text><text x="850" y="97" text-anchor="middle" class="sm">reconcile before retry</text><text x="850" y="112" text-anchor="middle" class="sm">not built</text>
+  <rect class="todo" x="752" y="180" width="196" height="84" rx="10"/>
+  <text x="850" y="208" text-anchor="middle">Evidence</text><text x="850" y="226" text-anchor="middle" class="sm">append-only, tamper-evident;</text><text x="850" y="241" text-anchor="middle" class="sm">authorised, signed, settled</text><text x="850" y="256" text-anchor="middle" class="sm">kept apart: not built</text>
+</svg>
+    <p class="legend"><span><i></i>built and checked</span><span><i class="d"></i>designed, not built</span></p>
+  </div>
+</section>
+
+<section id="refusals">
+  <div class="center"><h2>Look at one decision.</h2>
+  <p class="sub">The policy of the proposal's example: one asset on one test network, two approved suppliers, 500 USDC per transaction, 2,000 a day, a human above 250. Amounts are integers of base units (USDC has six decimals). The same intent, six amounts, run through the compiled engine.</p></div>
+  <div class="term"><div class="bar"><i></i><i></i><i></i></div><pre><span class="c"># policy: per_transaction 500000000, daily_total 2000000000, approval_required_above 250000000</span>
+<span class="b">amount</span>       <span class="b">outcome</span>            <span class="b">reason</span>
+100000000    <span class="g">allow</span>              ALLOWED
+250000000    <span class="g">allow</span>              ALLOWED                  <span class="c"># at the threshold, not above it</span>
+250000001    <span class="y">approval required</span>  APPROVAL_REQUIRED        <span class="c"># within every limit; a human decides</span>
+500000000    <span class="y">approval required</span>  APPROVAL_REQUIRED
+500000001    <span class="r">refuse</span>             AMOUNT_LIMIT_EXCEEDED    <span class="c"># one base unit over the per-transaction limit</span>
+<span class="c"># the same intent, but...</span>
+<span class="r">refuse</span>  PRINCIPAL_MISMATCH   <span class="c"># the authenticated caller is not the policy's principal</span>
+<span class="r">refuse</span>  POLICY_REVOKED       <span class="c"># the registry says so</span>
+<span class="r">refuse</span>  POLICY_EXPIRED       <span class="c"># now == not_after: the window is half-open</span></pre></div>
+  <p class="note">These are outputs of the compiled decision function, not an illustration. The first check that fails answers, in a fixed order (registry, validity window, caller, operation, chain, asset, recipient, per-transaction limit, replay, daily total, approval), and a test builds every combination of up to three of the fourteen reasons to hold that order.</p>
+  <div class="cards">
+    <div class="card"><h3>Why the agent cannot talk its way round it</h3><p>The engine has no operation that changes a policy, an allowlist or a key, so there is no flag to set false and no argument to send. The agent only ever supplies an intent.</p></div>
+    <div class="card"><h3>Why a retry cannot pay twice</h3><p>The engine is given the history of authorisations already issued. The same intent digest in it is <code>REQUEST_REPLAYED</code>: reconcile, do not ask again. The daily window is a rolling 86,400 seconds and counts what was issued, not only what settled.</p></div>
+    <div class="card"><h3>Why the digest matters</h3><p>The decision record carries the intent digest, the policy digest, the caller and the time window, and has its own digest. It cannot be presented for another intent, another policy version, or after it expires.</p></div>
+  </div>
+</section>
+
+<section id="built">
+  <h2>Built, and how each piece is checked.</h2>
+  <p class="sub">Every row is a command you can run. "Mutants" are deliberate faults put into the code one at a time; each must be caught by the same checks, or be explained in the script as unreachable.</p>
+  <div class="fitwrap"><table class="fit wide">
+    <thead><tr><th>Piece</th><th>What it does</th><th>Checked against</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><th><code>chain.keccak</code></th><td>Keccak-256 with Ethereum's padding</td><td>pycryptodome, every length across the block edges</td><td class="n">425 / 425; 12 / 12 mutants</td></tr>
+      <tr><th>addresses, RLP, ERC-20, type-2 transactions</th><td>EIP-55 addresses, RLP encoders, <code>transfer</code> calldata, a signed EIP-1559 transaction</td><td><code>eth-account</code>, <code>eth-abi</code>, <code>rlp</code>: signed transactions byte for byte</td><td class="n">531 / 531; 28 / 28 mutants</td></tr>
+      <tr><th>strict decoder, final validator</th><td>Reads the exact bytes back, 16 stable reasons</td><td><code>rlp</code> in strict mode, <code>eth-account</code></td><td class="n">1,423 / 1,423; 50 / 51 mutants (1 equivalent)</td></tr>
+      <tr><th>typed intent</th><td>The agent's JSON on <a href="https://github.com/alpibrusl/cancho-schema">cancho-schema</a>: canonical form, digest, 13 stable refusals</td><td>a separate model, <code>eth-utils</code>, <code>jsonschema</code></td><td class="n">795 / 795; 44 / 48 mutants (4 redundant)</td></tr>
+      <tr><th>policy and decision</th><td>The policy engine, its decision record and digest, 14 stable reasons</td><td>a separate model, <code>jsonschema</code>, every combination of up to three reasons</td><td class="n">989 / 989; 119 / 121 mutants (2 equivalent)</td></tr>
+      <tr><th><code>secp256k1</code> (in <a href="https://github.com/alpibrusl/cancho/pull/710">cancho#710</a>)</th><td>ECDSA with public-key recovery, RFC 6979, low s</td><td>libsecp256k1 and python-ecdsa: signatures byte for byte</td><td class="n">3,237 / 3,237; 50 / 53 mutants (3 unreachable)</td></tr>
+    </tbody>
+  </table></div>
+  <div class="stats">
+    <div><b>43 &micro;s</b><span>public key, secp256k1 (libsecp256k1: 34)</span></div>
+    <div><b>58 &micro;s</b><span>sign (libsecp256k1: 24)</span></div>
+    <div><b>180 &micro;s</b><span>verify (libsecp256k1: 27)</span></div>
+    <div><b>14</b><span>stable reasons a decision can carry</span></div>
+  </div>
+  <p class="note">Speed is not the goal (an agent signs a few transactions a second); it is measured so that the claim "the signing code is slower than the best" is a number. Intel Xeon 2.1 GHz, one run's best of five; <code>docs/secp256k1.md</code> in the cancho repository has the steps and what is left.</p>
+</section>
+
+<section id="not">
+  <h2>What it does not do, and what is not built.</h2>
+  <div class="cols">
+    <div><h3>Not built yet</h3><ul>
+      <li>The authorisation envelope that binds a decision to the exact unsigned transaction digest, with expiry and single use.</li>
+      <li>The signing gateway as a separate process, and its key isolation.</li>
+      <li>RPC submission, the transaction lifecycle, nonce and idempotency handling, reconciliation.</li>
+      <li>The evidence log and an inspection command.</li>
+      <li>A policy registry and an evidence-backed history (the engine is given their answers).</li>
+    </ul></div>
+    <div class="no"><h3>Never claimed</h3><ul>
+      <li>That an invoice is genuine, a supplier legitimate or a policy wise.</li>
+      <li>That a token is safe or an approved contract has no bug.</li>
+      <li>That an RPC provider is honest, or that a transfer can be reversed.</li>
+      <li>That an application is secure because it uses cancho.</li>
+    </ul></div>
+    <div><h3>Open, and stated</h3><ul>
+      <li>Constant time of <code>secp256k1</code> signing: not measured (<a href="https://github.com/alpibrusl/cancho/issues/712">cancho#712</a>).</li>
+      <li>One transaction shape: an ERC-20 <code>transfer</code> in EIP-1559 form, on one network.</li>
+      <li>The Python models were written from the same specification as the code; the independent checks are the libraries named above.</li>
+      <li>Nothing has been independently reviewed.</li>
+    </ul></div>
+  </div>
+</section>
+
+<section class="status" id="status">
+  <h2>Status: research</h2>
+  <ul>
+    <li>Built and checked: the typed intent, the policy and its decision, the strict decoder and the final-transaction validator, the encoders, Keccak-256 and (in the cancho repository) secp256k1 signing. The code is a draft pull request, <a href="https://github.com/alpibrusl/cancho-chain/pull/1">#1</a>.</li>
+    <li>Dependencies are consumed from sibling checkouts until <code>secp256k1</code> and <code>cancho-schema</code> are published to a store at a pinned commit.</li>
+    <li>The design is <a href="https://github.com/alpibrusl/cancho-chain/blob/main/docs/design.md">docs/design.md</a>: every claim in it is marked measured, read, a choice, or open, and a claim found false is corrected in place (it has happened: the address rule of section 8.1 was wrong and is corrected where it was made).</li>
+  </ul>
+</section>
+
+<section id="try">
+  <h2>Try it.</h2>
+  <p class="sub">The checks need the cancho compiler built from source (stage 2 of <code>scripts/build-standalone.sh</code>), a sibling checkout of <code>cancho</code> and <code>cancho-schema</code>, and a few Python packages.</p>
+<pre class="code">git clone https://github.com/alpibrusl/cancho-chain &amp;&amp; cd cancho-chain
+pip install eth-account coincurve jsonschema pycryptodome
+export CANCHO=/path/to/cancho CANCHO_PACKAGES=../cancho/packages CANCHO_SCHEMA=../cancho-schema/src/schema.cho
+
+cancho build --bin chain
+python3 -I scripts/check_keccak.py [--mutants]     # Keccak-256
+python3 -I scripts/check_eth.py    [--mutants]     # addresses, RLP, ERC-20, type-2 transactions
+python3 -I scripts/check_decode.py [--mutants]     # strict decoder and final validator
+python3 -I scripts/check_intent.py [--mutants]     # the typed intent
+python3 -I scripts/check_policy.py [--mutants]     # the policy and the decision</pre>
+</section>
+
+<section id="docs">
+  <h2>Go deeper.</h2>
+  <ul class="links">
+    <li><a href="https://github.com/alpibrusl/cancho-chain/blob/main/docs/design.md">docs/design.md</a>: the feasibility findings, trust boundaries, threat model and the design of every slice, with the measured results.</li>
+    <li><a href="https://github.com/alpibrusl/cancho-chain/pull/1">Pull request #1</a>: the five slices, and what each was checked against.</li>
+    <li><a href="https://github.com/alpibrusl/cancho/pull/710">cancho#710</a> and <a href="https://github.com/alpibrusl/cancho/issues/712">#712</a>: the secp256k1 package and what is left of it.</li>
+    <li><a href="llms.txt">llms.txt</a>: the same facts, for a machine.</li>
+  </ul>
+</section>
+
+</main>
+<footer><div class="wrap">
+  <span>cancho-chain &middot; EUPL-1.2 &middot; written in <a href="https://github.com/alpibrusl/cancho">cancho</a></span>
+  <a href="https://github.com/alpibrusl/cancho-chain">GitHub</a>
+  <a href="llms.txt">llms.txt</a>
+  <span>the sibling projects: <a href="https://github.com/alpibrusl/cancho-schema">schema</a>, <a href="https://github.com/alpibrusl/cancho-web">web</a>, <a href="https://github.com/alpibrusl/cancho-gpu">gpu</a>, <a href="https://github.com/alpibrusl/cancho-opt">opt</a></span>
+</div></footer>
+</body>
+</html>

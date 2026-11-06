@@ -1,0 +1,283 @@
+edition 7;
+
+// The driver of `scripts/check_policy.py` (docs/design.md section 11.5): one command on standard input, one answer on standard output. Not the product's command line.
+//
+//   P <hex>                     the policy whose JSON body is the hex bytes   -> "0 <canonical> <digest>" or `E<code>`
+//   Q <hex>                     `policy.explain` for it                        -> the problem+json text, or `ok`
+//   S                           the policy schema as JSON Schema 2020-12       -> the text
+//   D <policy-json> <intent-json> <caller> <now> <current-version> <revoked> <history>
+//                               parse both, then decide                        -> "0 <record> <decision digest>" or `E<code>`
+//   G <record>                  `decide.digest` of the given bytes, whatever they are  -> "0 <digest>" or `E<code>`
+//   O <policy-json> / W <policy-json>   `policy.parse` with a 1000-byte output / 100 words of working space (too short)  -> `E<code>`
+//   E <policy-canonical> <intent-canonical> <caller> <now> <current-version> <revoked> <history> / K <...>
+//                               `decide` with a 100-byte output / 100 words of working space (too short)  -> `E<code>`
+//   C <policy-canonical> <intent-canonical> <caller> <now> <current-version> <revoked> <history>
+//                               decide from canonical forms as given           -> the same
+//
+// Bodies, canonical forms, the caller and the history are hex (`_` is empty); `now` and `current-version` are decimal (a minus sign allowed); `revoked` is 0 or 1.
+
+import chain.address;
+import chain.decide;
+import chain.hex;
+import chain.intent;
+import chain.keccak;
+import chain.policy;
+import std.buffer;
+import std.io;
+
+fn read_stdin[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    var c = getchar(io);
+    while c >= 0 {
+        out = buffer.push(heap, out, byte_of(c));
+        c = getchar(io);
+    }
+    return out;
+}
+
+// Splits the line into fields; field k's bytes (hex-decoded, `_` empty, or the text itself for the fields in `raw`, a bit set) are at arena[meta[k]..meta[k] + meta[16 + k]].
+fn split_fields[&t, &a, &m](text: &t [byte], arena: &!a [byte], meta: &!m [int], raw: int) -> [] int {
+    var n = 0;
+    var at = 0;
+    var i = 0;
+    while i < len(text) && n < 12 {
+        while i < len(text) && (int_of(text[i]) == 32 || int_of(text[i]) == 10) {
+            i = i + 1;
+        }
+        if i < len(text) {
+            var j = i;
+            while j < len(text) && int_of(text[j]) != 32 && int_of(text[j]) != 10 {
+                j = j + 1;
+            }
+            meta[n] = at;
+            if n == 0 || raw >> n & 1 == 1 {
+                var k = i;
+                while k < j {
+                    arena[at] = text[k];
+                    at = at + 1;
+                    k = k + 1;
+                }
+            } else if !(j - i == 1 && int_of(text[i]) == '_') {
+                var k = i;
+                while k + 1 < j {
+                    arena[at] = byte_of(hex.value(int_of(text[k])) * 16 + hex.value(int_of(text[k + 1])));
+                    at = at + 1;
+                    k = k + 2;
+                }
+            }
+            meta[16 + n] = at - meta[n];
+            n = n + 1;
+            i = j;
+        }
+    }
+    return n;
+}
+
+fn field[&a, &m](arena: &a [byte], meta: &m [int], k: int) -> [] &a [byte] {
+    return arena[meta[k]..meta[k] + meta[16 + k]];
+}
+
+// A decimal integer with an optional minus sign.
+fn dec[&t](text: &t [byte]) -> [] int {
+    var neg = false;
+    var i = 0;
+    if len(text) > 0 && int_of(text[0]) == 45 {
+        neg = true;
+        i = 1;
+    }
+    var v = 0;
+    while i < len(text) {
+        v = v * 10 + int_of(text[i]) - 48;
+        i = i + 1;
+    }
+    if neg {
+        return 0 - v;
+    }
+    return v;
+}
+
+fn emit_char[&o](out: &!o [byte], pos: int, c: int) -> [] int {
+    out[pos] = byte_of(c);
+    return pos + 1;
+}
+
+fn emit_hex[&o, &b](out: &!o [byte], pos: int, bytes: &b [byte]) -> [] int {
+    var p = pos;
+    var k = 0;
+    while k < len(bytes) {
+        let v = int_of(bytes[k]);
+        p = emit_char(out, p, hex.digit(v >> 4));
+        p = emit_char(out, p, hex.digit(v & 15));
+        k = k + 1;
+    }
+    return p;
+}
+
+// decide (from canonical forms), then the answer text "0 <record> <digest>" into `out`; or a refusal.
+fn decide_text[&p, &i, &c, &hh, &s, &o, &r](pol: &p [byte], it: &i [byte], caller: &c [byte], now: int, current: int, revoked: bool, history: &hh [byte], st: &!s [int], rec: &!r [byte], out: &!o [byte]) -> [] int {
+    let n = decide.decide(pol, it, caller, now, current, revoked, history, st, rec);
+    if n < 0 {
+        return n;
+    }
+    var dg = rec[200..232];
+    let code = decide.digest(st, rec[0..n], rec[232..264]);
+    if code != 0 {
+        return code;
+    }
+    var p = emit_char(out, 0, '0');
+    p = emit_char(out, p, ' ');
+    p = emit_hex(out, p, rec[0..n]);
+    p = emit_char(out, p, ' ');
+    return emit_hex(out, p, rec[232..264]);
+}
+
+fn run[&h, &a, &m, &s, &o, &pb, &ib, &rb](heap: &!h Heap, op: int, nf: int, arena: &a [byte], meta: &m [int], st: &!s [int], pol: &!pb [byte], itn: &!ib [byte], rec: &!rb [byte], out: &!o [byte]) -> [heap] int {
+    let f1 = field(arena, meta, 1);
+    var p = emit_char(out, 0, '0');
+    p = emit_char(out, p, ' ');
+    if op == 'P' {
+        let n = policy.parse(heap, st, f1, pol);
+        if n < 0 {
+            return n;
+        }
+        let rc = policy.digest(st, pol[0..n], rec[0..32]);
+        if rc != 0 {
+            return rc;
+        }
+        p = emit_hex(out, p, pol[0..n]);
+        p = emit_char(out, p, ' ');
+        return emit_hex(out, p, rec[0..32]);
+    }
+    if op == 'G' {
+        let rc = decide.digest(st, f1, rec[0..32]);
+        if rc != 0 {
+            return rc;
+        }
+        return emit_hex(out, p, rec[0..32]);
+    }
+    if op == 'O' {
+        return policy.parse(heap, st, f1, pol[0..1000]);
+    }
+    if op == 'W' {
+        return policy.parse(heap, st[0..100], f1, pol);
+    }
+    if op == 'E' || op == 'K' {
+        let caller = field(arena, meta, 3);
+        let now = dec(field(arena, meta, 4));
+        let current = dec(field(arena, meta, 5));
+        let revoked = dec(field(arena, meta, 6)) == 1;
+        if op == 'E' {
+            return decide.decide(f1, field(arena, meta, 2), caller, now, current, revoked, field(arena, meta, 7), st, rec[0..100]);
+        }
+        return decide.decide(f1, field(arena, meta, 2), caller, now, current, revoked, field(arena, meta, 7), st[0..100], rec);
+    }
+    if op == 'D' || op == 'C' {
+        let caller = field(arena, meta, 3);
+        let now = dec(field(arena, meta, 4));
+        let current = dec(field(arena, meta, 5));
+        let revoked = dec(field(arena, meta, 6)) == 1;
+        let history = field(arena, meta, 7);
+        if op == 'C' {
+            return decide_text(f1, field(arena, meta, 2), caller, now, current, revoked, history, st, rec, out);
+        }
+        let pn = policy.parse(heap, st, f1, pol);
+        if pn < 0 {
+            return pn;
+        }
+        let inn = intent.parse(heap, st, field(arena, meta, 2), itn);
+        if inn < 0 {
+            return inn;
+        }
+        return decide_text(pol[0..pn], itn[0..inn], caller, now, current, revoked, history, st, rec, out);
+    }
+    return -999;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    borrow mut heap as &!h in {
+        borrow mut io as &!i in {
+            let text = read_stdin(h, i);
+            let arena = box_slice(h, 40000, byte_of(0));
+            let meta = box_slice(h, 32, 0);
+            let st = box_slice(h, keccak.state_len(), 0);
+            let pol = box_slice(h, 1100, byte_of(0));
+            let itn = box_slice(h, 300, byte_of(0));
+            let rec = box_slice(h, 300, byte_of(0));
+            let out = box_slice(h, 4000, byte_of(0));
+            var n = -999;
+            var line = buffer.empty(h, 64);
+            borrow text as &tx in {
+                let src = buffer.bytes(tx);
+                let op = int_of(src[0]);
+                borrow mut arena as &!ar in {
+                    borrow mut meta as &!me in {
+                        borrow mut st as &!s1 in {
+                            borrow mut pol as &!pl in {
+                                borrow mut itn as &!it in {
+                                    borrow mut rec as &!rc in {
+                                        borrow mut out as &!ou in {
+                                            var raw = 0;
+                                            if op == 'D' || op == 'C' || op == 'E' || op == 'K' {
+                                                raw = 16 + 32 + 64;
+                                            }
+                                            let nf = split_fields(src, contents(ar), contents(me), raw);
+                                            if op == 'S' {
+                                                buffer.drop(h, line);
+                                                line = policy.json_schema(h);
+                                                n = -1000;
+                                            } else if op == 'Q' {
+                                                let doc = policy.explain(h, field(contents(ar), contents(me), 1));
+                                                borrow doc as &db in {
+                                                    if len(buffer.bytes(db)) == 0 {
+                                                        line = buffer.append(h, line, "ok");
+                                                    } else {
+                                                        line = buffer.append(h, line, buffer.bytes(db));
+                                                    }
+                                                }
+                                                buffer.drop(h, doc);
+                                                n = -1000;
+                                            } else {
+                                                n = run(h, op, nf, contents(ar), contents(me), contents(s1), contents(pl), contents(it), contents(rc), contents(ou));
+                                            }
+                                            if n >= 0 {
+                                                line = buffer.append(h, line, contents(ou)[0..n]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if n < 0 && n != -1000 {
+                line = buffer.push(h, line, byte_of('E'));
+                line = buffer.push_nat(h, line, 0 - n);
+            }
+            line = buffer.push(h, line, byte_of(10));
+            borrow line as &lx in {
+                buffer.write(i, lx);
+            }
+            buffer.drop(h, line);
+            buffer.drop(h, text);
+            unbox_slice(h, arena);
+            unbox_slice(h, meta);
+            unbox_slice(h, st);
+            unbox_slice(h, pol);
+            unbox_slice(h, itn);
+            unbox_slice(h, rec);
+            unbox_slice(h, out);
+        }
+    }
+    release(heap);
+    release(io);
+    return 0;
+}

@@ -1,0 +1,71 @@
+edition 7;
+
+module chain.erc20;
+
+// ERC-20 calldata (docs/design.md section 8.1): `transfer(address,uint256)`, 68 bytes: the selector a9059cbb, the recipient left-padded to 32 bytes, the amount as a
+// 32-byte big-endian integer.
+
+// the amount is more than 32 bytes
+pub fn refused_amount() -> [] int {
+    return -160;
+}
+
+// the recipient is not 20 bytes
+pub fn refused_recipient() -> [] int {
+    return -161;
+}
+
+// the output is not 68 bytes
+pub fn refused_output() -> [] int {
+    return -162;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -160 {
+        return "erc20-amount";
+    }
+    if code == -161 {
+        return "erc20-recipient";
+    }
+    if code == -162 {
+        return "erc20-output";
+    }
+    return "erc20-unknown";
+}
+
+pub fn transfer_len() -> [] int {
+    return 68;
+}
+
+// The calldata of transfer(`to`, `amount`) into `out` (68 bytes). `amount` is big-endian, at most 32 bytes.
+pub fn transfer_calldata[&t, &a, &o](to: &t [byte], amount: &a [byte], out: &!o [byte]) -> [] int {
+    if len(out) != 68 {
+        return -162;
+    }
+    if len(to) != 20 {
+        return -161;
+    }
+    if len(amount) > 32 {
+        return -160;
+    }
+    var i = 0;
+    while i < 68 {
+        out[i] = byte_of(0);
+        i = i + 1;
+    }
+    out[0] = byte_of(0xa9);
+    out[1] = byte_of(0x05);
+    out[2] = byte_of(0x9c);
+    out[3] = byte_of(0xbb);
+    i = 0;
+    while i < 20 {
+        out[16 + i] = to[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(amount) {
+        out[68 - len(amount) + i] = amount[i];
+        i = i + 1;
+    }
+    return 0;
+}

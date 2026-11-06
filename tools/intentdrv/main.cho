@@ -1,0 +1,153 @@
+edition 7;
+
+// The driver of `scripts/check_intent.py` (docs/design.md section 10.4): one command on standard input, one answer on standard output. Not the product's command line.
+//
+//   I <hex>     the intent whose JSON body is the hex bytes (`_` is empty)  -> "0 <canonical> <digest>" or `E<code>`
+//   X <hex>     `intent.explain`: the problem+json document, or `ok`          -> the text
+//   S           the schema as JSON Schema 2020-12                              -> the text
+//   O <hex>     `intent.parse` with an output of 150 bytes (too short)         -> `E<code>`
+//   W <hex>     `intent.parse` with 100 words of Keccak working space (too short) -> `E<code>`
+//
+// Every body is hex, so that any bytes can be sent.
+
+import chain.hex;
+import chain.intent;
+import chain.keccak;
+import std.buffer;
+import std.io;
+
+fn read_stdin[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    var c = getchar(io);
+    while c >= 0 {
+        out = buffer.push(heap, out, byte_of(c));
+        c = getchar(io);
+    }
+    return out;
+}
+
+// The bytes of the hex text that follows the op and a space (an empty text, or `_`, is no bytes), into `out`. The count, or -1 for an odd or invalid text.
+fn decode_body[&t, &o](text: &t [byte], out: &!o [byte]) -> [] int {
+    var start = 2;
+    var end = len(text);
+    while end > start && (int_of(text[end - 1]) == 10 || int_of(text[end - 1]) == 32) {
+        end = end - 1;
+    }
+    if end <= start || end == start + 1 && int_of(text[start]) == 95 {
+        return 0;
+    }
+    if (end - start) % 2 != 0 || (end - start) / 2 > len(out) {
+        return -1;
+    }
+    var n = 0;
+    var i = start;
+    while i < end {
+        let a = hex.value(int_of(text[i]));
+        let b = hex.value(int_of(text[i + 1]));
+        if a < 0 || b < 0 {
+            return -1;
+        }
+        out[n] = byte_of(a * 16 + b);
+        n = n + 1;
+        i = i + 2;
+    }
+    return n;
+}
+
+fn put_hex[&h, &t](heap: &!h Heap, out: buffer.Buffer, bytes: &t [byte]) -> [heap] buffer.Buffer {
+    var o = out;
+    var k = 0;
+    while k < len(bytes) {
+        let v = int_of(bytes[k]);
+        o = buffer.push(heap, o, byte_of(hex.digit(v >> 4)));
+        o = buffer.push(heap, o, byte_of(hex.digit(v & 15)));
+        k = k + 1;
+    }
+    return o;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    borrow mut heap as &!h in {
+        borrow mut io as &!i in {
+            let text = read_stdin(h, i);
+            let body = box_slice(h, 8192, byte_of(0));
+            let canon = box_slice(h, 300, byte_of(0));
+            let digest = box_slice(h, 32, byte_of(0));
+            let st = box_slice(h, keccak.state_len(), 0);
+            var line = buffer.empty(h, 64);
+            borrow text as &tx in {
+                let src = buffer.bytes(tx);
+                let op = int_of(src[0]);
+                borrow mut body as &!bw in {
+                    borrow mut canon as &!cw in {
+                        borrow mut digest as &!dw in {
+                            borrow mut st as &!sw in {
+                                let b = contents(bw);
+                                let n = decode_body(src, b);
+                                if op == 'S' {
+                                    buffer.drop(h, line);
+                                    line = intent.json_schema(h);
+                                } else if n < 0 {
+                                    line = buffer.push(h, line, byte_of('E'));
+                                    line = buffer.push_nat(h, line, 999);
+                                } else if op == 'X' {
+                                    let doc = intent.explain(h, b[0..n]);
+                                    borrow doc as &db in {
+                                        if len(buffer.bytes(db)) == 0 {
+                                            line = buffer.append(h, line, "ok");
+                                        } else {
+                                            line = buffer.append(h, line, buffer.bytes(db));
+                                        }
+                                    }
+                                    buffer.drop(h, doc);
+                                } else if op == 'O' || op == 'W' {
+                                    var m = 0;
+                                    if op == 'O' {
+                                        m = intent.parse(h, contents(sw), b[0..n], contents(cw)[0..150]);
+                                    } else {
+                                        m = intent.parse(h, contents(sw)[0..100], b[0..n], contents(cw));
+                                    }
+                                    line = buffer.push(h, line, byte_of('E'));
+                                    line = buffer.push_nat(h, line, 0 - m);
+                                } else if op == 'I' {
+                                    let m = intent.parse(h, contents(sw), b[0..n], contents(cw));
+                                    if m < 0 {
+                                        line = buffer.push(h, line, byte_of('E'));
+                                        line = buffer.push_nat(h, line, 0 - m);
+                                    } else {
+                                        let rc = intent.digest(contents(sw), contents(cw)[0..m], contents(dw));
+                                        line = buffer.append(h, line, "0 ");
+                                        line = put_hex(h, line, contents(cw)[0..m]);
+                                        line = buffer.push(h, line, byte_of(32));
+                                        line = put_hex(h, line, contents(dw));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            line = buffer.push(h, line, byte_of(10));
+            borrow line as &lx in {
+                buffer.write(i, lx);
+            }
+            buffer.drop(h, line);
+            buffer.drop(h, text);
+            unbox_slice(h, body);
+            unbox_slice(h, canon);
+            unbox_slice(h, digest);
+            unbox_slice(h, st);
+        }
+    }
+    release(heap);
+    release(io);
+    return 0;
+}

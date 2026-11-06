@@ -1,0 +1,334 @@
+edition 7;
+
+// The driver of `scripts/check_eth.py` (docs/design.md section 8.2): one command on standard input, one answer on standard output. Not the product's command line.
+//
+//   H <hex>                       keccak256                                     -> "0 <hash>"
+//   A <pub65>                     address of a public key                       -> "0 <addr20> <EIP-55 text>"
+//   C <addr20>                    EIP-55 text                                   -> "0 <text>"
+//   P <text>                      parse address text (the field is the text)    -> "0 <addr20>"
+//   R <item> <item> ...           RLP of a list of byte strings (`_` is empty)  -> "0 <hex>"
+//   U <hex>                       RLP of one unsigned integer (big-endian)      -> "0 <hex>"
+//   E <to20> <amount>             ERC-20 transfer calldata                      -> "0 <hex>"
+//   T <chain> <nonce> <prio> <fee> <gas> <to20> <value> <data> [<key32>]
+//                                 type-2 transaction (integers are big-endian hex, `_` is empty)
+//                                                                               -> "0 <unsigned> <signing hash>" and, with a key, " <signed> <tx hash>"
+//   D <hex>                       strict RLP decode: is the input exactly one canonical item?             -> "0" or a refusal
+//   V <raw> <chain> <nonce> <token> <recipient> <amount> <feecap> <gascap>
+//                                 validate an unsigned message against what was authorised (integers big-endian hex) -> "0" or the first refusal
+//   W ...                         the same for a signed transaction
+//   M <body> <sig65>              signed message of a body and a signature (the encoder alone, with any signature the caller crafts) -> "0 <hex>"
+//
+// A refusal prints `E<code>` (the code, positive). Every field is hex except the text of `P`.
+
+import chain.address;
+import chain.erc20;
+import chain.hex;
+import chain.keccak;
+import chain.rlp;
+import chain.tx1559;
+import chain.txcheck;
+import secp256k1;
+import std.buffer;
+import std.io;
+
+fn read_stdin[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    var c = getchar(io);
+    while c >= 0 {
+        out = buffer.push(heap, out, byte_of(c));
+        c = getchar(io);
+    }
+    return out;
+}
+
+// Splits the line into fields. Field k's bytes (hex-decoded; `_` is empty; the text itself for field 1 of `P`) are at arena[meta[k]..meta[k] + meta[16 + k]].
+// Returns the number of fields, the op included.
+fn split_fields[&t, &a, &m](text: &t [byte], arena: &!a [byte], meta: &!m [int]) -> [] int {
+    let raw = int_of(text[0]) == 'P';
+    var n = 0;
+    var at = 0;
+    var i = 0;
+    while i < len(text) && n < 12 {
+        while i < len(text) && (int_of(text[i]) == 32 || int_of(text[i]) == 10) {
+            i = i + 1;
+        }
+        if i < len(text) {
+            var j = i;
+            while j < len(text) && int_of(text[j]) != 32 && int_of(text[j]) != 10 {
+                j = j + 1;
+            }
+            meta[n] = at;
+            if n == 0 || raw && n == 1 {
+                var k = i;
+                while k < j {
+                    arena[at] = text[k];
+                    at = at + 1;
+                    k = k + 1;
+                }
+            } else if !(j - i == 1 && int_of(text[i]) == '_') {
+                var k = i;
+                while k + 1 < j {
+                    arena[at] = byte_of(hex.value(int_of(text[k])) * 16 + hex.value(int_of(text[k + 1])));
+                    at = at + 1;
+                    k = k + 2;
+                }
+            }
+            meta[16 + n] = at - meta[n];
+            n = n + 1;
+            i = j;
+        }
+    }
+    return n;
+}
+
+fn field[&a, &m](arena: &a [byte], meta: &m [int], k: int) -> [] &a [byte] {
+    return arena[meta[k]..meta[k] + meta[16 + k]];
+}
+
+fn emit_char[&o](out: &!o [byte], pos: int, c: int) -> [] int {
+    out[pos] = byte_of(c);
+    return pos + 1;
+}
+
+fn emit_hex[&o, &b](out: &!o [byte], pos: int, bytes: &b [byte]) -> [] int {
+    var p = pos;
+    var k = 0;
+    while k < len(bytes) {
+        let v = int_of(bytes[k]);
+        p = emit_char(out, p, hex.digit(v >> 4));
+        p = emit_char(out, p, hex.digit(v & 15));
+        k = k + 1;
+    }
+    return p;
+}
+
+fn emit_text[&o, &b](out: &!o [byte], pos: int, text: &b [byte]) -> [] int {
+    var p = pos;
+    var k = 0;
+    while k < len(text) {
+        p = emit_char(out, p, int_of(text[k]));
+        k = k + 1;
+    }
+    return p;
+}
+
+// The big-endian bytes as an integer (at most 7 bytes: enough for a chain id, a nonce or a gas limit).
+fn int_of_bytes[&b](b: &b [byte]) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < len(b) && i < 7 {
+        v = v * 256 + int_of(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn if_signed_validate[&d, &t, &r, &a, &c](signed: bool, raw: &d [byte], chain_id: int, nonce: int, token: &t [byte], recipient: &r [byte], amount: &a [byte], fee_cap: &c [byte], gas_cap: int) -> [] int {
+    if signed {
+        return txcheck.validate_signed(raw, chain_id, nonce, token, recipient, amount, fee_cap, gas_cap);
+    }
+    return txcheck.validate_unsigned(raw, chain_id, nonce, token, recipient, amount, fee_cap, gas_cap);
+}
+
+// Runs the op. Answers the text length written to `out`, or a negative refusal.
+fn run[&a, &m, &s, &w, &c, &o](op: int, nf: int, arena: &a [byte], meta: &m [int], st: &!s [int], work: &!w [int], scratch: &!c [byte], out: &!o [byte]) -> [] int {
+    let f1 = field(arena, meta, 1);
+    let f2 = field(arena, meta, 2);
+    let digest = scratch[3000..3032];
+    var p = emit_char(out, 0, '0');
+    p = emit_char(out, p, ' ');
+    if op == 'H' {
+        let rc = keccak.hash256(st, f1, digest);
+        if rc != 0 {
+            return rc;
+        }
+        return emit_hex(out, p, digest);
+    }
+    if op == 'A' {
+        var rc = address.from_public_key(st, f1, scratch[0..20]);
+        if rc == 0 {
+            rc = address.checksum(st, scratch[0..20], scratch[100..142]);
+        }
+        if rc != 0 {
+            return rc;
+        }
+        p = emit_hex(out, p, scratch[0..20]);
+        p = emit_char(out, p, ' ');
+        return emit_text(out, p, scratch[100..142]);
+    }
+    if op == 'C' {
+        let rc = address.checksum(st, f1, scratch[100..142]);
+        if rc != 0 {
+            return rc;
+        }
+        return emit_text(out, p, scratch[100..142]);
+    }
+    if op == 'P' {
+        let rc = address.parse(st, f1, scratch[0..20]);
+        if rc != 0 {
+            return rc;
+        }
+        return emit_hex(out, p, scratch[0..20]);
+    }
+    if op == 'U' {
+        let n = rlp.put_uint(scratch, 0, f1);
+        if n < 0 {
+            return n;
+        }
+        return emit_hex(out, p, scratch[0..n]);
+    }
+    if op == 'R' {
+        // the payload is built at 1000, then the header is put in front of it
+        var q = 1000;
+        var k = 1;
+        while k < nf && q >= 0 {
+            q = rlp.put_bytes(scratch, q, field(arena, meta, k));
+            k = k + 1;
+        }
+        if q < 0 {
+            return q;
+        }
+        let hdr = rlp.put_list_header(scratch, 0, q - 1000);
+        if hdr < 0 {
+            return hdr;
+        }
+        var j = 0;
+        while j < q - 1000 {
+            scratch[hdr + j] = scratch[1000 + j];
+            j = j + 1;
+        }
+        return emit_hex(out, p, scratch[0..hdr + q - 1000]);
+    }
+    if op == 'E' {
+        let rc = erc20.transfer_calldata(f1, f2, scratch[0..68]);
+        if rc != 0 {
+            return rc;
+        }
+        return emit_hex(out, p, scratch[0..68]);
+    }
+    if op == 'D' {
+        let rc = rlp.whole(f1, st[0..3]);
+        if rc != 0 {
+            return rc;
+        }
+        return p;
+    }
+    if op == 'V' || op == 'W' {
+        let rc = if_signed_validate(op == 'W', f1, int_of_bytes(f2), int_of_bytes(field(arena, meta, 3)), field(arena, meta, 4), field(arena, meta, 5), field(arena, meta, 6), field(arena, meta, 7), int_of_bytes(field(arena, meta, 8)));
+        if rc != 0 {
+            return rc;
+        }
+        return p;
+    }
+    if op == 'M' {
+        let sm = tx1559.signed_message(scratch[2100..2900], f1, f2);
+        if sm < 0 {
+            return sm;
+        }
+        return emit_hex(out, p, scratch[2100..2100 + sm]);
+    }
+    if op == 'T' {
+        let n = tx1559.body(scratch[1000..2000], int_of_bytes(f1), int_of_bytes(f2), field(arena, meta, 3), field(arena, meta, 4), int_of_bytes(field(arena, meta, 5)), field(arena, meta, 6), field(arena, meta, 7), field(arena, meta, 8));
+        if n < 0 {
+            return n;
+        }
+        let body = scratch[1000..1000 + n];
+        let um = tx1559.unsigned_message(scratch[0..900], body);
+        if um < 0 {
+            return um;
+        }
+        var rc = keccak.hash256(st, scratch[0..um], digest);
+        if rc != 0 {
+            return rc;
+        }
+        p = emit_hex(out, p, scratch[0..um]);
+        p = emit_char(out, p, ' ');
+        p = emit_hex(out, p, digest);
+        let key = field(arena, meta, 9);
+        if nf > 9 {
+            let sig = scratch[2000..2065];
+            rc = secp256k1.sign(digest, key, scratch[0..0], sig, work);
+            if rc != 0 {
+                return rc;
+            }
+            let sm = tx1559.signed_message(scratch[2100..2900], body, sig);
+            if sm < 0 {
+                return sm;
+            }
+            rc = keccak.hash256(st, scratch[2100..2100 + sm], scratch[3040..3072]);
+            if rc != 0 {
+                return rc;
+            }
+            p = emit_char(out, p, ' ');
+            p = emit_hex(out, p, scratch[2100..2100 + sm]);
+            p = emit_char(out, p, ' ');
+            p = emit_hex(out, p, scratch[3040..3072]);
+        }
+        return p;
+    }
+    return -999;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    borrow mut heap as &!h in {
+        borrow mut io as &!i in {
+            let text = read_stdin(h, i);
+            let st = box_slice(h, keccak.state_len(), 0);
+            let work = box_slice(h, secp256k1.work_len(), 0);
+            let scratch = box_slice(h, 4096, byte_of(0));
+            let arena = box_slice(h, 8192, byte_of(0));
+            let out = box_slice(h, 8192, byte_of(0));
+            let meta = box_slice(h, 32, 0);
+            var n = -999;
+            borrow text as &tx in {
+                borrow mut arena as &!ar in {
+                    borrow mut meta as &!me in {
+                        let src = buffer.bytes(tx);
+                        let nf = split_fields(src, contents(ar), contents(me));
+                        borrow mut st as &!s1 in {
+                            borrow mut work as &!w1 in {
+                                borrow mut scratch as &!sc in {
+                                    borrow mut out as &!ou in {
+                                        n = run(int_of(src[0]), nf, contents(ar), contents(me), contents(s1), contents(w1), contents(sc), contents(ou));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            var line = buffer.empty(h, 32);
+            if n < 0 {
+                line = buffer.push(h, line, byte_of('E'));
+                line = buffer.push_nat(h, line, 0 - n);
+            } else {
+                borrow out as &ob in {
+                    line = buffer.append(h, line, contents(ob)[0..n]);
+                }
+            }
+            line = buffer.push(h, line, byte_of(10));
+            borrow line as &lx in {
+                buffer.write(i, lx);
+            }
+            buffer.drop(h, line);
+            buffer.drop(h, text);
+            unbox_slice(h, st);
+            unbox_slice(h, work);
+            unbox_slice(h, scratch);
+            unbox_slice(h, arena);
+            unbox_slice(h, out);
+            unbox_slice(h, meta);
+        }
+    }
+    release(heap);
+    release(io);
+    return 0;
+}

@@ -1,0 +1,9 @@
+[package]
+name = "chain"
+cancho = "162633a79a45a14e5eeecb54cb33c31a39bfaed9"   # the compiler these sources were written against: built from the seed chain (scripts/build-standalone.sh), stage 2 = stage 3
+
+[[bin]]
+name = "chain"
+sources = ["lib/keccak", "tools/chain"]
+std = true
+out = "build/chain"
