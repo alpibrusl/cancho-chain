@@ -7,6 +7,7 @@ edition 7;
 //   S                           the policy schema as JSON Schema 2020-12       -> the text
 //   D <policy-json> <intent-json> <caller> <now> <current-version> <revoked> <history>
 //                               parse both, then decide                        -> "0 <record> <decision digest>" or `E<code>`
+//   G <record>                  `decide.digest` of the given bytes, whatever they are  -> "0 <digest>" or `E<code>`
 //   O <policy-json> / W <policy-json>   `policy.parse` with a 1000-byte output / 100 words of working space (too short)  -> `E<code>`
 //   E <policy-canonical> <intent-canonical> <caller> <now> <current-version> <revoked> <history> / K <...>
 //                               `decide` with a 100-byte output / 100 words of working space (too short)  -> `E<code>`
@@ -145,6 +146,13 @@ fn run[&h, &a, &m, &s, &o, &pb, &ib, &rb](heap: &!h Heap, op: int, nf: int, aren
         }
         p = emit_hex(out, p, pol[0..n]);
         p = emit_char(out, p, ' ');
+        return emit_hex(out, p, rec[0..32]);
+    }
+    if op == 'G' {
+        let rc = decide.digest(st, f1, rec[0..32]);
+        if rc != 0 {
+            return rc;
+        }
         return emit_hex(out, p, rec[0..32]);
     }
     if op == 'O' {

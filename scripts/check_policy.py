@@ -198,7 +198,7 @@ BREAKERS = {
 }
 
 
-def run(exe, cases):
+def run(exe, cases, quiet=False):
     bad = total = 0
 
     def check(name, got, want):
@@ -206,7 +206,7 @@ def run(exe, cases):
         total += 1
         if got != want:
             bad += 1
-            if bad <= 8:
+            if bad <= 8 and not quiet:
                 print(f"  MISMATCH {name}: got {got} want {want}")
 
     rng = random.Random(20261106)
@@ -402,6 +402,30 @@ def run(exe, cases):
     t = Scenario(rng)
     t.hist = [(t.now - 5, keccak(b"a"), 700), (t.now - 6, keccak(b"b"), 700), (t.now - 86400, keccak(b"c"), 10**9)]
     check("several records are summed, an old one is not", t.run(exe), t.expected())
+    # the chain compared in both directions
+    t = Scenario(rng)
+    t.I.chain = t.P.chain - 1
+    check("the intent's chain below the policy's", t.run(exe), t.expected())
+    # replay anywhere in the history, not only first
+    for pos in range(4):
+        t = Scenario(rng)
+        t.hist = [(t.now - 10 - k, keccak(bytes([k])), 1) for k in range(4)]
+        t.hist[pos] = (t.now - 10 - pos, t.I.digest(), 1)
+        check(f"a replay at position {pos} of 4", t.run(exe), t.expected())
+    # an overflow in any record is not forgotten by a later one
+    for name, hist in (("overflow in the first record, a small second", [(1, U256 - 1), (2, 1)]), ("a small first record, overflow in the second", [(1, 1), (2, U256 - 1)]),
+                       ("overflow in the first of three", [(1, U256 - 1), (2, 1), (3, 1)])):
+        t = Scenario(rng)
+        t.P.per, t.P.daily, t.P.approval = U256 - 1, U256 - 1, None
+        t.I.amount = 2
+        t.hist = [(t.now - 5 - k, keccak(bytes([k + 9])), am) for k, (_, am) in enumerate(hist)]
+        check(name, t.run(exe), t.expected())
+    # the decision digest of any record the engine could write, and refusal of any other length
+    for n in (117, 182, 0, 1, 300):
+        check(f"decision digest of {n} bytes", tup(call(exe, f"G {hx(bytes(range(256))[:n] if n <= 256 else bytes(n))}")), "E234")
+    for n in (118, 150, 181):
+        rec = bytes((i * 7 + 3) & 255 for i in range(n))
+        check(f"decision digest of {n} bytes", tup(call(exe, f"G {hx(rec)}")), ("0", keccak(b"cancho-chain/decision/v1" + rec).hex()))
     # D: from the JSON, end to end
     for k in range(cases):
         s = Scenario(rng)
@@ -430,6 +454,11 @@ def run(exe, cases):
     check("a decision working space that is too short", decide(exe, s.P, s.I, s.caller, s.now, s.cur, False, [], op="K"), "E235")
     return bad, total
 
+
+# Mutants no input can kill, with the reason. Reported, not failed: a survivor outside this list fails the run.
+EXPECTED_SURVIVORS = {
+    "the working space limit": "defence in depth: with 50 to 109 words the first check passes, the Keccak call that follows refuses the short working space, and `decide` answers the same decide-work code",
+}
 
 # (name, file, old, new)
 MUTANTS = [
@@ -557,30 +586,39 @@ MUTANTS = [
 ]
 
 
+def one_mutant(cancho, cases, entry):
+    name, fname, old, new = entry
+    d = tempfile.mkdtemp()
+    try:
+        os.makedirs(f"{d}/lib/policy")
+        for f in ("policy.cho", "decide.cho"):
+            shutil.copy(os.path.join(ROOT, "lib/policy", f), f"{d}/lib/policy/{f}")
+        p = f"{d}/lib/policy/{fname}"
+        text = open(p).read()
+        if text.count(old) != 1:
+            return name, "BAD", f"mutant pattern not unique ({text.count(old)})"
+        open(p, "w").write(text.replace(old, new))
+        exe = f"{d}/pol"
+        r = subprocess.run([cancho, "build", "--std", *srcs(f"{d}/lib"), "-o", exe], capture_output=True, text=True)
+        if r.returncode != 0:
+            return name, "NOBUILD", r.stderr[:300]
+        bad, total = run(exe, cases, quiet=True)
+        return name, ("KILLED" if bad else "SURVIVED"), f"{bad}/{total}"
+    finally:
+        shutil.rmtree(d)
+
+
 def mutants(cancho, cases):
+    from concurrent.futures import ThreadPoolExecutor
+    workers = int(os.environ.get("MUTANT_WORKERS", "4"))
     survived = 0
-    for name, fname, old, new in MUTANTS:
-        d = tempfile.mkdtemp()
-        try:
-            os.makedirs(f"{d}/lib/policy")
-            for f in ("policy.cho", "decide.cho"):
-                shutil.copy(os.path.join(ROOT, "lib/policy", f), f"{d}/lib/policy/{f}")
-            p = f"{d}/lib/policy/{fname}"
-            text = open(p).read()
-            if text.count(old) != 1:
-                raise SystemExit(f"mutant pattern not unique ({text.count(old)}): {name}")
-            open(p, "w").write(text.replace(old, new))
-            exe = f"{d}/pol"
-            r = subprocess.run([cancho, "build", "--std", *srcs(f"{d}/lib"), "-o", exe], capture_output=True, text=True)
-            if r.returncode != 0:
-                print(f"mutant '{name}': did not build\n{r.stderr[:300]}")
-                survived += 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for name, status, detail in pool.map(lambda e: one_mutant(cancho, cases, e), MUTANTS):
+            if status == "SURVIVED" and name in EXPECTED_SURVIVORS:
+                print(f"mutant '{name}': SURVIVED, expected: {EXPECTED_SURVIVORS[name]}")
                 continue
-            bad, total = run(exe, cases)
-            print(f"mutant '{name}': {'KILLED' if bad else 'SURVIVED'} ({bad}/{total})")
-            survived += 0 if bad else 1
-        finally:
-            shutil.rmtree(d)
+            print(f"mutant '{name}': {status} ({detail})")
+            survived += 0 if status == "KILLED" else 1
     return survived
 
 
@@ -597,7 +635,7 @@ def main():
             sys.exit(1)
         if "--mutants" in sys.argv:
             s = mutants(cancho, max(3, cases // 5))
-            print(f"mutants: {len(MUTANTS) - s}/{len(MUTANTS)} killed")
+            print(f"mutants: {len(MUTANTS) - s - len(EXPECTED_SURVIVORS)}/{len(MUTANTS)} killed, {len(EXPECTED_SURVIVORS)} equivalent (above), {s} unexpected survivors")
             if s:
                 sys.exit(1)
     finally:
