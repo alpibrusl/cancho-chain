@@ -68,13 +68,8 @@ def run(exe, cases):
     for spec in ("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB", "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb",
                  "0x52908400098527886E0F7030069857D2E4169EE7", "0x8617E340B3D01FA5F11F306F4090FD50E238070D", "0xde709f2102306220921060314715629080e2fb77", "0x27b1fdb04752bbc536007a920d24acb045561c26"):
         rc, out = call(exe, f"P {spec}")
-        if spec[2:].isupper() or spec[2:].replace("0", "").isdigit():
-            pass
-        want = bytes.fromhex(spec[2:]).hex()
-        # the EIP-55 test set includes all-caps and all-lower strings: all-caps is refused by design (section 8.1), lower and mixed accepted
-        letters = [ch for ch in spec[2:] if ch.isalpha()]
-        expect_refused = bool(letters) and all(ch.isupper() for ch in letters)
-        c.check(f"parse {spec}", (rc, out), ("E142", []) if expect_refused else ("0", [want]))
+        # every vector of the specification is a valid address: its all-caps ones are checksummed addresses whose checksum is all capitals (section 8.1)
+        c.check(f"parse {spec}", (rc, out), ("0", [bytes.fromhex(spec[2:]).hex()]))
         rc, out = call(exe, f"C {spec[2:].lower()}")
         c.check(f"checksum {spec}", (rc, out), ("0", [to_checksum_address(spec)]))
     for _ in range(cases):
@@ -96,7 +91,7 @@ def run(exe, cases):
             c.check("parse with one letter's case flipped", rc, "E142" if mixed else "0")
     for name, text, want in (("no prefix", "7E5F4552091A69125d5DfCb7b8C2659029395Bdf", "E140"), ("0X", "0X7E5F4552091A69125d5DfCb7b8C2659029395Bdf", "E140"),
                              ("short", "0x7E5F4552091A69125d5DfCb7b8C2659029395Bd", "E140"), ("long", "0x7E5F4552091A69125d5DfCb7b8C2659029395BdfA", "E140"),
-                             ("non-hex", "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdg", "E141"), ("all upper", "0x7E5F4552091A69125D5DFCB7B8C2659029395BDF", "E142"),
+                             ("non-hex", "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdg", "E141"), ("an all-capitals spelling that is not the checksum", "0x7E5F4552091A69125D5DFCB7B8C2659029395BDF", "E142"),
                              ("digits only", "0x" + "1" * 40, "0")):
         rc, _ = call(exe, f"P {text}")
         c.check(f"parse refuses {name}", rc, want)
@@ -194,16 +189,15 @@ MUTANTS = [
     ("rlp: single byte below 0x80 -> 0x81", "rlp.cho", "int_of(data[0]) < 128 {", "int_of(data[0]) < 129 {"),
     ("rlp: list base 0xc1", "rlp.cho", "return put_header(out, pos, 192, payload_len);", "return put_header(out, pos, 193, payload_len);"),
     ("rlp: long header 0xb8 + w", "rlp.cho", "base + 55 + w", "base + 56 + w"),
-    ("rlp: length bytes little-endian", "rlp.cho", "p = put(out, p, n >> (8 * i) & 255);", "p = put(out, p, n >> (8 * (w - 1 - i)) & 255);"),
+    ("rlp: length bytes little-endian", "rlp.cho", "p = put(out, p, n >> 8 * i & 255);", "p = put(out, p, n >> 8 * (w - 1 - i) & 255);"),
     ("rlp: leading zeros kept", "rlp.cho", "while at < len(be) && int_of(be[at]) == 0 {", "while at < 0 && int_of(be[at]) == 0 {"),
     ("rlp: put_int single-byte rule", "rlp.cho", "if v > 0 && v < 128 {", "if v > 0 && v < 127 {"),
-    ("rlp: integer bytes little-endian", "rlp.cho", "p = put(out, p, v >> (8 * i) & 255);", "p = put(out, p, v >> (8 * (w - 1 - i)) & 255);"),
+    ("rlp: integer bytes little-endian", "rlp.cho", "p = put(out, p, v >> 8 * i & 255);", "p = put(out, p, v >> 8 * (w - 1 - i) & 255);"),
     ("address: checksum threshold 8 -> 9", "address.cho", "nib >= 8", "nib >= 9"),
-    ("address: checksum nibble order", "address.cho", "(4 - 4 * (i % 2))", "(4 * (i % 2))"),
+    ("address: checksum nibble order", "address.cho", ">> 4 - 4 * (i % 2) & 15", ">> 4 * (i % 2) & 15"),
     ("address: last 20 bytes off by one", "address.cho", "out[i] = h[12 + i];", "out[i] = h[11 + i];"),
     ("address: hashes the 0x04 prefix too", "address.cho", "keccak.hash256(st, pubkey[1..65], h)", "keccak.hash256(st, pubkey[0..64], h)"),
-    ("address: mixed case not verified", "address.cho", "if upper == 1 && lower == 1 {", "if upper == 1 && lower == 2 {"),
-    ("address: all-uppercase accepted", "address.cho", "if upper == 1 && lower == 0 {", "if upper == 2 && lower == 0 {"),
+    ("address: uppercase text not verified", "address.cho", "if upper == 1 {", "if upper == 2 {"),
     ("address: 0X accepted", "address.cho", "int_of(text[1]) != 120", "int_of(text[1]) != 120 && int_of(text[1]) != 88"),
     ("address: non-hex accepted", "address.cho", "if code != 0 {\n        return -141;", "if code != 7 {\n        return -141;"),
     ("erc20: selector byte", "erc20.cho", "out[3] = byte_of(0xbb);", "out[3] = byte_of(0xba);"),

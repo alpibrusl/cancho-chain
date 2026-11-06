@@ -1,0 +1,614 @@
+edition 7;
+
+module chain.policy;
+
+import chain.address;
+import chain.intent;
+import chain.keccak;
+import schema;
+import std.buffer;
+import std.bytes;
+import std.json;
+
+// The policy (docs/design.md section 11.1): an administrator's JSON, checked against a strict cancho-schema object, then read into a canonical binary layout and an immutable
+// digest, or refused. Canonical layout, version 1 (at most max_len() = 1024 bytes):
+//   [0] 1   [1] n, then the policy id (n bytes)   then the policy version (4 bytes)   then m, and the principal (m bytes)   then the chain id (8)   the asset contract (20)
+//   the decimals (1)   the operations (1, a bit set: 1 = erc20_transfer)   r, the number of recipients (1), then r addresses of 20 bytes   the per-transaction limit (32)
+//   the daily limit (32)   the approval threshold (32; 2^256 - 1 if absent)   the fee cap (32)   the gas limit (8)   not_before (8)   not_after (8)   the decision ttl (4).
+// Every number is big-endian.
+
+pub fn refused_json() -> [] int {
+    return -220;
+}
+
+pub fn refused_schema() -> [] int {
+    return -221;
+}
+
+pub fn refused_address() -> [] int {
+    return -222;
+}
+
+pub fn refused_number() -> [] int {
+    return -223;
+}
+
+pub fn refused_text() -> [] int {
+    return -224;
+}
+
+pub fn refused_duplicate() -> [] int {
+    return -225;
+}
+
+pub fn refused_order() -> [] int {
+    return -226;
+}
+
+pub fn refused_size() -> [] int {
+    return -227;
+}
+
+pub fn refused_output() -> [] int {
+    return -228;
+}
+
+pub fn refused_work() -> [] int {
+    return -229;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -220 {
+        return "policy-json";
+    }
+    if code == -221 {
+        return "policy-schema";
+    }
+    if code == -222 {
+        return "policy-address";
+    }
+    if code == -223 {
+        return "policy-number";
+    }
+    if code == -224 {
+        return "policy-text";
+    }
+    if code == -225 {
+        return "policy-duplicate";
+    }
+    if code == -226 {
+        return "policy-order";
+    }
+    if code == -227 {
+        return "policy-size";
+    }
+    if code == -228 {
+        return "policy-output";
+    }
+    if code == -229 {
+        return "policy-work";
+    }
+    return "policy-unknown";
+}
+
+pub fn max_len() -> [] int {
+    return 1024;
+}
+
+pub fn max_body() -> [] int {
+    return 8192;
+}
+
+static domain: [byte] {
+    let t = alloc_slice[static](22, byte_of(0));
+    let s = "cancho-chain/policy/v1";
+    var i = 0;
+    while i < 22 {
+        t[i] = s[i];
+        i = i + 1;
+    }
+    return t;
+}
+
+// ---- The schema ----
+//
+// Slots, in the order the fields are added: 0 asset.contract, 1 asset.decimals, 2 limits.per_transaction, 3 limits.daily_total, 4 limits.approval_required_above (optional),
+// 5 fees.max_fee_per_gas, 6 fees.gas_limit, 7 validity.not_before, 8 validity.not_after, 9 policy_id, 10 version, 11 principal, 12 chain_id, 13 asset, 14 operations,
+// 15 recipients, 16 limits, 17 fees, 18 validity, 19 decision_ttl_seconds.
+
+fn build[&h](heap: &!h Heap) -> [heap] (schema.Schema, int) {
+    let s0 = schema.empty(heap);
+    let (s1, address) = schema.new_string(heap, s0, 42, 42);
+    let (s2, amount) = schema.new_string(heap, s1, 1, 78);
+    let (s3, text) = schema.new_string(heap, s2, 1, 64);
+    let (s4, small) = schema.new_int(heap, s3, 0, 36);
+    let (s5, count) = schema.new_int(heap, s4, 1, 9007199254740991);
+    let (s6, stamp) = schema.new_int(heap, s5, 0, 9007199254740991);
+    let (s7, ttl) = schema.new_int(heap, s6, 1, 3600);
+    let (s8, version) = schema.new_int(heap, s7, 1, 4294967295);
+    let (s9, op) = schema.new_string(heap, s8, 1, 32);
+    let s10 = schema.add_choice(heap, s9, op, "erc20_transfer");
+    let (s11, ops) = schema.new_array(heap, s10, op, 1, 1);
+    let (s12, recipients) = schema.new_array(heap, s11, address, 1, 32);
+    let (s13, asset) = schema.new_object(heap, s12, true);
+    let (s14, limits) = schema.new_object(heap, s13, true);
+    let (s15, fees) = schema.new_object(heap, s14, true);
+    let (s16, validity) = schema.new_object(heap, s15, true);
+    let (s17, root) = schema.new_object(heap, s16, true);
+    let s18 = schema.add_field(heap, s17, asset, "contract", address, true);
+    let s19 = schema.add_field(heap, s18, asset, "decimals", small, true);
+    let s20 = schema.add_field(heap, s19, limits, "per_transaction", amount, true);
+    let s21 = schema.add_field(heap, s20, limits, "daily_total", amount, true);
+    let s22 = schema.add_field(heap, s21, limits, "approval_required_above", amount, false);
+    let s23 = schema.add_field(heap, s22, fees, "max_fee_per_gas", amount, true);
+    let s24 = schema.add_field(heap, s23, fees, "gas_limit", count, true);
+    let s25 = schema.add_field(heap, s24, validity, "not_before", stamp, true);
+    let s26 = schema.add_field(heap, s25, validity, "not_after", stamp, true);
+    let s27 = schema.add_field(heap, s26, root, "policy_id", text, true);
+    let s28 = schema.add_field(heap, s27, root, "version", version, true);
+    let s29 = schema.add_field(heap, s28, root, "principal", text, true);
+    let s30 = schema.add_field(heap, s29, root, "chain_id", count, true);
+    let s31 = schema.add_field(heap, s30, root, "asset", asset, true);
+    let s32 = schema.add_field(heap, s31, root, "operations", ops, true);
+    let s33 = schema.add_field(heap, s32, root, "recipients", recipients, true);
+    let s34 = schema.add_field(heap, s33, root, "limits", limits, true);
+    let s35 = schema.add_field(heap, s34, root, "fees", fees, true);
+    let s36 = schema.add_field(heap, s35, root, "validity", validity, true);
+    let s37 = schema.add_field(heap, s36, root, "decision_ttl_seconds", ttl, true);
+    return (s37, root);
+}
+
+pub fn json_schema[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    let (s, root) = build(heap);
+    var out = buffer.empty(heap, 16);
+    borrow s as &sr in {
+        buffer.drop(heap, out);
+        out = schema.json_schema(heap, sr, root);
+    }
+    schema.drop(heap, s);
+    return out;
+}
+
+// ---- Writing the canonical form ----
+
+fn put_be[&o](out: &!o [byte], at: int, v: int, width: int) -> [] int {
+    var i = 0;
+    while i < width {
+        out[at + i] = byte_of(v >> 8 * (width - 1 - i) & 255);
+        i = i + 1;
+    }
+    return at + width;
+}
+
+fn put_text[&o, &b, &t](out: &!o [byte], at: int, body: &b [byte], tape: &t [int], node: int) -> [] int {
+    let v = json.string_view(body, tape, node);
+    out[at] = byte_of(len(v));
+    var i = 0;
+    while i < len(v) {
+        out[at + 1 + i] = v[i];
+        i = i + 1;
+    }
+    return at + 1 + len(v);
+}
+
+// An integer field written as a plain integer (no fraction or exponent), as an int; or -1.
+fn int_field[&b, &t](body: &b [byte], tape: &t [int], node: int) -> [] int {
+    if !json.is_int(tape, node) {
+        return -1;
+    }
+    return json.to_int(body, tape, node);
+}
+
+pub fn cmp32[&a, &c](a: &a [byte], c: &c [byte]) -> [] int {
+    var i = 0;
+    while i < 32 {
+        let x = int_of(a[i]);
+        let y = int_of(c[i]);
+        if x < y {
+            return -1;
+        }
+        if x > y {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// No key is written with an escape or twice, in the object at node `obj` and in every object inside it, to depth 3. Members past 16 are the schema's to refuse. 0, or -225.
+fn keys_ok[&b, &t](body: &b [byte], tape: &t [int], obj: int, depth: int) -> [] int {
+    if depth > 3 {
+        return -221;
+    }
+    let n = tape[3 * obj + 1];
+    if n > 16 {
+        return -221;
+    }
+    var j = obj + 1;
+    var a = 0;
+    while a < n {
+        if !json.string_plain(tape, j) {
+            return -225;
+        }
+        var k = json.skip(tape, j + 1);
+        var c = a + 1;
+        while c < n {
+            if !json.string_plain(tape, k) {
+                return -225;
+            }
+            if bytes.equal(json.string_view(body, tape, j), json.string_view(body, tape, k)) {
+                return -225;
+            }
+            k = json.skip(tape, k + 1);
+            c = c + 1;
+        }
+        if json.is_object(tape, j + 1) {
+            let inner = keys_ok(body, tape, j + 1, depth + 1);
+            if inner != 0 {
+                return inner;
+            }
+        }
+        j = json.skip(tape, j + 1);
+        a = a + 1;
+    }
+    return 0;
+}
+
+// The validated document into `out`: the length, or the first refusal. `slots` hold the tape node of each field's value (-1 for an absent optional one).
+fn fill[&b, &t, &u, &s, &o](body: &b [byte], tape: &t [int], slots: &u [int], st: &!s [int], out: &!o [byte]) -> [] int {
+    out[0] = byte_of(1);
+    if !intent.is_word(body, tape, slots[9]) {
+        return -224;
+    }
+    var at = put_text(out, 1, body, tape, slots[9]);
+    let version = int_field(body, tape, slots[10]);
+    if version < 0 {
+        return -223;
+    }
+    at = put_be(out, at, version, 4);
+    if !intent.is_word(body, tape, slots[11]) {
+        return -224;
+    }
+    at = put_text(out, at, body, tape, slots[11]);
+    let chain = int_field(body, tape, slots[12]);
+    if chain < 0 {
+        return -223;
+    }
+    at = put_be(out, at, chain, 8);
+    let contract = slots[0];
+    if !json.string_plain(tape, contract) || address.parse(st, json.string_view(body, tape, contract), out[at..at + 20]) != 0 {
+        return -222;
+    }
+    at = at + 20;
+    let decimals = int_field(body, tape, slots[1]);
+    if decimals < 0 {
+        return -223;
+    }
+    out[at] = byte_of(decimals);
+    out[at + 1] = byte_of(1);
+    at = at + 2;
+    let recipients = slots[15];
+    let count = json.count(tape, recipients);
+    out[at] = byte_of(count);
+    at = at + 1;
+    var i = 0;
+    while i < count {
+        let node = json.at(tape, recipients, i);
+        if !json.string_plain(tape, node) || address.parse(st, json.string_view(body, tape, node), out[at..at + 20]) != 0 {
+            return -222;
+        }
+        var k = 0;
+        while k < i {
+            if bytes.equal(out[at..at + 20], out[at - 20 * (i - k)..at - 20 * (i - k) + 20]) {
+                return -225;
+            }
+            k = k + 1;
+        }
+        at = at + 20;
+        i = i + 1;
+    }
+    let per = at;
+    if !json.string_plain(tape, slots[2]) || intent.read_amount(json.string_view(body, tape, slots[2]), out[at..at + 32]) != 0 {
+        return -223;
+    }
+    at = at + 32;
+    let daily = at;
+    if !json.string_plain(tape, slots[3]) || intent.read_amount(json.string_view(body, tape, slots[3]), out[at..at + 32]) != 0 {
+        return -223;
+    }
+    at = at + 32;
+    let approval = at;
+    if slots[4] < 0 {
+        i = 0;
+        while i < 32 {
+            out[at + i] = byte_of(255);
+            i = i + 1;
+        }
+    } else if !json.string_plain(tape, slots[4]) || intent.read_amount(json.string_view(body, tape, slots[4]), out[at..at + 32]) != 0 {
+        return -223;
+    }
+    at = at + 32;
+    if !json.string_plain(tape, slots[5]) || intent.read_amount(json.string_view(body, tape, slots[5]), out[at..at + 32]) != 0 {
+        return -223;
+    }
+    at = at + 32;
+    let gas = int_field(body, tape, slots[6]);
+    let not_before = int_field(body, tape, slots[7]);
+    let not_after = int_field(body, tape, slots[8]);
+    let ttl = int_field(body, tape, slots[19]);
+    if gas < 0 || not_before < 0 || not_after < 0 || ttl < 0 {
+        return -223;
+    }
+    at = put_be(out, at, gas, 8);
+    at = put_be(out, at, not_before, 8);
+    at = put_be(out, at, not_after, 8);
+    at = put_be(out, at, ttl, 4);
+    // the limits must be ordered, and the window must not be empty
+    if cmp32(out[per..per + 32], out[daily..daily + 32]) > 0 {
+        return -226;
+    }
+    if slots[4] >= 0 && cmp32(out[approval..approval + 32], out[per..per + 32]) > 0 {
+        return -226;
+    }
+    if not_after <= not_before {
+        return -226;
+    }
+    return at;
+}
+
+// The policy in `body` (JSON) into `out` (`max_len()` bytes at least) in canonical form: its length, or a refusal. `st` is `keccak.state_len()` words.
+pub fn parse[&h, &s, &b, &o](heap: &!h Heap, st: &!s [int], body: &b [byte], out: &!o [byte]) -> [heap] int {
+    if len(out) < 1024 {
+        return -228;
+    }
+    if len(st) < 110 {
+        return -229;
+    }
+    if len(body) > 8192 {
+        return -227;
+    }
+    let tape = box_slice(heap, json.tape_len(body), 0);
+    var code = 0;
+    borrow mut tape as &!tw in {
+        let t = contents(tw);
+        let parsed = json.parse(body, t);
+        if parsed < 0 || !json.is_object(t, 0) {
+            code = -220;
+        } else {
+            code = keys_ok(body, t, 0, 0);
+        }
+        if code == 0 {
+            let (sc, root) = build(heap);
+            borrow sc as &sr in {
+                let slots = box_slice(heap, schema.slot_count(sr) + 1, 0);
+                let errs = box_slice(heap, schema.errors_len(8), 0);
+                borrow mut slots as &!uw in {
+                    borrow mut errs as &!ew in {
+                        let u = contents(uw);
+                        if schema.validate(sr, root, body, t, u, contents(ew)) != 0 {
+                            code = -221;
+                        } else {
+                            code = fill(body, t, u, st, out);
+                        }
+                    }
+                }
+                unbox_slice(heap, errs);
+                unbox_slice(heap, slots);
+            }
+            schema.drop(heap, sc);
+        }
+    }
+    unbox_slice(heap, tape);
+    return code;
+}
+
+// For a body that `parse` refused with `policy-schema`: the RFC 9457 `problem+json` listing every error. An empty buffer if the body has the shape.
+pub fn explain[&h, &b](heap: &!h Heap, body: &b [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 16);
+    if len(body) > 8192 {
+        return buffer.append(heap, out, "{\"type\":\"about:blank\",\"title\":\"Content Too Large\",\"status\":413}");
+    }
+    let tape = box_slice(heap, json.tape_len(body), 0);
+    borrow mut tape as &!tw in {
+        let t = contents(tw);
+        let parsed = json.parse(body, t);
+        if parsed < 0 {
+            let bad = buffer.append(heap, out, "{\"type\":\"about:blank\",\"title\":\"Bad Request\",\"status\":400}");
+            out = bad;
+        } else {
+            let (sc, root) = build(heap);
+            borrow sc as &sr in {
+                let slots = box_slice(heap, schema.slot_count(sr) + 1, 0);
+                let errs = box_slice(heap, schema.errors_len(8), 0);
+                borrow mut slots as &!uw in {
+                    borrow mut errs as &!ew in {
+                        let e = contents(ew);
+                        if schema.validate(sr, root, body, t, contents(uw), e) != 0 {
+                            buffer.drop(heap, out);
+                            out = schema.problem(heap, sr, body, t, e, 422, "Unprocessable Content");
+                        }
+                    }
+                }
+                unbox_slice(heap, errs);
+                unbox_slice(heap, slots);
+            }
+            schema.drop(heap, sc);
+        }
+    }
+    unbox_slice(heap, tape);
+    return out;
+}
+
+// ---- Reading the canonical form ----
+
+fn pid_len[&c](c: &c [byte]) -> [] int {
+    return int_of(c[1]);
+}
+
+fn o_version[&c](c: &c [byte]) -> [] int {
+    return 2 + pid_len(c);
+}
+
+fn o_principal[&c](c: &c [byte]) -> [] int {
+    return o_version(c) + 4;
+}
+
+fn o_chain[&c](c: &c [byte]) -> [] int {
+    return o_principal(c) + 1 + int_of(c[o_principal(c)]);
+}
+
+fn o_asset[&c](c: &c [byte]) -> [] int {
+    return o_chain(c) + 8;
+}
+
+fn o_ops[&c](c: &c [byte]) -> [] int {
+    return o_asset(c) + 21;
+}
+
+fn o_recipients[&c](c: &c [byte]) -> [] int {
+    return o_ops(c) + 2;
+}
+
+fn o_limits[&c](c: &c [byte]) -> [] int {
+    return o_recipients(c) + 20 * int_of(c[o_recipients(c) - 1]);
+}
+
+// The offset after the last field, which must be the length.
+fn o_end[&c](c: &c [byte]) -> [] int {
+    return o_limits(c) + 32 * 4 + 8 + 8 + 8 + 4;
+}
+
+// Whether `c` has the shape of a canonical policy: the version byte, every length in range and the total equal to its length. Does not re-check what `parse` checked.
+pub fn well_formed[&c](c: &c [byte]) -> [] bool {
+    if len(c) < 70 || len(c) > 1024 || int_of(c[0]) != 1 {
+        return false;
+    }
+    let pl = int_of(c[1]);
+    if pl < 1 || pl > 64 || 2 + pl + 4 + 1 > len(c) {
+        return false;
+    }
+    let pr = int_of(c[o_principal(c)]);
+    if pr < 1 || pr > 64 || o_principal(c) + 1 + pr + 8 + 20 + 3 > len(c) {
+        return false;
+    }
+    let n = int_of(c[o_recipients(c) - 1]);
+    if n < 1 || n > 32 {
+        return false;
+    }
+    return o_end(c) == len(c);
+}
+
+pub fn version[&c](c: &c [byte]) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < 4 {
+        v = v * 256 + int_of(c[o_version(c) + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn be_int[&c](c: &c [byte], at: int, width: int) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < width {
+        v = v * 256 + int_of(c[at + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn policy_id[&c](c: &c [byte]) -> [] &c [byte] {
+    return c[2..2 + pid_len(c)];
+}
+
+pub fn principal[&c](c: &c [byte]) -> [] &c [byte] {
+    let at = o_principal(c);
+    return c[at + 1..at + 1 + int_of(c[at])];
+}
+
+pub fn chain_id[&c](c: &c [byte]) -> [] int {
+    return be_int(c, o_chain(c), 8);
+}
+
+pub fn asset[&c](c: &c [byte]) -> [] &c [byte] {
+    return c[o_asset(c)..o_asset(c) + 20];
+}
+
+pub fn decimals[&c](c: &c [byte]) -> [] int {
+    return int_of(c[o_asset(c) + 20]);
+}
+
+// Whether the policy allows the operation `kind` (1 = erc20_transfer).
+pub fn allows_operation[&c](c: &c [byte], kind: int) -> [] bool {
+    return kind >= 1 && kind <= 8 && int_of(c[o_ops(c)]) >> kind - 1 & 1 == 1;
+}
+
+pub fn recipient_count[&c](c: &c [byte]) -> [] int {
+    return int_of(c[o_recipients(c) - 1]);
+}
+
+pub fn recipient[&c](c: &c [byte], i: int) -> [] &c [byte] {
+    let at = o_recipients(c) + 20 * i;
+    return c[at..at + 20];
+}
+
+pub fn per_transaction[&c](c: &c [byte]) -> [] &c [byte] {
+    let at = o_limits(c);
+    return c[at..at + 32];
+}
+
+pub fn daily_total[&c](c: &c [byte]) -> [] &c [byte] {
+    let at = o_limits(c) + 32;
+    return c[at..at + 32];
+}
+
+// The amount above which a human must approve (2^256 - 1 when the policy has none).
+pub fn approval_above[&c](c: &c [byte]) -> [] &c [byte] {
+    let at = o_limits(c) + 64;
+    return c[at..at + 32];
+}
+
+pub fn fee_cap[&c](c: &c [byte]) -> [] &c [byte] {
+    let at = o_limits(c) + 96;
+    return c[at..at + 32];
+}
+
+pub fn gas_limit[&c](c: &c [byte]) -> [] int {
+    return be_int(c, o_limits(c) + 128, 8);
+}
+
+pub fn not_before[&c](c: &c [byte]) -> [] int {
+    return be_int(c, o_limits(c) + 136, 8);
+}
+
+pub fn not_after[&c](c: &c [byte]) -> [] int {
+    return be_int(c, o_limits(c) + 144, 8);
+}
+
+pub fn ttl[&c](c: &c [byte]) -> [] int {
+    return be_int(c, o_limits(c) + 152, 4);
+}
+
+// The policy digest, `keccak256("cancho-chain/policy/v1" || canonical)`, into `out` (32 bytes).
+pub fn digest[&s, &c, &o](st: &!s [int], canonical: &c [byte], out: &!o [byte]) -> [] int {
+    if len(canonical) < 70 || len(canonical) > 1024 {
+        return -228;
+    }
+    var code = 0;
+    region r {
+        let m = alloc_slice[r](22 + len(canonical), byte_of(0));
+        var i = 0;
+        while i < 22 {
+            m[i] = domain[i];
+            i = i + 1;
+        }
+        i = 0;
+        while i < len(canonical) {
+            m[22 + i] = canonical[i];
+            i = i + 1;
+        }
+        code = keccak.hash256(st, m, out);
+    }
+    return code;
+}

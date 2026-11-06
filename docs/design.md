@@ -147,7 +147,9 @@ A gate is written before the code it judges and must be able to fail.
 - `chain.hex`: encode and decode, lowercase output, either case accepted on input. A bad length or digit is a refusal, never a trap.
 - `chain.address`: the 20-byte address of a public key (`keccak256(x || y)[12..]`), the EIP-55 checksummed text, and parsing text back. **[choice]** A parsed address is
   exactly `0x` + 40 hex digits (no `0X`, no bare 40 digits, no ENS); all-lowercase and digits-only text are accepted as *unchecked*; mixed case must match its EIP-55
-  checksum; **all-uppercase is refused**, since it claims a checksum it does not have. Policies compare the 20 bytes, never the text.
+  checksum, and **so must any text with an uppercase letter**: it claims a checksum, so it has to be the one EIP-55 gives (an address whose checksum happens to be all capitals, as two of the specification's own vectors are, is valid;
+the all-capitals spelling of any other address is refused). *Corrected in place:* this document first refused all-uppercase text outright, reading the specification's "all caps" vectors as invalid spellings when they are valid checksummed
+addresses; found when a random policy's address, whose correct checksum is all capitals, was refused by the policy tests of slice 5. Policies compare the 20 bytes, never the text.
 - `chain.rlp`: encoders over a caller-provided output slice and a position, returning the new position or a refusal (`rlp-overflow` when the slice is too small). Integers
   are minimal big-endian; zero is the empty string. No decoder yet (the final-transaction validator needs one, §7 step 4; it is the next slice).
 - `chain.erc20`: `transfer(address,uint256)` calldata, 68 bytes, selector `a9059cbb`.
@@ -170,9 +172,9 @@ EIP-55 on the specification's own vectors and on random addresses, parse and ref
 **[measured]** 2026-11-06, Linux x86-64, the self-hosted `cancho` (stage 2 = stage 3) at `162633a7`, `eth-account` 0.13 / `eth-abi` / `rlp` from pip, `secp256k1` from PR alpibrusl/cancho#710
 at its head. `CANCHO=<compiler> CANCHO_PACKAGES=<cancho>/packages python3 -I scripts/check_eth.py --cases 40`: **531 of 531** checks agree.
 
-- EIP-55: the eight addresses of the specification (mixed case, all-caps and all-lowercase: the all-caps ones are refused by design, §8.1), 40 random keys' addresses against
+- EIP-55: the eight addresses of the specification (mixed case, all-caps and all-lowercase, all accepted: the two all-caps ones are checksummed addresses whose checksum is all capitals, §8.1), 40 random keys' addresses against
   `Account.from_key(..).address` (and the lowercase and checksummed forms parsed back), a single flipped letter's case refused whenever the result is still mixed, and the
-  refusals: no prefix, `0X`, 41 and 43 characters, a non-hex character, all-uppercase, digits-only accepted, a compressed-prefix or short public key.
+  refusals: no prefix, `0X`, 41 and 43 characters, a non-hex character, the all-capitals spelling of an address whose checksum is not all capitals, digits-only accepted, a compressed-prefix or short public key.
 - RLP against `rlp.encode`: lists of one string of 0, 2, 54, 55, 56, 57, 255, 256, 257 and 1,000 bytes; every single byte value that matters (00, 01, 7f, 80, ff); 40 random lists of up
   to 8 strings with lengths at the boundaries; two long-list headers (one-byte length and two-byte length); 40 random unsigned integers of 0 to 256 bits with and without leading zeros.
 - ERC-20 `transfer` calldata against `eth-abi` and the selector from `eth-utils` (40 random recipients and amounts of 0 to 256 bits), and the 19-byte recipient and 33-byte amount refusals.
@@ -181,7 +183,7 @@ at its head. `CANCHO=<compiler> CANCHO_PACKAGES=<cancho>/packages python3 -I scr
   `Account.recover_transaction` of our bytes gives the signer's address. Refusals: a 19-byte `to`, a 33-byte value; the signed-message encoder alone with recovery ids 0 and 1 (accepted),
   2 and 255 (refused) and a 64-byte signature.
 - `--mutants`: 29 deliberate faults (every RLP threshold, base byte and byte order; the checksum's threshold and nibble order; the address's offset and its hashing the prefix; the
-  acceptance of mixed case unchecked, all-caps, `0X` and non-hex; the selector, the offsets and the alignment of the calldata; the type byte, a missing access list, swapped
+  acceptance of any uppercase text unchecked, `0X` and non-hex; the selector, the offsets and the alignment of the calldata; the type byte, a missing access list, swapped
   fields, y parity, r and s; a wider value and an accepted recovery id; uppercase hex digits): **29 of 29 killed**. A first run killed 28: the recovery-id-2 refusal was reachable
   only by a signature a signer almost never produces, so the driver gained `M`, which feeds the encoder one the script crafts.
 
@@ -289,7 +291,7 @@ Bodies larger than 4 KiB are refused before they are parsed (§6: bounded inputs
 |---|---|---|
 | -200 | `intent-json` | not valid JSON (strict RFC 8259 and UTF-8), or not one object |
 | -201 | `intent-schema` | the structure: a missing or unknown key, a wrong type, a range, a length, a kind other than `erc20_transfer` |
-| -202 | `intent-asset` | not `0x` and 40 hex digits, bad EIP-55 checksum, all-uppercase, an escape (`chain.address.parse`'s rules, §8.1) |
+| -202 | `intent-asset` | not `0x` and 40 hex digits, bad EIP-55 checksum (including an all-capitals spelling that is not the checksum's), an escape (`chain.address.parse`'s rules, §8.1) |
 | -203 | `intent-recipient` | the same, for the recipient |
 | -204 | `intent-amount` | not canonical decimal digits (a sign, a leading zero, a point, an exponent, a space, a non-digit), or above 2^256 - 1 |
 | -205 | `intent-amount-zero` | zero: a transfer of nothing is a probe, not a payment |
@@ -318,7 +320,76 @@ documents. `--mutants` as for the other slices. Results are added below when mea
 **Interim dependency [choice]:** `cancho-schema` is consumed from a sibling checkout (`CANCHO_SCHEMA`, default `../cancho-schema/src/schema.cho`), as `secp256k1` is (§8.1); its `vcs lock` / `vcs fetch` route
 (documented in its README) needs a published store at a pinned commit and is the better way once the two packages settle. It compiles with this repository's compiler although it pins an older one (`cancho check --std src/schema.cho` is clean).
 
-## 11. Open questions for the maintainer
+## 11. The policy and the decision (slice 5)
+
+**Status: designed here; results in §11.5.** The policy engine is a pure function: the same policy, intent, caller, time, registry state and history always give the same decision, and nothing it reads is the agent's word.
+It decides; it signs nothing and moves nothing. Binding a decision to the exact transaction bytes is the next slice (the builder and the authorisation envelope).
+
+### 11.1 The policy
+
+An administrator's JSON document, read with the same machinery as the intent (`cancho-schema`, strict, no duplicate keys, no escapes, no floats, amounts as decimal strings of base units) into a canonical binary
+layout and an immutable digest, `keccak256("cancho-chain/policy/v1" || canonical)`. **[choice]** The policy names exactly one asset and one chain (the MVP's claim is one network and one operation); the agent cannot change any of it, because
+the engine has no operation that does (the proposal's `may_change_policy`, `may_manage_keys` and `may_change_allowlists` are not flags to be set false but things the interface does not contain).
+
+```
+{"policy_id":"procurement-usdc-v1","version":1,"principal":"agent-procurement-01","chain_id":11155111,
+ "asset":{"contract":"0x...","decimals":6},"operations":["erc20_transfer"],"recipients":["0x...","0x..."],
+ "limits":{"per_transaction":"500000000","daily_total":"2000000000","approval_required_above":"250000000"},
+ "fees":{"max_fee_per_gas":"30000000000","gas_limit":100000},
+ "validity":{"not_before":1730000000,"not_after":1830000000},"decision_ttl_seconds":300}
+```
+`recipients` has 1 to 32 distinct addresses; `approval_required_above` is optional (absent: never); the fee cap and gas limit are what `chain.txcheck` will be given as its expectation, so they come from the policy and not from the agent;
+`decimals` (0 to 36) is recorded for evidence and display, and never used in arithmetic: every amount in the system is an integer of base units. Refusals while reading a policy: `policy-json` (-220), `policy-schema` (-221), `policy-address` (-222),
+`policy-number` (-223: an amount not in canonical decimal, zero, or above 2^256 - 1; a float spelling), `policy-text` (-224: a policy id or principal outside `A-Z a-z 0-9 . _ : -`), `policy-duplicate` (-225: a key twice, a key written with an escape, or a recipient listed twice),
+`policy-order` (-226: a limit above the one it is supposed to be below: per-transaction above daily, approval threshold above per-transaction, `not_after` not after `not_before`), `policy-size` (-227: over 8 KiB), `policy-output` (-228), `policy-work` (-229).
+
+### 11.2 The decision function
+
+`decide(policy, intent, caller, now, registry, history, ...)` where `policy` and `intent` are the canonical forms (§10.3, §11.1), `caller` is the **authenticated** principal the service established (a string of word characters, 1 to 64), `now` is the
+service's clock in Unix seconds (never the agent's), `registry` is the policy registry's answer `(current_version, revoked)` for this policy id (`current_version < 0`: the registry could not be asked), and `history` is the list of authorisations already issued, each
+`timestamp (8 bytes) || intent digest (32) || amount (32)`, 72 bytes, oldest to newest or in any order. The first check that fails answers; outcomes are `allow` (1), `refuse` (2), `approval-required` (3):
+
+| reason | code | when |
+|---|---|---|
+| `POLICY_STATE_MISSING` | 1 | the registry could not be asked: refuse, never allow |
+| `POLICY_REVOKED` | 2 | the registry says revoked |
+| `POLICY_SUPERSEDED` | 3 | the policy's version is below the registry's current version |
+| `POLICY_NOT_YET_VALID` | 4 | `now` below `not_before` |
+| `POLICY_EXPIRED` | 5 | `now` at or above `not_after` |
+| `PRINCIPAL_MISMATCH` | 6 | the authenticated caller is not the policy's principal |
+| `OPERATION_NOT_ALLOWED` | 7 | the intent's kind is not in the policy's operations |
+| `CHAIN_NOT_ALLOWED` | 8 | chain id differs |
+| `ASSET_NOT_ALLOWED` | 9 | asset contract differs |
+| `RECIPIENT_NOT_ALLOWED` | 10 | recipient is not in the policy's list |
+| `AMOUNT_LIMIT_EXCEEDED` | 11 | amount above the per-transaction limit |
+| `REQUEST_REPLAYED` | 12 | this intent's digest is already in the history: an authorisation was issued, so reconcile, do not ask again |
+| `DAILY_LIMIT_EXCEEDED` | 13 | the amounts issued in the last 86,400 seconds plus this one exceed the daily total (or the sum overflows 2^256) |
+| `APPROVAL_REQUIRED` | 14 | outcome 3: within every limit but above `approval_required_above`; a human decides |
+| `ALLOWED` | 0 | outcome 1 |
+
+**[choice]** Cumulative limits are over a *rolling* 86,400 seconds, `timestamp > now - 86400` and `timestamp <= now`, and count amounts at **issuance**, not settlement: an authorisation that was never used still counts until it ages out, which is the
+conservative reading (releasing one is a later, explicit operation). A timestamp after `now` is an inconsistent history and fails closed, as does a length that is not a multiple of 72. An outcome of `approval-required` is not counted, and a
+later `allow` after approval is a new decision. Malformed *inputs* (a policy or intent that is not canonical, a bad caller, a bad history) answer a negative code and **no decision**: `decide-policy` (-230), `decide-intent` (-231), `decide-caller` (-232),
+`decide-history` (-233), `decide-output` (-234), `decide-work` (-235), `decide-clock` (-236); the caller treats any negative answer as a refusal and records it.
+
+### 11.3 The decision record
+
+Canonical bytes, at most 181: byte 0 the layout version (1), byte 1 the outcome, bytes 2 to 4 the reason (a big-endian 16-bit code), 4 to 36 the intent digest, 36 to 68 the policy digest, 68 to 76 `decided_at` (8 bytes), 76 to 84 `expires_at`
+(`decided_at` plus the policy's TTL for an `allow`, `decided_at` for anything else), 84 to 116 the amount counted (the intent's for an `allow`, zero otherwise), then the caller as a length byte and its bytes. The **decision digest** is
+`keccak256("cancho-chain/decision/v1" || record)`. It binds the decision to the exact intent, the exact policy version, the caller and the time window; it cannot be presented for another intent or after it expires.
+
+### 11.4 What it does not do
+
+It does not authenticate the caller (it is told who that is), keep the clock, store the history or consult the registry (it is given their answers: the evidence store and the registry are later slices), and it does not know the transaction bytes (the next slice
+binds the decision to them). A caller that lies about `now`, `caller` or `history` defeats it; that is the service's trust boundary (§5.2), and the evidence log is what lets an auditor notice.
+
+### 11.5 How it is checked
+
+`scripts/check_policy.py` against a model in Python written separately from this section: every policy and intent the model accepts has the same canonical bytes and digest; for random policies, intents, callers, times, registry states and histories
+the decision (outcome, reason, every byte of the record and its digest) is the model's; each of the 14 reasons is reached alone and in every pairing that tests the table's order; every boundary (`now` at `not_before`, `not_after` and one either side; an
+amount at, one below and one above each limit; a history record at and either side of the 86,400-second edge; sums that reach, exceed and overflow the daily total); every malformed input. `--mutants` as for the other slices. Results are added below when measured.
+
+## 12. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
 2. May `cancho-chain` depend on `cancho-schema` (a package dependency) or is vendoring preferred? How do sibling repos consume each other (`cancho.toml` has no

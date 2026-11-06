@@ -179,12 +179,12 @@ pub fn json_schema[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
 // ---- Reading the fields ----
 
 // A character of a reference or request id: A-Z a-z 0-9 . _ : -
-fn word_char(c: int) -> [] bool {
+pub fn word_char(c: int) -> [] bool {
     return c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 46 || c == 95 || c == 58 || c == 45;
 }
 
 // The plain string at tape node `at` is entirely word characters.
-fn is_word[&b, &t](body: &b [byte], tape: &t [int], at: int) -> [] bool {
+pub fn is_word[&b, &t](body: &b [byte], tape: &t [int], at: int) -> [] bool {
     if !json.string_plain(tape, at) {
         return false;
     }
@@ -200,7 +200,7 @@ fn is_word[&b, &t](body: &b [byte], tape: &t [int], at: int) -> [] bool {
 }
 
 // The decimal digits in `v` into the 32 bytes of `out` as a big-endian integer: 0, or -204 (not canonical decimal, or above 2^256 - 1) or -205 (zero).
-fn read_amount[&v, &o](v: &v [byte], out: &!o [byte]) -> [] int {
+pub fn read_amount[&v, &o](v: &v [byte], out: &!o [byte]) -> [] int {
     var i = 0;
     while i < 32 {
         out[i] = byte_of(0);

@@ -1,0 +1,427 @@
+edition 7;
+
+module chain.decide;
+
+import chain.intent;
+import chain.keccak;
+import chain.policy;
+import std.bytes;
+
+// The decision function (docs/design.md section 11.2): a pure function of a policy, an intent, the authenticated caller, the time, the registry's answer and the history of
+// authorisations already issued. It decides; it signs nothing. The first check that fails answers.
+//
+// Decision record, version 1 (at most 181 bytes): [0] 1   [1] outcome (1 allow, 2 refuse, 3 approval required)   [2..4] reason (16 bits, big-endian)   [4..36] intent digest
+// [36..68] policy digest   [68..76] decided_at   [76..84] expires_at   [84..116] the amount counted   [116] n, then the caller (n bytes).
+
+pub fn refused_policy() -> [] int {
+    return -230;
+}
+
+pub fn refused_intent() -> [] int {
+    return -231;
+}
+
+pub fn refused_caller() -> [] int {
+    return -232;
+}
+
+pub fn refused_history() -> [] int {
+    return -233;
+}
+
+pub fn refused_output() -> [] int {
+    return -234;
+}
+
+pub fn refused_work() -> [] int {
+    return -235;
+}
+
+pub fn refused_clock() -> [] int {
+    return -236;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -230 {
+        return "decide-policy";
+    }
+    if code == -231 {
+        return "decide-intent";
+    }
+    if code == -232 {
+        return "decide-caller";
+    }
+    if code == -233 {
+        return "decide-history";
+    }
+    if code == -234 {
+        return "decide-output";
+    }
+    if code == -235 {
+        return "decide-work";
+    }
+    if code == -236 {
+        return "decide-clock";
+    }
+    return "decide-unknown";
+}
+
+pub fn outcome_allow() -> [] int {
+    return 1;
+}
+
+pub fn outcome_refuse() -> [] int {
+    return 2;
+}
+
+pub fn outcome_approval() -> [] int {
+    return 3;
+}
+
+// The reason codes; 0 is ALLOWED.
+pub fn reason_name(code: int) -> [] &static [byte] {
+    if code == 0 {
+        return "ALLOWED";
+    }
+    if code == 1 {
+        return "POLICY_STATE_MISSING";
+    }
+    if code == 2 {
+        return "POLICY_REVOKED";
+    }
+    if code == 3 {
+        return "POLICY_SUPERSEDED";
+    }
+    if code == 4 {
+        return "POLICY_NOT_YET_VALID";
+    }
+    if code == 5 {
+        return "POLICY_EXPIRED";
+    }
+    if code == 6 {
+        return "PRINCIPAL_MISMATCH";
+    }
+    if code == 7 {
+        return "OPERATION_NOT_ALLOWED";
+    }
+    if code == 8 {
+        return "CHAIN_NOT_ALLOWED";
+    }
+    if code == 9 {
+        return "ASSET_NOT_ALLOWED";
+    }
+    if code == 10 {
+        return "RECIPIENT_NOT_ALLOWED";
+    }
+    if code == 11 {
+        return "AMOUNT_LIMIT_EXCEEDED";
+    }
+    if code == 12 {
+        return "REQUEST_REPLAYED";
+    }
+    if code == 13 {
+        return "DAILY_LIMIT_EXCEEDED";
+    }
+    if code == 14 {
+        return "APPROVAL_REQUIRED";
+    }
+    return "UNKNOWN";
+}
+
+pub fn max_len() -> [] int {
+    return 181;
+}
+
+// One history record: timestamp (8) || intent digest (32) || amount (32).
+pub fn record_len() -> [] int {
+    return 72;
+}
+
+static domain: [byte] {
+    let t = alloc_slice[static](24, byte_of(0));
+    let s = "cancho-chain/decision/v1";
+    var i = 0;
+    while i < 24 {
+        t[i] = s[i];
+        i = i + 1;
+    }
+    return t;
+}
+
+// ---- Helpers on 32-byte big-endian integers ----
+
+// out = a + b; the carry out of the top (0 or 1).
+fn add32[&a, &b, &o](a: &a [byte], b: &b [byte], out: &!o [byte]) -> [] int {
+    var carry = 0;
+    var i = 31;
+    while i >= 0 {
+        let v = int_of(a[i]) + int_of(b[i]) + carry;
+        out[i] = byte_of(v & 255);
+        carry = v >> 8;
+        i = i - 1;
+    }
+    return carry;
+}
+
+fn be8[&c](c: &c [byte], at: int) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < 8 {
+        v = v * 256 + int_of(c[at + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn put_be[&o](out: &!o [byte], at: int, v: int, width: int) -> [] int {
+    var i = 0;
+    while i < width {
+        out[at + i] = byte_of(v >> 8 * (width - 1 - i) & 255);
+        i = i + 1;
+    }
+    return at + width;
+}
+
+// The canonical intent has the shape `intent.parse` writes: the layout and kind bytes, and lengths that add up.
+fn intent_ok[&c](c: &c [byte]) -> [] bool {
+    if len(c) < 85 || len(c) > 212 || int_of(c[0]) != 1 || int_of(c[1]) != 1 {
+        return false;
+    }
+    let rl = int_of(c[82]);
+    if rl < 1 || rl > 64 || 83 + rl + 1 > len(c) {
+        return false;
+    }
+    let ql = int_of(c[83 + rl]);
+    return ql >= 1 && ql <= 64 && 83 + rl + 1 + ql == len(c);
+}
+
+fn caller_ok[&c](c: &c [byte]) -> [] bool {
+    if len(c) < 1 || len(c) > 64 {
+        return false;
+    }
+    var i = 0;
+    while i < len(c) {
+        if !intent.word_char(int_of(c[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The history is whole records, none from after `now`. The top byte of a timestamp at or above 128 is above any `now` that is accepted.
+fn history_ok[&h](h: &h [byte], now: int) -> [] bool {
+    if len(h) % 72 != 0 {
+        return false;
+    }
+    var k = 0;
+    while k < len(h) / 72 {
+        if int_of(h[72 * k]) >= 128 || be8(h, 72 * k) > now {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn in_list[&p, &r](c: &p [byte], who: &r [byte]) -> [] bool {
+    var i = 0;
+    while i < policy.recipient_count(c) {
+        if bytes.equal(policy.recipient(c, i), who) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Answers the reason (0 for allowed, 14 for approval required) and, through `sum`, nothing else; the first failing check wins.
+fn check[&p, &i, &c, &h, &d](pol: &p [byte], it: &i [byte], caller: &c [byte], now: int, current_version: int, revoked: bool, history: &h [byte], idigest: &d [byte]) -> [] int {
+    if current_version < 0 {
+        return 1;
+    }
+    if revoked {
+        return 2;
+    }
+    if policy.version(pol) < current_version {
+        return 3;
+    }
+    if now < policy.not_before(pol) {
+        return 4;
+    }
+    if now >= policy.not_after(pol) {
+        return 5;
+    }
+    if !bytes.equal(policy.principal(pol), caller) {
+        return 6;
+    }
+    if !policy.allows_operation(pol, int_of(it[1])) {
+        return 7;
+    }
+    if policy.chain_id(pol) != intent.chain_id(it) {
+        return 8;
+    }
+    if !bytes.equal(policy.asset(pol), intent.asset(it)) {
+        return 9;
+    }
+    if !in_list(pol, intent.recipient(it)) {
+        return 10;
+    }
+    let amount = intent.amount(it);
+    if policy.cmp32(amount, policy.per_transaction(pol)) > 0 {
+        return 11;
+    }
+    // replay: this intent's digest is anywhere in the history; and the amounts issued in the last 86,400 seconds, with this one, against the daily total
+    var total = 0;
+    var overflow = 0;
+    var replayed = false;
+    var k = 0;
+    while k < len(history) / 72 {
+        if bytes.equal(history[72 * k + 8..72 * k + 40], idigest) {
+            replayed = true;
+        }
+        k = k + 1;
+    }
+    if replayed {
+        return 12;
+    }
+    region r {
+        let sum = alloc_slice[r](32, byte_of(0));
+        let next = alloc_slice[r](32, byte_of(0));
+        var j = 0;
+        while j < 32 {
+            sum[j] = amount[j];
+            j = j + 1;
+        }
+        k = 0;
+        while k < len(history) / 72 {
+            if be8(history, 72 * k) > now - 86400 {
+                overflow = overflow | add32(sum, history[72 * k + 40..72 * k + 72], next);
+                j = 0;
+                while j < 32 {
+                    sum[j] = next[j];
+                    j = j + 1;
+                }
+            }
+            k = k + 1;
+        }
+        if overflow == 1 || policy.cmp32(sum, policy.daily_total(pol)) > 0 {
+            total = 1;
+        }
+    }
+    if total == 1 {
+        return 13;
+    }
+    if policy.cmp32(amount, policy.approval_above(pol)) > 0 {
+        return 14;
+    }
+    return 0;
+}
+
+// Decides. `policy_c` and `intent_c` are the canonical forms; `caller` is the authenticated principal; `now` is the service's clock in Unix seconds; `current_version` and `revoked` are the
+// registry's answer for the policy's id (`current_version` < 0 if it could not be asked); `history` is whole 72-byte records. Writes the decision record into `out` (`max_len()` bytes at least)
+// and answers its length, or a negative refusal of the inputs. `st` is `keccak.state_len()` words.
+pub fn decide[&p, &i, &c, &h, &s, &o](policy_c: &p [byte], intent_c: &i [byte], caller: &c [byte], now: int, current_version: int, revoked: bool, history: &h [byte], st: &!s [int], out: &!o [byte]) -> [] int {
+    if len(out) < 181 {
+        return -234;
+    }
+    if len(st) < 110 {
+        return -235;
+    }
+    if now < 0 || now > 4611686018427387904 {
+        return -236;
+    }
+    if !policy.well_formed(policy_c) {
+        return -230;
+    }
+    if !intent_ok(intent_c) {
+        return -231;
+    }
+    if !caller_ok(caller) {
+        return -232;
+    }
+    if !history_ok(history, now) {
+        return -233;
+    }
+    var code = 0;
+    region r {
+        let idigest = alloc_slice[r](32, byte_of(0));
+        let pdigest = alloc_slice[r](32, byte_of(0));
+        if intent.digest(st, intent_c, idigest) != 0 || policy.digest(st, policy_c, pdigest) != 0 {
+            code = -235;
+        } else {
+            let reason = check(policy_c, intent_c, caller, now, current_version, revoked, history, idigest);
+            var outcome = 2;
+            if reason == 0 {
+                outcome = 1;
+            }
+            if reason == 14 {
+                outcome = 3;
+            }
+            out[0] = byte_of(1);
+            out[1] = byte_of(outcome);
+            out[2] = byte_of(reason >> 8 & 255);
+            out[3] = byte_of(reason & 255);
+            var j = 0;
+            while j < 32 {
+                out[4 + j] = idigest[j];
+                out[36 + j] = pdigest[j];
+                j = j + 1;
+            }
+            put_be(out, 68, now, 8);
+            var expires = now;
+            if outcome == 1 {
+                expires = now + policy.ttl(policy_c);
+            }
+            put_be(out, 76, expires, 8);
+            j = 0;
+            while j < 32 {
+                if outcome == 1 {
+                    out[84 + j] = intent.amount(intent_c)[j];
+                } else {
+                    out[84 + j] = byte_of(0);
+                }
+                j = j + 1;
+            }
+            out[116] = byte_of(len(caller));
+            j = 0;
+            while j < len(caller) {
+                out[117 + j] = caller[j];
+                j = j + 1;
+            }
+            code = 117 + len(caller);
+        }
+    }
+    return code;
+}
+
+pub fn outcome[&d](record: &d [byte]) -> [] int {
+    return int_of(record[1]);
+}
+
+pub fn reason[&d](record: &d [byte]) -> [] int {
+    return int_of(record[2]) * 256 + int_of(record[3]);
+}
+
+// The decision digest, `keccak256("cancho-chain/decision/v1" || record)`, into `out` (32 bytes). It binds the decision to the intent, the policy version, the caller and the time window.
+pub fn digest[&s, &d, &o](st: &!s [int], record: &d [byte], out: &!o [byte]) -> [] int {
+    if len(record) < 118 || len(record) > 181 {
+        return -234;
+    }
+    var code = 0;
+    region r {
+        let m = alloc_slice[r](24 + len(record), byte_of(0));
+        var i = 0;
+        while i < 24 {
+            m[i] = domain[i];
+            i = i + 1;
+        }
+        i = 0;
+        while i < len(record) {
+            m[24 + i] = record[i];
+            i = i + 1;
+        }
+        code = keccak.hash256(st, m, out);
+    }
+    return code;
+}

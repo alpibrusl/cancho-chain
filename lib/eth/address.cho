@@ -17,7 +17,7 @@ pub fn refused_digit() -> [] int {
     return -141;
 }
 
-// mixed case that does not match EIP-55, or all-uppercase letters (which claim a checksum they do not have)
+// any uppercase letter, and the text does not match its EIP-55 checksum (an all-uppercase text is checksummed too, if it is the one the checksum gives)
 pub fn refused_checksum() -> [] int {
     return -142;
 }
@@ -103,8 +103,8 @@ pub fn checksum[&s, &a, &o](st: &!s [int], addr: &a [byte], out: &!o [byte]) -> 
     return code;
 }
 
-// The 20 bytes of the text `0x` + 40 hex digits into `out`. All-lowercase and digits-only text is accepted as unchecked; mixed case must match its checksum;
-// all-uppercase letters are refused. `out` is zero after a refusal.
+// The 20 bytes of the text `0x` + 40 hex digits into `out`. All-lowercase and digits-only text is accepted as unchecked;
+// any uppercase letter makes the text claim a checksum, which it must then match exactly (an address whose checksum is all capitals is valid; an all-capitals spelling of any other address is not). `out` is zero after a refusal.
 pub fn parse[&s, &t, &o](st: &!s [int], text: &t [byte], out: &!o [byte]) -> [] int {
     if len(out) != 20 {
         return -143;
@@ -116,23 +116,16 @@ pub fn parse[&s, &t, &o](st: &!s [int], text: &t [byte], out: &!o [byte]) -> [] 
     if code != 0 {
         return -141;
     }
-    var lower = 0;
     var upper = 0;
     var i = 2;
     while i < 42 {
         let c = int_of(text[i]);
-        if c >= 97 && c <= 102 {
-            lower = 1;
-        }
         if c >= 65 && c <= 70 {
             upper = 1;
         }
         i = i + 1;
     }
-    if upper == 1 && lower == 0 {
-        code = -142;
-    }
-    if upper == 1 && lower == 1 {
+    if upper == 1 {
         region r {
             let want = alloc_slice[r](42, byte_of(0));
             code = checksum(st, out, want);
