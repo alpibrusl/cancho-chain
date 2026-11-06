@@ -415,6 +415,64 @@ binds the decision to them). A caller that lies about `now`, `caller` or `histor
 the decision (outcome, reason, every byte of the record and its digest) is the model's; each of the 14 reasons is reached alone and in every pairing that tests the table's order; every boundary (`now` at `not_before`, `not_after` and one either side; an
 amount at, one below and one above each limit; a history record at and either side of the 86,400-second edge; sums that reach, exceed and overflow the daily total); every malformed input. `--mutants` as for the other slices. Results are added below when measured.
 
+## 13. The authorisation envelope (slice 6)
+
+**Status: design, written before the code.** Claims are *choice* or *open* until measured; the measured results go into §13.5. The envelope is what crosses from the policy side to the signer: a decision (§11) bound to the exact unsigned transaction,
+signed by an **issuer** key that is not the wallet key. The signer trusts nothing in it until the issuer's signature is checked, and re-derives everything it can.
+
+### 13.1 The envelope
+
+A fixed binary layout (big-endian, version 1), 262 bytes plus the caller:
+
+| bytes | field |
+|---|---|
+| 0 | layout version, 1 |
+| 1 to 33 | envelope id: 32 bytes the issuer draws fresh; the key of single use |
+| 33 to 65 | the decision digest (§11.3): evidence, the signer cannot recompute it |
+| 65 to 97 | the transaction digest: `keccak256` of the unsigned message `02 \|\| rlp(body)`, which is the hash that is signed |
+| 97 to 105 | chain id |
+| 105 to 125 | the address that must sign (the wallet) |
+| 125 to 145 | token contract; 145 to 165 recipient; 165 to 197 amount (32 bytes) |
+| 197 to 205 | nonce; 205 to 237 fee cap per gas (32); 237 to 245 gas cap |
+| 245 to 253 | `issued_at`; 253 to 261 `expires_at` (Unix seconds) |
+| 261 | the caller's length `n` (1 to 64), then the caller's bytes |
+
+The envelope digest is `keccak256("cancho-chain/envelope/v1" \|\| layout)`; the **issuer signs that digest** with secp256k1 (`r \|\| s \|\| recid`, low s, RFC 6979), and the signer recovers the issuer's address from it and compares with the one it was configured with.
+**[choice]** An issuer signature, and not a MAC under a secret both sides hold: the signer then holds no secret that can *make* an envelope, so a compromised signer cannot authorise anything for itself, and a compromised policy service cannot sign (it has no wallet key).
+The two keys must differ; the signer refuses to start if they do not (a later slice).
+
+The fields after the digest are the **expectation** `chain.txcheck` is given (§9.2): the signer recomputes nothing from the decision, but it does decode the exact bytes and require every field to be what the envelope says, and the envelope to be what the issuer signed.
+
+### 13.2 Issuing
+
+`issue` takes the decision record (§11.3), the unsigned message, the expectation, the wallet address, a fresh envelope id, `now` and the issuer key. It refuses (reasons below) unless the decision's outcome is `allow`, `now` is in `[decided_at, expires_at)` of the decision, the decision's amount is the expectation's,
+and `validate_unsigned` passes on the message. The envelope expires when the **decision** does: an envelope cannot outlive the authority it carries. It writes the layout and the signature.
+
+### 13.3 Verifying (the signer's side)
+
+`verify` takes the envelope, the signature, the unsigned message, and **the signer's own configuration**: the issuer address, chain id, wallet address, the authenticated caller of this request and its clock. Checks, in this order, the first failure answers:
+
+1. the layout is whole and version 1 (`ENVELOPE_FORMAT`); nothing in it is believed yet;
+2. the recovered issuer is the configured one (`SIGNATURE_INVALID` if recovery fails or `s` is high; `ISSUER_MISMATCH`);
+3. `chain id`, the wallet address and the caller equal the signer's (`CHAIN_ID_MISMATCH`, `SIGNER_KEY_MISMATCH`, `CALLER_MISMATCH`): the caller is the one the gateway authenticated (`auth_identity_header`), so an envelope issued to one principal is useless to another;
+4. `issued_at <= now < expires_at` (`ENVELOPE_NOT_YET_VALID`, `ENVELOPE_EXPIRED`);
+5. `keccak256(message)` is the envelope's transaction digest (`TRANSACTION_DIGEST_MISMATCH`);
+6. `validate_unsigned` against the envelope's expectation (`TRANSACTION_INVALID`, with `txcheck`'s code as the detail).
+
+Single use is **state**, kept by the signer, and is not part of `verify`: a **ledger** of `envelope id \|\| transaction digest` (64 bytes per entry). `ledger_check(ledger, id, digest)` answers *fresh*, *same* or *conflict*.
+**[choice]** The entry is written and flushed **before** the signature is produced. A crash between the two loses a signature, never lets a second one out. An envelope seen again **with the same transaction digest** is signed again, and gets the same bytes (RFC 6979 is deterministic): a retry after a timeout cannot pay twice, because it is the same
+transaction with the same nonce, and refusing it would leave the caller unable to recover the signature. An envelope id seen with a **different** digest is `AUTHORIZATION_REPLAYED`.
+
+### 13.4 What it does not do
+
+It does not keep the ledger durable (the signer process does, on cancho-log), draw the id's randomness, hold either key, or run the signer; those are the next slice. It proves nothing about the decision beyond the issuer's word that one was made: the decision digest is evidence an auditor can match to the log, not something
+the signer can check. An issuer that is compromised can authorise anything within a policy it is willing to sign for: the signer's own configuration (chain id, wallet) and the expiry bound it, the policy does not (the signer never sees it). That is the trust placed in the issuer, and it is said in §6.
+
+### 13.5 How it is checked
+
+`scripts/check_envelope.py`, against a model in Python written separately from this section: envelopes issued by the code have the model's bytes and digest and a signature the model verifies with libsecp256k1 (`coincurve`) and recovers to the issuer's address; every refusal reached alone and in the pairings that test the order; every boundary (`now` at
+`issued_at`, `expires_at` and one either side); a changed byte at every offset of the envelope, of the signature and of the message (each must be refused, with the reason the order says); the ledger's three answers; `--mutants` as for the other slices. Results are added below when measured.
+
 ## 12. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
