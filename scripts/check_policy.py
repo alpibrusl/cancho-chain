@@ -443,6 +443,16 @@ def run(exe, cases, quiet=False):
                            ("history of 73 bytes", dict(hist_raw=b"\0" * 73), "E233"), ("history from the future", dict(hist_raw=(s.now + 1).to_bytes(8, "big") + b"\0" * 64), "E233"),
                            ("history with a timestamp of 2^63", dict(hist_raw=(2**63).to_bytes(8, "big") + b"\0" * 64), "E233"), ("history of 2^64 - 1", dict(hist_raw=(2**64 - 1).to_bytes(8, "big") + b"\0" * 64), "E233")):
         check(name, decide(exe, s.P, s.I, s.caller, s.now, s.cur, False, [], **kw), want)
+    # a canonical policy that is consistent in length but out of range: the shape check is what refuses it
+    for name, edit in (("a policy with no recipients", lambda q: setattr(q, "recips", [])), ("a policy with 33 recipients", lambda q: setattr(q, "recips", [bytes([i + 1]) * 20 for i in range(33)])),
+                       ("a policy with an empty id", lambda q: setattr(q, "pid", "")), ("a policy with a 65-byte id", lambda q: setattr(q, "pid", "a" * 65)),
+                       ("a policy with an empty principal", lambda q: setattr(q, "principal", "")), ("a policy with a 65-byte principal", lambda q: setattr(q, "principal", "a" * 65)),
+                       ("a policy with a 64-byte id (accepted)", lambda q: setattr(q, "pid", "a" * 64)), ("a policy with 32 recipients (accepted)", lambda q: setattr(q, "recips", [bytes([i + 1]) * 20 for i in range(32)])),
+                       ("a policy with a 1-byte id (accepted)", lambda q: setattr(q, "pid", "a"))):
+        q = Pol(rng)
+        edit(q)
+        got = decide(exe, q, s.I, q.principal.encode() or b"x", s.now, q.version, False, [], pol_canon=q.canonical())
+        check(name, got if isinstance(got, str) else "decision", "decision" if "accepted" in name else "E230")
     for name, caller in (("an empty caller", b""), ("a caller of 65 bytes", b"a" * 65), ("a caller with a space", b"a b"), ("a caller with a non-ASCII byte", b"a\xc3\xa9"), ("a caller with a slash", b"a/b"),
                          ("a caller of 64 bytes", b"a" * 64), ("a caller of one byte", b"a")):
         got = decide(exe, s.P, s.I, caller, s.now, s.cur, False, [])
@@ -457,6 +467,7 @@ def run(exe, cases, quiet=False):
 
 # Mutants no input can kill, with the reason. Reported, not failed: a survivor outside this list fails the run.
 EXPECTED_SURVIVORS = {
+    "escaped later keys accepted": "equivalent: an escaped key and a duplicate key share the refusal code -225, and the outer loop reaches every escaped key on its own iteration, so the answer is the same",
     "the working space limit": "defence in depth: with 50 to 109 words the first check passes, the Keccak call that follows refuses the short working space, and `decide` answers the same decide-work code",
 }
 
