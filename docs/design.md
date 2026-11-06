@@ -315,14 +315,40 @@ reordered keys, any whitespace) has one canonical form and one digest.
 
 `scripts/check_intent.py` against an independent implementation in Python (the spec above, written separately, with `eth-utils` for addresses and `jsonschema` for the structure): accept/reject agreement and the canonical bytes and digest of every accepted
 intent, on valid intents in every spelling, on each field damaged in each way the table names, on random JSON, and on every duplicate-key and escape case; the exported JSON Schema is validated as Draft 2020-12 and agrees with the structure stage on random
-documents. `--mutants` as for the other slices. Results are added below when measured.
+documents. `--mutants` as for the other slices.
+
+**[measured]** 2026-11-06, Linux x86-64, the self-hosted `cancho` at `162633a7`, `cancho-schema` at `ab15474`, `eth-utils` and `jsonschema` 4.26 from pip.
+`CANCHO=<compiler> CANCHO_SCHEMA=<cancho-schema>/src/schema.cho python3 -I scripts/check_policy.py --cases 20`: **989 of 989** checks agree.
+- **The policy:** 20 random policies (ids and principals of 1 to 64 characters over every allowed character, versions to 2^32 - 1, chain ids to 2^53 - 1, 1 to 32 recipients, limits to 2^256 - 1, with and without an approval threshold), each in three
+  forms (as generated; keys shuffled and indented; addresses in lowercase), all giving the model's canonical bytes and digest; and 125 damaged or edge-case policies, each refused with exactly its code or accepted when it is a boundary:
+  each of the 19 required fields missing, an unknown key in the policy and in each of its four objects, wrong types and out-of-range numbers (version 0 and 2^32, decimals 37, ttl 0 and 3601, gas limit 0, operations empty, doubled or other, no recipients, 33),
+  bad addresses (checksum, upper case, no prefix) in the contract and at either end of the recipients, every amount spelling (zero, leading zero, sign, point, exponent, space, 2^256) for each of the four amount fields, integers spelled as floats,
+  identifiers with a space, slash, non-ASCII, quote or escape, duplicate keys at the top and nested, escaped keys, duplicate recipients (adjacent, apart, and in a different case), each ordering rule (per-transaction above daily, approval above per-transaction,
+  an empty or reversed window) with its equal-is-fine boundary, no approval threshold, JSON errors, and exactly 8,192 bytes (accepted) against 8,193. The exported JSON Schema is valid Draft 2020-12 and the structure stage agrees with `jsonschema` on every
+  document where the two are comparable.
+- **The decision:** 120 random scenarios (random policy limits, window and version, caller, clock around every edge, registry state, a history of up to five records some of which replay the intent); **each of the 14 reasons alone and every combination of up to three of them, 469
+  scenarios**, which is what holds the table's order; every boundary (`now` one below and at `not_before`, one below, at and above `not_after`; amounts one below, at and one above the per-transaction limit and the approval threshold; a history record at 86,401, 86,400
+  and 86,399 seconds old and at `now`; the daily total reached exactly, exceeded by one and one short; a sum that overflows 2^256 and one that is 2^256 - 1; a replay older than the window; several records summed and an old one not); a replay at each of four positions in the history; an
+  overflow in the first, the second or the first of three records; the intent's chain below the policy's; the decision digest of records of 0, 1, 117, 118, 150, 181, 182 and 300 bytes; 20 decisions from the JSON of both documents, end to end; and the malformed inputs: policies and intents truncated,
+  extended, with a wrong layout or kind byte, or consistent in length but out of range (no recipients, 33, an empty or 65-byte id or principal), histories of 71 and 73 bytes, from the future, with a timestamp of 2^63 and of 2^64 - 1, callers of 0, 65 bytes, with a space, a slash or a non-ASCII byte,
+  a clock of -1 and of 2^62 + 1 (and 2^62 accepted), and a short output and a short working space for the policy parser and for `decide`.
+- `--mutants`: **121 deliberate faults** (each registry, validity and caller check; each comparison and its boundary: strict against inclusive, one way against the other; the replay scan and the daily window at 86,399, 86,400 and 86,401 seconds; the overflow flag; every byte
+  and offset of the decision record and its digest; the schema's bounds, strictness and required flags; the float spellings of each integer field; the duplicate and escape checks; the ordering rules; every offset and bound of the canonical reader; both digests' domains and inputs; the input
+  validation limits): **119 killed, 2 equivalent, 0 unexpected survivors.** The two are in the script with their reasons: the `decide` working-space bound (with 50 to 109 words the first check passes and the Keccak call that follows refuses the short space with the same code) and the escape check on
+  later keys (an escaped and a duplicate key share the refusal code -225, and the outer loop reaches every escaped key by itself).
+- **Found by the checks.** The first full run of this slice's tests refused a random policy whose recipient's correct EIP-55 spelling is all capitals: `chain.address.parse` (slice 2) had refused all-uppercase text outright. That was my misreading of the specification, whose "all caps" vectors are valid
+  checksummed addresses; §8.1 is corrected in place and the slice-2 test that had encoded the misreading now expects those vectors to be accepted. The mutant runs themselves took three passes: the first stopped after 66 of 121 mutants without saying why (58 killed, five survivors seen) and was
+  replaced by a parallel run; the second killed 115 and left five (one equivalent, four needing canonical policies that are consistent in length but out of range, which the tests did not build); the third is the result above.
+
+**Not claimed.** The model is written from this section by the same author, so a shared misreading passes; the independent checks are `eth-utils` and `jsonschema`. The decision is not yet bound to the transaction bytes (the next slice), the history, the registry and the clock are
+inputs this repository does not provide, and nothing has been independently reviewed.
 
 **Interim dependency [choice]:** `cancho-schema` is consumed from a sibling checkout (`CANCHO_SCHEMA`, default `../cancho-schema/src/schema.cho`), as `secp256k1` is (§8.1); its `vcs lock` / `vcs fetch` route
 (documented in its README) needs a published store at a pinned commit and is the better way once the two packages settle. It compiles with this repository's compiler although it pins an older one (`cancho check --std src/schema.cho` is clean).
 
 ## 11. The policy and the decision (slice 5)
 
-**Status: designed here; results in §11.5.** The policy engine is a pure function: the same policy, intent, caller, time, registry state and history always give the same decision, and nothing it reads is the agent's word.
+**Status: built.** Results are in §11.5. The policy engine is a pure function: the same policy, intent, caller, time, registry state and history always give the same decision, and nothing it reads is the agent's word.
 It decides; it signs nothing and moves nothing. Binding a decision to the exact transaction bytes is the next slice (the builder and the authorisation envelope).
 
 ### 11.1 The policy

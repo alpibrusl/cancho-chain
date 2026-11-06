@@ -15,6 +15,7 @@ bytes that were approved. Every step leaves evidence. The agent never holds a ke
 | `chain.hex`, `chain.address` (EIP-55), `chain.rlp`, `chain.erc20`, `chain.tx1559` (encoders and the signed type-2 transaction) | built | `scripts/check_eth.py`: 531 checks against eth-account, eth-abi and rlp (signed transactions byte for byte), 29 of 29 mutants killed |
 | `chain.rlp` decoder (strict), `chain.txcheck` (the final-transaction validator, 16 stable reason codes) | built | `scripts/check_decode.py`: 1,423 checks against rlp (strict) and eth-account, 50 of 51 mutants killed (1 equivalent) |
 | `chain.intent` (the typed ERC-20 transfer intent on `cancho-schema`: canonical form, digest, 13 stable refusals) | built | `scripts/check_intent.py`: 795 checks against a separate model, eth-utils and jsonschema, 44 of 48 mutants killed (4 redundant) |
+| `chain.policy` and `chain.decide` (the policy engine: canonical policy and digest, a pure decision function, 14 stable reasons, a decision record and digest) | built | `scripts/check_policy.py`: 989 checks against a separate model and jsonschema, every combination of up to three reasons, 119 of 121 mutants killed (2 equivalent) |
 | everything else in [`docs/design.md`](docs/design.md) | designed, not built | -- |
 
 ```
