@@ -138,7 +138,57 @@ cancho. A local development key is a development key; nothing here claims produc
 
 A gate is written before the code it judges and must be able to fail.
 
-## 8. Open questions for the maintainer
+## 8. Ethereum encodings (slice 2): addresses, RLP, ERC-20 calldata, type-2 transactions
+
+**Status: built.** Measured numbers are in §8.3. Everything the signer will eventually be asked to sign has to be produced, and later checked, byte for byte.
+
+### 8.1 What is built, and the choices
+
+- `chain.hex`: encode and decode, lowercase output, either case accepted on input. A bad length or digit is a refusal, never a trap.
+- `chain.address`: the 20-byte address of a public key (`keccak256(x || y)[12..]`), the EIP-55 checksummed text, and parsing text back. **[choice]** A parsed address is
+  exactly `0x` + 40 hex digits (no `0X`, no bare 40 digits, no ENS); all-lowercase and digits-only text are accepted as *unchecked*; mixed case must match its EIP-55
+  checksum; **all-uppercase is refused**, since it claims a checksum it does not have. Policies compare the 20 bytes, never the text.
+- `chain.rlp`: encoders over a caller-provided output slice and a position, returning the new position or a refusal (`rlp-overflow` when the slice is too small). Integers
+  are minimal big-endian; zero is the empty string. No decoder yet (the final-transaction validator needs one, §7 step 4; it is the next slice).
+- `chain.erc20`: `transfer(address,uint256)` calldata, 68 bytes, selector `a9059cbb`.
+- `chain.tx1559`: an EIP-1559 (type 2) transaction as `body` (the nine fields, access list empty), the unsigned message `02 || rlp(body)` whose Keccak-256 is what is signed, and the
+  signed message `02 || rlp(body, y_parity, r, s)`. **[choice]** Fields are byte strings and small integers the caller has already validated; a value, a fee or a calldata
+  is never a float and never wider than 32 bytes. An access list is always empty in the MVP (a non-empty one is a refusal at the intent, not here).
+- Signing is `secp256k1.sign` from the cancho repository (`packages/secp256k1`, PR alpibrusl/cancho#710). **Interim dependency [choice]:** cancho's package manager pulls
+  from a published, hash-checked store at a pinned commit, and that package is neither merged nor published, so the oracle scripts build against a sibling checkout named by
+  `CANCHO_PACKAGES` (default `../cancho/packages`). When it is published this becomes a `[dependencies.secp256k1]` entry in `cancho.toml`.
+
+### 8.2 How it is checked
+
+`scripts/check_eth.py` builds `tools/ethdrv/main.cho` and compares it with `eth-account` (and `rlp`, which it depends on) on: the address of a key (against `Account.from_key(..).address`, checksummed),
+EIP-55 on the specification's own vectors and on random addresses, parse and refuse cases, RLP against `rlp.encode` on strings and integers across every length boundary
+(0, 1, 55, 56, 255, 256, 65535, 65536 bytes), ERC-20 calldata, and whole type-2 transactions (unsigned message, signing hash, signed raw transaction and transaction hash) against
+`Account.sign_transaction` with random fields. `--mutants` rebuilds with one deliberate fault at a time; every mutant must be killed.
+
+### 8.3 Measured
+
+**[measured]** 2026-11-06, Linux x86-64, the self-hosted `cancho` (stage 2 = stage 3) at `162633a7`, `eth-account` 0.13 / `eth-abi` / `rlp` from pip, `secp256k1` from PR alpibrusl/cancho#710
+at its head. `CANCHO=<compiler> CANCHO_PACKAGES=<cancho>/packages python3 -I scripts/check_eth.py --cases 40`: **531 of 531** checks agree.
+
+- EIP-55: the eight addresses of the specification (mixed case, all-caps and all-lowercase: the all-caps ones are refused by design, §8.1), 40 random keys' addresses against
+  `Account.from_key(..).address` (and the lowercase and checksummed forms parsed back), a single flipped letter's case refused whenever the result is still mixed, and the
+  refusals: no prefix, `0X`, 41 and 43 characters, a non-hex character, all-uppercase, digits-only accepted, a compressed-prefix or short public key.
+- RLP against `rlp.encode`: lists of one string of 0, 2, 54, 55, 56, 57, 255, 256, 257 and 1,000 bytes; every single byte value that matters (00, 01, 7f, 80, ff); 40 random lists of up
+  to 8 strings with lengths at the boundaries; two long-list headers (one-byte length and two-byte length); 40 random unsigned integers of 0 to 256 bits with and without leading zeros.
+- ERC-20 `transfer` calldata against `eth-abi` and the selector from `eth-utils` (40 random recipients and amounts of 0 to 256 bits), and the 19-byte recipient and 33-byte amount refusals.
+- Type-2 transactions: 40 random ones (chain id, nonce, fees, gas, recipient, value of 0 to 256 bits, data of 0 to 200 bytes), each signed with `Account.sign_transaction`:
+  our signing hash equals `TypedTransaction.hash()`, our unsigned message hashes to it, our signed raw transaction and our transaction hash are **byte for byte** `eth-account`'s, and
+  `Account.recover_transaction` of our bytes gives the signer's address. Refusals: a 19-byte `to`, a 33-byte value; the signed-message encoder alone with recovery ids 0 and 1 (accepted),
+  2 and 255 (refused) and a 64-byte signature.
+- `--mutants`: 29 deliberate faults (every RLP threshold, base byte and byte order; the checksum's threshold and nibble order; the address's offset and its hashing the prefix; the
+  acceptance of mixed case unchecked, all-caps, `0X` and non-hex; the selector, the offsets and the alignment of the calldata; the type byte, a missing access list, swapped
+  fields, y parity, r and s; a wider value and an accepted recovery id; uppercase hex digits): **29 of 29 killed**. A first run killed 28: the recovery-id-2 refusal was reachable
+  only by a signature a signer almost never produces, so the driver gained `M`, which feeds the encoder one the script crafts.
+
+**Not claimed.** No decoder, so nothing here yet checks *a transaction someone else built*; that is the final-transaction validator, the next slice. The intent, the policy and the signer
+as a separate process are not built. `secp256k1` is from an unmerged PR (§8.1).
+
+## 9. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
 2. May `cancho-chain` depend on `cancho-schema` (a package dependency) or is vendoring preferred? How do sibling repos consume each other (`cancho.toml` has no

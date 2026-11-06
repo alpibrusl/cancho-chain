@@ -30,7 +30,13 @@ fn read_stdin[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buff
 
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
-    release(ffi); release(fs); release(args); release(net); release(clock); release(signals); release(exec);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
     borrow mut heap as &!h in {
         borrow mut io as &!i in {
             let msg = read_stdin(h, i);
@@ -64,6 +70,7 @@ fn main(world: World) -> [] int {
             unbox_slice(h, dig);
         }
     }
-    release(heap); release(io);
+    release(heap);
+    release(io);
     return 0;
 }

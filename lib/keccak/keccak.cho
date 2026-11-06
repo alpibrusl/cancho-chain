@@ -47,34 +47,90 @@ pub fn refusal_tag(code: int) -> [] &static [byte] {
 
 static round_lo: [int] {
     let t = alloc_slice[static](24, 0);
-    t[0] = 0x00000001; t[1] = 0x00008082; t[2] = 0x0000808a; t[3] = 0x80008000;
-    t[4] = 0x0000808b; t[5] = 0x80000001; t[6] = 0x80008081; t[7] = 0x00008009;
-    t[8] = 0x0000008a; t[9] = 0x00000088; t[10] = 0x80008009; t[11] = 0x8000000a;
-    t[12] = 0x8000808b; t[13] = 0x0000008b; t[14] = 0x00008089; t[15] = 0x00008003;
-    t[16] = 0x00008002; t[17] = 0x00000080; t[18] = 0x0000800a; t[19] = 0x8000000a;
-    t[20] = 0x80008081; t[21] = 0x00008080; t[22] = 0x80000001; t[23] = 0x80008008;
+    t[0] = 0x00000001;
+    t[1] = 0x00008082;
+    t[2] = 0x0000808a;
+    t[3] = 0x80008000;
+    t[4] = 0x0000808b;
+    t[5] = 0x80000001;
+    t[6] = 0x80008081;
+    t[7] = 0x00008009;
+    t[8] = 0x0000008a;
+    t[9] = 0x00000088;
+    t[10] = 0x80008009;
+    t[11] = 0x8000000a;
+    t[12] = 0x8000808b;
+    t[13] = 0x0000008b;
+    t[14] = 0x00008089;
+    t[15] = 0x00008003;
+    t[16] = 0x00008002;
+    t[17] = 0x00000080;
+    t[18] = 0x0000800a;
+    t[19] = 0x8000000a;
+    t[20] = 0x80008081;
+    t[21] = 0x00008080;
+    t[22] = 0x80000001;
+    t[23] = 0x80008008;
     return t;
 }
 
 static round_hi: [int] {
     let t = alloc_slice[static](24, 0);
-    t[0] = 0x00000000; t[1] = 0x00000000; t[2] = 0x80000000; t[3] = 0x80000000;
-    t[4] = 0x00000000; t[5] = 0x00000000; t[6] = 0x80000000; t[7] = 0x80000000;
-    t[8] = 0x00000000; t[9] = 0x00000000; t[10] = 0x00000000; t[11] = 0x00000000;
-    t[12] = 0x00000000; t[13] = 0x80000000; t[14] = 0x80000000; t[15] = 0x80000000;
-    t[16] = 0x80000000; t[17] = 0x80000000; t[18] = 0x00000000; t[19] = 0x80000000;
-    t[20] = 0x80000000; t[21] = 0x80000000; t[22] = 0x00000000; t[23] = 0x80000000;
+    t[0] = 0x00000000;
+    t[1] = 0x00000000;
+    t[2] = 0x80000000;
+    t[3] = 0x80000000;
+    t[4] = 0x00000000;
+    t[5] = 0x00000000;
+    t[6] = 0x80000000;
+    t[7] = 0x80000000;
+    t[8] = 0x00000000;
+    t[9] = 0x00000000;
+    t[10] = 0x00000000;
+    t[11] = 0x00000000;
+    t[12] = 0x00000000;
+    t[13] = 0x80000000;
+    t[14] = 0x80000000;
+    t[15] = 0x80000000;
+    t[16] = 0x80000000;
+    t[17] = 0x80000000;
+    t[18] = 0x00000000;
+    t[19] = 0x80000000;
+    t[20] = 0x80000000;
+    t[21] = 0x80000000;
+    t[22] = 0x00000000;
+    t[23] = 0x80000000;
     return t;
 }
 
 // rotation offsets, indexed x + 5y
 static rho: [int] {
     let t = alloc_slice[static](25, 0);
-    t[0] = 0; t[1] = 1; t[2] = 62; t[3] = 28; t[4] = 27;
-    t[5] = 36; t[6] = 44; t[7] = 6; t[8] = 55; t[9] = 20;
-    t[10] = 3; t[11] = 10; t[12] = 43; t[13] = 25; t[14] = 39;
-    t[15] = 41; t[16] = 45; t[17] = 15; t[18] = 21; t[19] = 8;
-    t[20] = 18; t[21] = 2; t[22] = 61; t[23] = 56; t[24] = 14;
+    t[0] = 0;
+    t[1] = 1;
+    t[2] = 62;
+    t[3] = 28;
+    t[4] = 27;
+    t[5] = 36;
+    t[6] = 44;
+    t[7] = 6;
+    t[8] = 55;
+    t[9] = 20;
+    t[10] = 3;
+    t[11] = 10;
+    t[12] = 43;
+    t[13] = 25;
+    t[14] = 39;
+    t[15] = 41;
+    t[16] = 45;
+    t[17] = 15;
+    t[18] = 21;
+    t[19] = 8;
+    t[20] = 18;
+    t[21] = 2;
+    t[22] = 61;
+    t[23] = 56;
+    t[24] = 14;
     return t;
 }
 
@@ -91,7 +147,7 @@ fn rotl_lo(hi: int, lo: int, n: int) -> [] int {
     if k == 0 {
         return l;
     }
-    return (l << k | h >> (32 - k)) & 0xffffffff;
+    return (l << k | h >> 32 - k) & 0xffffffff;
 }
 
 // the high word of the same
@@ -107,7 +163,7 @@ fn rotl_hi(hi: int, lo: int, n: int) -> [] int {
     if k == 0 {
         return h;
     }
-    return (h << k | l >> (32 - k)) & 0xffffffff;
+    return (h << k | l >> 32 - k) & 0xffffffff;
 }
 
 fn permute[&s](st: &!s [int]) -> [] int {
@@ -157,8 +213,8 @@ fn permute[&s](st: &!s [int]) -> [] int {
                 let a = x + 5 * y;
                 let b = (x + 1) % 5 + 5 * y;
                 let c = (x + 2) % 5 + 5 * y;
-                st[2 * a] = st[50 + 2 * a] ^ ((st[50 + 2 * b] ^ 0xffffffff) & st[50 + 2 * c]);
-                st[2 * a + 1] = st[51 + 2 * a] ^ ((st[51 + 2 * b] ^ 0xffffffff) & st[51 + 2 * c]);
+                st[2 * a] = st[50 + 2 * a] ^ (st[50 + 2 * b] ^ 0xffffffff) & st[50 + 2 * c];
+                st[2 * a + 1] = st[51 + 2 * a] ^ (st[51 + 2 * b] ^ 0xffffffff) & st[51 + 2 * c];
                 x = x + 1;
             }
             y = y + 1;
@@ -176,9 +232,9 @@ fn xor_byte[&s](st: &!s [int], pos: int, v: int) -> [] int {
     let lane = pos / 8;
     let within = pos % 8;
     if within < 4 {
-        st[2 * lane] = st[2 * lane] ^ v << (8 * within);
+        st[2 * lane] = st[2 * lane] ^ v << 8 * within;
     } else {
-        st[2 * lane + 1] = st[2 * lane + 1] ^ v << (8 * (within - 4));
+        st[2 * lane + 1] = st[2 * lane + 1] ^ v << 8 * (within - 4);
     }
     return 0;
 }
@@ -187,9 +243,9 @@ fn state_byte[&s](st: &s [int], pos: int) -> [] int {
     let lane = pos / 8;
     let within = pos % 8;
     if within < 4 {
-        return st[2 * lane] >> (8 * within) & 0xff;
+        return st[2 * lane] >> 8 * within & 0xff;
     }
-    return st[2 * lane + 1] >> (8 * (within - 4)) & 0xff;
+    return st[2 * lane + 1] >> 8 * (within - 4) & 0xff;
 }
 
 // Keccak-256 of `data` into `out` (exactly 32 bytes), using `st` (at least state_len() words, overwritten and left zeroed).

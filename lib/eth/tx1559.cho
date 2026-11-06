@@ -1,0 +1,131 @@
+edition 7;
+
+module chain.tx1559;
+
+import chain.rlp;
+
+// EIP-1559 (type 2) transactions (docs/design.md section 8.1). The body is the nine fields (chain id, nonce, max priority fee, max fee, gas limit, to, value,
+// data, access list) as RLP items without a list header; the unsigned message is 02 || list(body), whose Keccak-256 is what is signed; the signed message is
+// 02 || list(body, y_parity, r, s). The access list is always empty (0xc0).
+
+// the recipient is not 20 bytes
+pub fn refused_to() -> [] int {
+    return -170;
+}
+
+// a fee or value wider than 32 bytes
+pub fn refused_wide() -> [] int {
+    return -171;
+}
+
+// a signature that is not r || s || recid, or a recovery id above 1
+pub fn refused_signature() -> [] int {
+    return -172;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -170 {
+        return "tx-to";
+    }
+    if code == -171 {
+        return "tx-wide";
+    }
+    if code == -172 {
+        return "tx-signature";
+    }
+    return "tx-unknown";
+}
+
+// The nine fields as RLP items into the start of `out`: their length, or a refusal. `max_priority`, `max_fee` and `value` are big-endian, at most 32 bytes;
+// `to` is 20 bytes; `data` is any length.
+pub fn body[&o, &p, &f, &t, &v, &d](out: &!o [byte], chain_id: int, nonce: int, max_priority: &p [byte], max_fee: &f [byte], gas_limit: int, to: &t [byte], value: &v [byte], data: &d [byte]) -> [] int {
+    if len(to) != 20 {
+        return -170;
+    }
+    if len(max_priority) > 32 || len(max_fee) > 32 || len(value) > 32 {
+        return -171;
+    }
+    var p = rlp.put_int(out, 0, chain_id);
+    if p >= 0 {
+        p = rlp.put_int(out, p, nonce);
+    }
+    if p >= 0 {
+        p = rlp.put_uint(out, p, max_priority);
+    }
+    if p >= 0 {
+        p = rlp.put_uint(out, p, max_fee);
+    }
+    if p >= 0 {
+        p = rlp.put_int(out, p, gas_limit);
+    }
+    if p >= 0 {
+        p = rlp.put_bytes(out, p, to);
+    }
+    if p >= 0 {
+        p = rlp.put_uint(out, p, value);
+    }
+    if p >= 0 {
+        p = rlp.put_bytes(out, p, data);
+    }
+    if p >= 0 {
+        p = rlp.put_list_header(out, p, 0);
+    }
+    return p;
+}
+
+fn copy_in[&o, &b](out: &!o [byte], pos: int, bytes: &b [byte]) -> [] int {
+    var p = pos;
+    var i = 0;
+    while i < len(bytes) && p >= 0 {
+        if p >= len(out) {
+            p = -150;
+        } else {
+            out[p] = bytes[i];
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    return p;
+}
+
+// 02 || list(body) into `out`: the length, or a refusal.
+pub fn unsigned_message[&o, &b](out: &!o [byte], body_bytes: &b [byte]) -> [] int {
+    if len(out) == 0 {
+        return -150;
+    }
+    out[0] = byte_of(2);
+    var p = rlp.put_list_header(out, 1, len(body_bytes));
+    if p >= 0 {
+        p = copy_in(out, p, body_bytes);
+    }
+    return p;
+}
+
+// 02 || list(body, y_parity, r, s) into `out`: the length, or a refusal. `sig` is r || s || recid (65 bytes) from `secp256k1.sign`.
+pub fn signed_message[&o, &b, &s](out: &!o [byte], body_bytes: &b [byte], sig: &s [byte]) -> [] int {
+    if len(sig) != 65 || int_of(sig[64]) > 1 {
+        return -172;
+    }
+    var p = -150;
+    region r {
+        let tail = alloc_slice[r](100, byte_of(0));
+        var t = rlp.put_int(tail, 0, int_of(sig[64]));
+        if t >= 0 {
+            t = rlp.put_uint(tail, t, sig[0..32]);
+        }
+        if t >= 0 {
+            t = rlp.put_uint(tail, t, sig[32..64]);
+        }
+        if t >= 0 && len(out) > 0 {
+            out[0] = byte_of(2);
+            p = rlp.put_list_header(out, 1, len(body_bytes) + t);
+            if p >= 0 {
+                p = copy_in(out, p, body_bytes);
+            }
+            if p >= 0 {
+                p = copy_in(out, p, tail[0..t]);
+            }
+        }
+    }
+    return p;
+}

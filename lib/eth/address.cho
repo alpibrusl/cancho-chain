@@ -1,0 +1,158 @@
+edition 7;
+
+module chain.address;
+
+import chain.hex;
+import chain.keccak;
+
+// Ethereum addresses (docs/design.md section 8.1): 20 bytes, written as 0x + 40 hex digits with EIP-55's mixed-case checksum.
+
+// the text is not 0x followed by 40 characters
+pub fn refused_text() -> [] int {
+    return -140;
+}
+
+// a character that is not a hex digit
+pub fn refused_digit() -> [] int {
+    return -141;
+}
+
+// mixed case that does not match EIP-55, or all-uppercase letters (which claim a checksum they do not have)
+pub fn refused_checksum() -> [] int {
+    return -142;
+}
+
+// a buffer of the wrong length
+pub fn refused_length() -> [] int {
+    return -143;
+}
+
+// not an uncompressed public key (65 bytes starting 04)
+pub fn refused_key() -> [] int {
+    return -144;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -140 {
+        return "address-text";
+    }
+    if code == -141 {
+        return "address-digit";
+    }
+    if code == -142 {
+        return "address-checksum";
+    }
+    if code == -143 {
+        return "address-length";
+    }
+    if code == -144 {
+        return "address-key";
+    }
+    return "address-unknown";
+}
+
+// The last 20 bytes of the Keccak-256 of the public key's x || y, into `out` (20 bytes). `st` is `keccak.state_len()` words.
+pub fn from_public_key[&s, &p, &o](st: &!s [int], pubkey: &p [byte], out: &!o [byte]) -> [] int {
+    if len(pubkey) != 65 || int_of(pubkey[0]) != 4 {
+        return -144;
+    }
+    if len(out) != 20 {
+        return -143;
+    }
+    var code = 0;
+    region r {
+        let h = alloc_slice[r](32, byte_of(0));
+        code = keccak.hash256(st, pubkey[1..65], h);
+        if code == 0 {
+            var i = 0;
+            while i < 20 {
+                out[i] = h[12 + i];
+                i = i + 1;
+            }
+        }
+    }
+    return code;
+}
+
+// The EIP-55 text of the 20-byte `addr` into `out` (42 bytes): 0x, then each letter upper-case when the matching nibble of the Keccak-256 of the lowercase hex is 8 or more.
+pub fn checksum[&s, &a, &o](st: &!s [int], addr: &a [byte], out: &!o [byte]) -> [] int {
+    if len(addr) != 20 || len(out) != 42 {
+        return -143;
+    }
+    var code = 0;
+    region r {
+        let lower = alloc_slice[r](40, byte_of(0));
+        let h = alloc_slice[r](32, byte_of(0));
+        hex.encode(addr, lower);
+        code = keccak.hash256(st, lower, h);
+        if code == 0 {
+            out[0] = byte_of(48);
+            out[1] = byte_of(120);
+            var i = 0;
+            while i < 40 {
+                var c = int_of(lower[i]);
+                let nib = int_of(h[i / 2]) >> 4 - 4 * (i % 2) & 15;
+                if c >= 97 && nib >= 8 {
+                    c = c - 32;
+                }
+                out[2 + i] = byte_of(c);
+                i = i + 1;
+            }
+        }
+    }
+    return code;
+}
+
+// The 20 bytes of the text `0x` + 40 hex digits into `out`. All-lowercase and digits-only text is accepted as unchecked; mixed case must match its checksum;
+// all-uppercase letters are refused. `out` is zero after a refusal.
+pub fn parse[&s, &t, &o](st: &!s [int], text: &t [byte], out: &!o [byte]) -> [] int {
+    if len(out) != 20 {
+        return -143;
+    }
+    if len(text) != 42 || int_of(text[0]) != 48 || int_of(text[1]) != 120 {
+        return -140;
+    }
+    var code = hex.decode(text[2..42], out);
+    if code != 0 {
+        return -141;
+    }
+    var lower = 0;
+    var upper = 0;
+    var i = 2;
+    while i < 42 {
+        let c = int_of(text[i]);
+        if c >= 97 && c <= 102 {
+            lower = 1;
+        }
+        if c >= 65 && c <= 70 {
+            upper = 1;
+        }
+        i = i + 1;
+    }
+    if upper == 1 && lower == 0 {
+        code = -142;
+    }
+    if upper == 1 && lower == 1 {
+        region r {
+            let want = alloc_slice[r](42, byte_of(0));
+            code = checksum(st, out, want);
+            if code == 0 {
+                var k = 0;
+                while k < 42 {
+                    if int_of(want[k]) != int_of(text[k]) {
+                        code = -142;
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+    }
+    if code != 0 {
+        i = 0;
+        while i < 20 {
+            out[i] = byte_of(0);
+            i = i + 1;
+        }
+    }
+    return code;
+}
