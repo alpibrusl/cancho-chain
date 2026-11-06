@@ -1,0 +1,98 @@
+edition 7;
+
+module chain.test_keccak;
+
+import chain.keccak;
+import std.test;
+
+fn hex_digit(v: int) -> [] int {
+    if v < 10 {
+        return 48 + v;
+    }
+    return 87 + v;
+}
+
+// `msg` hashed, and the 64 hex characters compared with `want`
+fn check[&h](heap: &!h Heap, msg: &static [byte], want: &static [byte]) -> [heap] int {
+    let st = box_slice(heap, keccak.state_len(), 0);
+    let out = box_slice(heap, 32, byte_of(0));
+    var rc = 0;
+    var bad = 0;
+    borrow mut st as &!a in {
+        borrow mut out as &!b in {
+            rc = keccak.hash256(contents(a), msg, contents(b));
+        }
+    }
+    borrow out as &b in {
+        let o = contents(b);
+        var i = 0;
+        while i < 32 {
+            let v = int_of(o[i]);
+            if int_of(want[2 * i]) != hex_digit(v >> 4) {
+                bad = 1;
+            }
+            if int_of(want[2 * i + 1]) != hex_digit(v & 15) {
+                bad = 1;
+            }
+            i = i + 1;
+        }
+    }
+    unbox_slice(heap, st);
+    unbox_slice(heap, out);
+    return rc + bad;
+}
+
+pub fn test_empty[&h](heap: &!h Heap) -> [heap] int {
+    return check(heap, "", "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+}
+
+pub fn test_abc[&h](heap: &!h Heap) -> [heap] int {
+    return check(heap, "abc", "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45");
+}
+
+// a digest buffer of 31 bytes is refused, not written past
+pub fn test_refuses_short_output[&h](heap: &!h Heap) -> [heap] int {
+    let st = box_slice(heap, keccak.state_len(), 0);
+    let out = box_slice(heap, 31, byte_of(7));
+    var rc = 0;
+    borrow mut st as &!a in {
+        borrow mut out as &!b in {
+            rc = keccak.hash256(contents(a), "abc", contents(b));
+        }
+    }
+    var untouched = 0;
+    borrow out as &b in {
+        let o = contents(b);
+        var i = 0;
+        while i < 31 {
+            if int_of(o[i]) != 7 {
+                untouched = 1;
+            }
+            i = i + 1;
+        }
+    }
+    unbox_slice(heap, st);
+    unbox_slice(heap, out);
+    if rc != keccak.refused_output_length() {
+        return 1;
+    }
+    return untouched;
+}
+
+// working space of 109 words is refused
+pub fn test_refuses_short_state[&h](heap: &!h Heap) -> [heap] int {
+    let st = box_slice(heap, 109, 0);
+    let out = box_slice(heap, 32, byte_of(0));
+    var rc = 0;
+    borrow mut st as &!a in {
+        borrow mut out as &!b in {
+            rc = keccak.hash256(contents(a), "abc", contents(b));
+        }
+    }
+    unbox_slice(heap, st);
+    unbox_slice(heap, out);
+    if rc != keccak.refused_state_length() {
+        return 1;
+    }
+    return 0;
+}

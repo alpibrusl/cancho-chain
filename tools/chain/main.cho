@@ -1,0 +1,69 @@
+edition 7;
+
+// `chain` -- the command line of cancho-chain (docs/design.md).
+//
+//     chain         standard input -> the 64 hex characters of its Keccak-256, then a newline
+//
+// Only here to give the differential gate (scripts/check_keccak.py) something to run; every verb of the real tool gets a section in
+// docs/design.md before it is written.
+
+import chain.keccak;
+import std.buffer;
+import std.io;
+
+fn hex_digit(v: int) -> [] int {
+    if v < 10 {
+        return 48 + v;
+    }
+    return 87 + v;
+}
+
+fn read_stdin[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    var c = getchar(io);
+    while c >= 0 {
+        out = buffer.push(heap, out, byte_of(c));
+        c = getchar(io);
+    }
+    return out;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi); release(fs); release(args); release(net); release(clock); release(signals); release(exec);
+    borrow mut heap as &!h in {
+        borrow mut io as &!i in {
+            let msg = read_stdin(h, i);
+            let st = box_slice(h, keccak.state_len(), 0);
+            let dig = box_slice(h, 32, byte_of(0));
+            var hex = buffer.empty(h, 66);
+            borrow mut st as &!a in {
+                borrow mut dig as &!b in {
+                    borrow msg as &m in {
+                        keccak.hash256(contents(a), buffer.bytes(m), contents(b));
+                    }
+                }
+            }
+            borrow dig as &b in {
+                let o = contents(b);
+                var k = 0;
+                while k < 32 {
+                    let v = int_of(o[k]);
+                    hex = buffer.push(h, hex, byte_of(hex_digit(v >> 4)));
+                    hex = buffer.push(h, hex, byte_of(hex_digit(v & 15)));
+                    k = k + 1;
+                }
+            }
+            hex = buffer.push(h, hex, byte_of(10));
+            borrow hex as &x in {
+                buffer.write(i, x);
+            }
+            buffer.drop(h, hex);
+            buffer.drop(h, msg);
+            unbox_slice(h, st);
+            unbox_slice(h, dig);
+        }
+    }
+    release(heap); release(io);
+    return 0;
+}
