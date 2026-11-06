@@ -1,0 +1,476 @@
+edition 7;
+
+module chain.intent;
+
+import chain.address;
+import chain.keccak;
+import schema;
+import std.buffer;
+import std.bytes;
+import std.json;
+
+// The typed intent (docs/design.md section 10): the agent's JSON, checked against a schema declared with cancho-schema, then read field by field into a canonical binary
+// layout, or refused. The agent's output is data, never authority.
+//
+// Canonical layout, version 1 (at most max_len() = 212 bytes):
+//   [0] 1, the layout version   [1] 1, the kind (erc20_transfer)   [2..10] chain id, 8 bytes big-endian   [10..30] asset   [30..50] recipient
+//   [50..82] amount, a uint256, 32 bytes big-endian   [82] n, the length of the reference   [83..83 + n] the reference   then m and the request id, likewise.
+
+pub fn refused_json() -> [] int {
+    return -200;
+}
+
+pub fn refused_schema() -> [] int {
+    return -201;
+}
+
+pub fn refused_asset() -> [] int {
+    return -202;
+}
+
+pub fn refused_recipient() -> [] int {
+    return -203;
+}
+
+pub fn refused_amount() -> [] int {
+    return -204;
+}
+
+pub fn refused_amount_zero() -> [] int {
+    return -205;
+}
+
+pub fn refused_reference() -> [] int {
+    return -206;
+}
+
+pub fn refused_request_id() -> [] int {
+    return -207;
+}
+
+pub fn refused_duplicate_key() -> [] int {
+    return -208;
+}
+
+pub fn refused_key_escape() -> [] int {
+    return -209;
+}
+
+pub fn refused_output() -> [] int {
+    return -210;
+}
+
+pub fn refused_work() -> [] int {
+    return -211;
+}
+
+pub fn refused_size() -> [] int {
+    return -212;
+}
+
+// the chain id is a number written with a fraction or an exponent (`1.0`, `1e2`)
+pub fn refused_number() -> [] int {
+    return -213;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -213 {
+        return "intent-number";
+    }
+    if code == -200 {
+        return "intent-json";
+    }
+    if code == -201 {
+        return "intent-schema";
+    }
+    if code == -202 {
+        return "intent-asset";
+    }
+    if code == -203 {
+        return "intent-recipient";
+    }
+    if code == -204 {
+        return "intent-amount";
+    }
+    if code == -205 {
+        return "intent-amount-zero";
+    }
+    if code == -206 {
+        return "intent-reference";
+    }
+    if code == -207 {
+        return "intent-request-id";
+    }
+    if code == -208 {
+        return "intent-duplicate-key";
+    }
+    if code == -209 {
+        return "intent-key-escape";
+    }
+    if code == -210 {
+        return "intent-output";
+    }
+    if code == -211 {
+        return "intent-work";
+    }
+    if code == -212 {
+        return "intent-size";
+    }
+    return "intent-unknown";
+}
+
+// The longest canonical form.
+pub fn max_len() -> [] int {
+    return 212;
+}
+
+// The largest body, in bytes, that is looked at.
+pub fn max_body() -> [] int {
+    return 4096;
+}
+
+// The Keccak-256 domain: a different layout or protocol cannot give the same digest.
+static domain: [byte] {
+    let t = alloc_slice[static](22, byte_of(0));
+    let s = "cancho-chain/intent/v1";
+    var i = 0;
+    while i < 22 {
+        t[i] = s[i];
+        i = i + 1;
+    }
+    return t;
+}
+
+// ---- The schema ----
+//
+// An object with exactly these seven keys, and slots numbered in the order they are added: 0 kind, 1 chain_id, 2 asset, 3 recipient, 4 amount, 5 reference, 6 request_id.
+
+fn build[&h](heap: &!h Heap) -> [heap] (schema.Schema, int) {
+    let s0 = schema.empty(heap);
+    let (s1, kind) = schema.new_string(heap, s0, 1, 32);
+    let s2 = schema.add_choice(heap, s1, kind, "erc20_transfer");
+    let (s3, chain) = schema.new_int(heap, s2, 1, 9007199254740991);
+    let (s4, address) = schema.new_string(heap, s3, 42, 42);
+    let (s5, amount) = schema.new_string(heap, s4, 1, 78);
+    let (s6, text) = schema.new_string(heap, s5, 1, 64);
+    let (s7, object) = schema.new_object(heap, s6, true);
+    let s8 = schema.add_field(heap, s7, object, "kind", kind, true);
+    let s9 = schema.add_field(heap, s8, object, "chain_id", chain, true);
+    let s10 = schema.add_field(heap, s9, object, "asset", address, true);
+    let s11 = schema.add_field(heap, s10, object, "recipient", address, true);
+    let s12 = schema.add_field(heap, s11, object, "amount", amount, true);
+    let s13 = schema.add_field(heap, s12, object, "reference", text, true);
+    let s14 = schema.add_field(heap, s13, object, "request_id", text, true);
+    return (s14, object);
+}
+
+// The schema as JSON Schema 2020-12, the machine-readable statement of what an agent may send.
+pub fn json_schema[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    let (s, root) = build(heap);
+    var out = buffer.empty(heap, 16);
+    borrow s as &sr in {
+        buffer.drop(heap, out);
+        out = schema.json_schema(heap, sr, root);
+    }
+    schema.drop(heap, s);
+    return out;
+}
+
+// ---- Reading the fields ----
+
+// A character of a reference or request id: A-Z a-z 0-9 . _ : -
+fn word_char(c: int) -> [] bool {
+    return c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 46 || c == 95 || c == 58 || c == 45;
+}
+
+// The plain string at tape node `at` is entirely word characters.
+fn is_word[&b, &t](body: &b [byte], tape: &t [int], at: int) -> [] bool {
+    if !json.string_plain(tape, at) {
+        return false;
+    }
+    let v = json.string_view(body, tape, at);
+    var i = 0;
+    while i < len(v) {
+        if !word_char(int_of(v[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The decimal digits in `v` into the 32 bytes of `out` as a big-endian integer: 0, or -204 (not canonical decimal, or above 2^256 - 1) or -205 (zero).
+fn read_amount[&v, &o](v: &v [byte], out: &!o [byte]) -> [] int {
+    var i = 0;
+    while i < 32 {
+        out[i] = byte_of(0);
+        i = i + 1;
+    }
+    if len(v) == 0 || len(v) > 1 && int_of(v[0]) == 48 {
+        return -204;
+    }
+    var k = 0;
+    while k < len(v) {
+        let c = int_of(v[k]);
+        if c < 48 || c > 57 {
+            return -204;
+        }
+        var carry = c - 48;
+        var j = 31;
+        while j >= 0 {
+            let x = int_of(out[j]) * 10 + carry;
+            out[j] = byte_of(x & 255);
+            carry = x >> 8;
+            j = j - 1;
+        }
+        if carry != 0 {
+            return -204;
+        }
+        k = k + 1;
+    }
+    var any = 0;
+    i = 0;
+    while i < 32 {
+        any = any | int_of(out[i]);
+        i = i + 1;
+    }
+    if any == 0 {
+        return -205;
+    }
+    return 0;
+}
+
+// The tape node of the value in slot `k` (the validation guarantees all seven are there).
+fn value_at[&u](slots: &u [int], k: int) -> [] int {
+    return slots[k];
+}
+
+// The validated fields into `out`: the length, or the first refusal.
+fn fill[&b, &t, &u, &s, &o](body: &b [byte], tape: &t [int], slots: &u [int], st: &!s [int], out: &!o [byte]) -> [] int {
+    out[0] = byte_of(1);
+    out[1] = byte_of(1);
+    if !json.is_int(tape, value_at(slots, 1)) {
+        return -213;
+    }
+    let chain = json.to_int(body, tape, value_at(slots, 1));
+    var i = 0;
+    while i < 8 {
+        out[2 + i] = byte_of(chain >> 8 * (7 - i) & 255);
+        i = i + 1;
+    }
+    let asset = value_at(slots, 2);
+    if !json.string_plain(tape, asset) || address.parse(st, json.string_view(body, tape, asset), out[10..30]) != 0 {
+        return -202;
+    }
+    let recipient = value_at(slots, 3);
+    if !json.string_plain(tape, recipient) || address.parse(st, json.string_view(body, tape, recipient), out[30..50]) != 0 {
+        return -203;
+    }
+    let amount = value_at(slots, 4);
+    if !json.string_plain(tape, amount) {
+        return -204;
+    }
+    let code = read_amount(json.string_view(body, tape, amount), out[50..82]);
+    if code != 0 {
+        return code;
+    }
+    let reference = value_at(slots, 5);
+    if !is_word(body, tape, reference) {
+        return -206;
+    }
+    let rv = json.string_view(body, tape, reference);
+    out[82] = byte_of(len(rv));
+    i = 0;
+    while i < len(rv) {
+        out[83 + i] = rv[i];
+        i = i + 1;
+    }
+    let request = value_at(slots, 6);
+    if !is_word(body, tape, request) {
+        return -207;
+    }
+    let qv = json.string_view(body, tape, request);
+    let at = 83 + len(rv);
+    out[at] = byte_of(len(qv));
+    i = 0;
+    while i < len(qv) {
+        out[at + 1 + i] = qv[i];
+        i = i + 1;
+    }
+    return at + 1 + len(qv);
+}
+
+// No key is written with an escape and no key appears twice, in the top-level object at node 0 (at most 16 members; more is the schema's to refuse). 0, -208 or -209.
+fn keys_ok[&b, &t](body: &b [byte], tape: &t [int]) -> [] int {
+    let n = tape[1];
+    var j = 1;
+    var a = 0;
+    while a < n {
+        if !json.string_plain(tape, j) {
+            return -209;
+        }
+        var k = json.skip(tape, j + 1);
+        var c = a + 1;
+        while c < n {
+            if !json.string_plain(tape, k) {
+                return -209;
+            }
+            if bytes.equal(json.string_view(body, tape, j), json.string_view(body, tape, k)) {
+                return -208;
+            }
+            k = json.skip(tape, k + 1);
+            c = c + 1;
+        }
+        j = json.skip(tape, j + 1);
+        a = a + 1;
+    }
+    return 0;
+}
+
+// The intent in `body` (JSON) into `out` (`max_len()` bytes at least) in canonical form: its length, or a refusal. `st` is `keccak.state_len()` words, for the addresses' checksums.
+pub fn parse[&h, &s, &b, &o](heap: &!h Heap, st: &!s [int], body: &b [byte], out: &!o [byte]) -> [heap] int {
+    if len(out) < 212 {
+        return -210;
+    }
+    if len(st) < 110 {
+        return -211;
+    }
+    if len(body) > 4096 {
+        return -212;
+    }
+    let tape = box_slice(heap, json.tape_len(body), 0);
+    var code = 0;
+    borrow mut tape as &!tw in {
+        let t = contents(tw);
+        let parsed = json.parse(body, t);
+        if parsed < 0 || !json.is_object(t, 0) {
+            code = -200;
+        } else if t[1] > 16 {
+            code = -201;
+        } else {
+            code = keys_ok(body, t);
+        }
+        if code == 0 {
+            let (sc, root) = build(heap);
+            borrow sc as &sr in {
+                let slots = box_slice(heap, schema.slot_count(sr) + 1, 0);
+                let errs = box_slice(heap, schema.errors_len(8), 0);
+                borrow mut slots as &!uw in {
+                    borrow mut errs as &!ew in {
+                        let u = contents(uw);
+                        if schema.validate(sr, root, body, t, u, contents(ew)) != 0 {
+                            code = -201;
+                        } else {
+                            code = fill(body, t, u, st, out);
+                        }
+                    }
+                }
+                unbox_slice(heap, errs);
+                unbox_slice(heap, slots);
+            }
+            schema.drop(heap, sc);
+        }
+    }
+    unbox_slice(heap, tape);
+    return code;
+}
+
+// For a body that `parse` refused with `intent-schema` (or -200): the RFC 9457 `problem+json` document that lists every error, each with its JSON Pointer and a code a client can switch on.
+// An empty buffer if the body has the shape.
+pub fn explain[&h, &b](heap: &!h Heap, body: &b [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 16);
+    if len(body) > 4096 {
+        return buffer.append(heap, out, "{\"type\":\"about:blank\",\"title\":\"Content Too Large\",\"status\":413}");
+    }
+    let tape = box_slice(heap, json.tape_len(body), 0);
+    borrow mut tape as &!tw in {
+        let t = contents(tw);
+        let parsed = json.parse(body, t);
+        if parsed < 0 {
+            let bad = buffer.append(heap, out, "{\"type\":\"about:blank\",\"title\":\"Bad Request\",\"status\":400}");
+            out = bad;
+        } else {
+            let (sc, root) = build(heap);
+            borrow sc as &sr in {
+                let slots = box_slice(heap, schema.slot_count(sr) + 1, 0);
+                let errs = box_slice(heap, schema.errors_len(8), 0);
+                borrow mut slots as &!uw in {
+                    borrow mut errs as &!ew in {
+                        let e = contents(ew);
+                        if schema.validate(sr, root, body, t, contents(uw), e) != 0 {
+                            buffer.drop(heap, out);
+                            out = schema.problem(heap, sr, body, t, e, 422, "Unprocessable Content");
+                        }
+                    }
+                }
+                unbox_slice(heap, errs);
+                unbox_slice(heap, slots);
+            }
+            schema.drop(heap, sc);
+        }
+    }
+    unbox_slice(heap, tape);
+    return out;
+}
+
+// ---- The canonical form ----
+
+// The intent digest, `keccak256("cancho-chain/intent/v1" || canonical)`, into `out` (32 bytes). `st` is `keccak.state_len()` words.
+pub fn digest[&s, &c, &o](st: &!s [int], canonical: &c [byte], out: &!o [byte]) -> [] int {
+    if len(canonical) < 85 || len(canonical) > 212 {
+        return -210;
+    }
+    var code = 0;
+    region r {
+        let m = alloc_slice[r](22 + len(canonical), byte_of(0));
+        var i = 0;
+        while i < 22 {
+            m[i] = domain[i];
+            i = i + 1;
+        }
+        i = 0;
+        while i < len(canonical) {
+            m[22 + i] = canonical[i];
+            i = i + 1;
+        }
+        code = keccak.hash256(st, m, out);
+    }
+    return code;
+}
+
+// The chain id of a canonical intent.
+pub fn chain_id[&c](canonical: &c [byte]) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < 8 {
+        v = v * 256 + int_of(canonical[2 + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+// The 20 bytes of the asset.
+pub fn asset[&c](canonical: &c [byte]) -> [] &c [byte] {
+    return canonical[10..30];
+}
+
+// The 20 bytes of the recipient.
+pub fn recipient[&c](canonical: &c [byte]) -> [] &c [byte] {
+    return canonical[30..50];
+}
+
+// The 32 bytes of the amount, big-endian.
+pub fn amount[&c](canonical: &c [byte]) -> [] &c [byte] {
+    return canonical[50..82];
+}
+
+// The reference.
+pub fn reference[&c](canonical: &c [byte]) -> [] &c [byte] {
+    return canonical[83..83 + int_of(canonical[82])];
+}
+
+// The request id.
+pub fn request_id[&c](canonical: &c [byte]) -> [] &c [byte] {
+    let at = 83 + int_of(canonical[82]);
+    return canonical[at + 1..at + 1 + int_of(canonical[at])];
+}

@@ -261,7 +261,64 @@ sixteen codes, a transaction tampered in exactly that field is refused with exac
 shape of transaction, an ERC-20 `transfer` in EIP-1559 form; other shapes (native transfers, approvals, arbitrary calls) are refused as `tx-data-length` or `tx-selector`, not understood. It does not judge
 whether the fee is *sensible*, only that it is within what was authorised.
 
-## 10. Open questions for the maintainer
+## 10. The typed intent (slice 4)
+
+**Status: built.** Results are in §10.4. The agent's output is data, never authority (§5). This is where it becomes a typed, canonical value, or is refused.
+
+### 10.1 The wire format and the schema
+
+The agent sends one JSON object. **[choice]** It carries *addresses*, not names: a name such as `approved_supplier_01` would be one more thing to resolve, and an alias that resolves to the wrong
+address is a new way to be wrong; names belong in the policy's allowlist as labels for humans and evidence.
+
+```
+{"kind":"erc20_transfer","chain_id":11155111,"asset":"0x...40 hex...","recipient":"0x...40 hex...","amount":"250000000","reference":"invoice-2026-0042","request_id":"2026-0042-a"}
+```
+
+The structure is declared once with `cancho-schema` (`alpibrusl/cancho-schema`, a schema as data that validates a body, reports **every** error with a JSON Pointer, and exports the same schema as JSON Schema 2020-12), as a strict object:
+unknown keys are refused (so there is no `from`, `gas_price`, `spender`, `data`, `to` or `value` for an agent to smuggle), and `kind` is the single choice `erc20_transfer`, `chain_id` an integer from 1 to 2^53 - 1 (the largest integer
+JSON carries without loss), `asset` and `recipient` strings of exactly 42 characters, `amount` a string of 1 to 78 characters (a uint256 has at most 78 decimal digits), `reference` and `request_id` strings of 1 to 64 characters.
+An amount is a **string** of **base units** (6-decimals USDC: `"250000000"` is 250), never a number and never decimals: a JSON number is a float in half the world's parsers. `request_id` is the agent's idempotency key (§6: a retry after a timeout must not pay twice).
+
+### 10.2 What the schema cannot say, and the code that does
+
+`cancho-schema` has types, ranges, lengths and choices but no patterns, so a second stage reads the validated fields and refuses what the schema lets through. **[choice]** Strings are plain ASCII with no JSON escape (a `\u0041` that decodes to
+`A` is two spellings of one value), and **duplicate keys are refused**: `std.json` and `cancho-schema` let the first win, which is deterministic here and exactly what a log reader or an audit tool taking the last one would disagree about.
+Bodies larger than 4 KiB are refused before they are parsed (§6: bounded inputs). The fields are read in the order chain id, asset, recipient, amount, reference, request id, and the first check that fails answers; a schema failure also has `intent.explain`, the RFC 9457 `problem+json` body listing every error.
+
+| code | tag | when |
+|---|---|---|
+| -200 | `intent-json` | not valid JSON (strict RFC 8259 and UTF-8), or not one object |
+| -201 | `intent-schema` | the structure: a missing or unknown key, a wrong type, a range, a length, a kind other than `erc20_transfer` |
+| -202 | `intent-asset` | not `0x` and 40 hex digits, bad EIP-55 checksum, all-uppercase, an escape (`chain.address.parse`'s rules, §8.1) |
+| -203 | `intent-recipient` | the same, for the recipient |
+| -204 | `intent-amount` | not canonical decimal digits (a sign, a leading zero, a point, an exponent, a space, a non-digit), or above 2^256 - 1 |
+| -205 | `intent-amount-zero` | zero: a transfer of nothing is a probe, not a payment |
+| -206 | `intent-reference` | a character outside `A-Z a-z 0-9 . _ : -`, or an escape |
+| -207 | `intent-request-id` | the same, for the request id |
+| -208 | `intent-duplicate-key` | a key twice |
+| -209 | `intent-key-escape` | a key written with an escape |
+| -210 | `intent-output` | the caller's output slice is shorter than `max_len()` |
+| -211 | `intent-work` | the Keccak working space is shorter than `keccak.state_len()` |
+| -212 | `intent-size` | more than 4,096 bytes |
+| -213 | `intent-number` | the chain id is written with a fraction or an exponent (`1.0`, `1e2`): JSON Schema calls those integers, but no float is parsed on this path, and a number has one spelling |
+
+### 10.3 The canonical form
+
+**[choice]** What is hashed, compared and recorded is never the JSON (ambiguous by nature, §7.3) but a fixed binary layout of the typed fields, version 1: byte 0 the layout version (1), byte 1 the kind (1, `erc20_transfer`), bytes 2 to 10 the
+chain id (8 bytes, big-endian), 10 to 30 the asset (20 bytes), 30 to 50 the recipient (20), 50 to 82 the amount (a uint256, 32 bytes big-endian), then the reference as a length byte and its bytes, then the request id likewise: at most 212 bytes.
+The **intent digest** is `keccak256("cancho-chain/intent/v1" || canonical)`: a different layout or a different protocol cannot produce the same digest. The same intent spelled differently (the checksummed and the lowercase address,
+reordered keys, any whitespace) has one canonical form and one digest.
+
+### 10.4 How it is checked
+
+`scripts/check_intent.py` against an independent implementation in Python (the spec above, written separately, with `eth-utils` for addresses and `jsonschema` for the structure): accept/reject agreement and the canonical bytes and digest of every accepted
+intent, on valid intents in every spelling, on each field damaged in each way the table names, on random JSON, and on every duplicate-key and escape case; the exported JSON Schema is validated as Draft 2020-12 and agrees with the structure stage on random
+documents. `--mutants` as for the other slices. Results are added below when measured.
+
+**Interim dependency [choice]:** `cancho-schema` is consumed from a sibling checkout (`CANCHO_SCHEMA`, default `../cancho-schema/src/schema.cho`), as `secp256k1` is (§8.1); its `vcs lock` / `vcs fetch` route
+(documented in its README) needs a published store at a pinned commit and is the better way once the two packages settle. It compiles with this repository's compiler although it pins an older one (`cancho check --std src/schema.cho` is clean).
+
+## 11. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
 2. May `cancho-chain` depend on `cancho-schema` (a package dependency) or is vendoring preferred? How do sibling repos consume each other (`cancho.toml` has no
