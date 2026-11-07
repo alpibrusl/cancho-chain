@@ -7,7 +7,7 @@ An auditable authority and execution layer for autonomous blockchain agents, in 
 An agent may *propose* a transaction. A separately enforced policy decides whether it is allowed. A signer, in its own process, signs only the exact
 bytes that were approved. Every step leaves evidence. The agent never holds a key and cannot change its own policy.
 
-**Status: research.** Nine slices are built: a development signer behind a network front and `cancho-gateway`, and a strict reader of what a chain provider says. Nothing opens a connection to a chain or submits a transaction yet: nothing moves value. What exists, and how it is checked:
+**Status: research.** Ten slices are built: a development signer behind a network front and `cancho-gateway`, a strict reader of what a chain provider says, and the lifecycle of a signed transaction as a pure state machine. Nothing opens a connection to a chain or submits a transaction yet: nothing moves value. What exists, and how it is checked:
 
 | Piece | State | Check |
 |---|---|---|
@@ -20,6 +20,7 @@ bytes that were approved. Every step leaves evidence. The agent never holds a ke
 | `signer` (`tools/signer`, `chain.signer`): a process that takes one request line, verifies the envelope, records it in a hash-chained `cancho-log` ledger (flushed before any signature exists) and signs; authority: one directory, the clock, stdio | built | `scripts/check_signer.py`: 386 checks against the envelope model, libsecp256k1, python-ecdsa, eth-account and an independent ledger reader; 14 kinds of ledger damage, none ever signs; 49 of 50 mutants killed (1 equivalent) |
 | `front` (`tools/front`): `POST /sign` behind `cancho-gateway`; the caller is the gateway's `X-Auth-Identity`; starts the signer once per request; authority: one port in, one program to start, nothing else | built | `scripts/check_front.py`: 117 checks with the real signer behind it, 61 mutants (59 killed, 2 equivalent); `scripts/check_stack.py`: 15 checks through the real gateway with three API keys |
 | `chain.rpc` (the JSON-RPC requests and a strict reader of a provider's answers: a receipt, a transaction or a block is believed only if it says what was signed; 15 stable refusals) | built | `scripts/check_rpc.py`: 635 checks with transactions signed by eth-account, every truncation and 400 damaged responses (none traps); 106 of 118 mutants killed (12 equivalent) |
+| `chain.lifecycle` (what a signed transaction is, as a pure function of the record last kept and what two providers say: nine states, a 74-byte canonical record, resubmit only the same bytes, final only on the same block, no decision on a disagreement) | built | `scripts/check_lifecycle.py`: 509 checks, 209,088 observations of the full product against a model **and ten properties as predicates**, random walks with a lying provider; 76 of 83 mutants killed (7 equivalent) |
 | everything else in [`docs/design.md`](docs/design.md) | designed, not built | -- |
 
 ```
@@ -30,6 +31,7 @@ CHAIN=build/chain python3 -I scripts/check_keccak.py [--mutants]     # --mutants
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages python3 -I scripts/check_eth.py [--mutants]   # needs pip install eth-account coincurve
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages python3 -I scripts/check_decode.py [--mutants]
 CANCHO=the-compiler CANCHO_SCHEMA=../cancho-schema/src/schema.cho python3 -I scripts/check_intent.py [--mutants]   # needs pip install eth-account jsonschema
+CANCHO=the-compiler python3 -I scripts/check_lifecycle.py [--mutants]
 CANCHO=the-compiler python3 -I scripts/check_rpc.py [--mutants]   # needs pip install eth-account eth-abi rlp eth-utils pycryptodome
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages CANCHO_SCHEMA=../cancho-schema/src/schema.cho CANCHO_LOG=../cancho-log/src python3 -I scripts/check_signer.py [--mutants]   # the real binary; needs cancho-log checked out too
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages CANCHO_SCHEMA=../cancho-schema/src/schema.cho python3 -I scripts/check_envelope.py [--mutants]   # needs pip install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils
