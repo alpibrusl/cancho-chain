@@ -29,6 +29,7 @@ if [ -n "$big" ]; then
 fi
 
 "$CANCHO" test --std tests/keccak.cho lib/keccak/keccak.cho
+"$CANCHO" build --bin chain
 
 for c in keccak eth decode intent policy envelope lifecycle rpc signer front executor; do
     echo "== check_$c"
