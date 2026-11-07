@@ -24,6 +24,8 @@ bytes that were approved. Every step leaves evidence. The agent never holds a ke
 | `executor` (`tools/executor`, `chain.executor`: one tick per process; two providers must agree, the lifecycle decides, the same bytes are re-sent, every change is evidence in a `cancho-log` trail; authority: one directory, two loopback addresses, the clock; plain HTTP only) | built | `scripts/check_executor.py`: 176 checks against two mock nodes (faults, lies, reorganisations, chain mismatch, damaged state and evidence); 72 of 78 mutants killed (6 explained, 1 of them not proven equivalent: design §18.5) |
 | everything else in [`docs/design.md`](docs/design.md) | designed, not built | -- |
 
+`scripts/gate.sh` runs the formatting, the file budget and every check below (without `--mutants`); CI runs it.
+
 ```
 cancho test --std tests/keccak.cho lib/keccak/keccak.cho
 cancho build --bin chain && printf abc | build/chain
