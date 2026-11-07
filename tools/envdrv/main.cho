@@ -9,6 +9,7 @@ edition 7;
 //                                 the signer's check                          -> "0" or "<code> <detail>"
 //   L <ledger> <id> <digest>      the single-use ledger                       -> "0" (fresh) or "1" (same) or a refusal
 //   D <envelope>                  the envelope digest                         -> "0 <hex>"
+//   Y <id> <digest>               the ledger entry                            -> "0 <hex>"
 //
 // A refusal prints `E<code>` (the code, positive); a `V` refusal prints `E<code> <txcheck code>`.
 
@@ -155,14 +156,21 @@ fn run[&a, &m, &s, &w, &c, &o, &x](op: int, nf: int, arena: &a [byte], meta: &m 
         var q = emit_char(out, 0, 'E');
         q = emit_nat(out, q, 0 - r);
         q = emit_char(out, q, ' ');
-        return emit_nat(out, q, detail[0] * (0 - 1) * (0 - 1));
+        return emit_nat(out, q, 0 - detail[0]);
     }
     if op == 'L' && nf == 4 {
         let r = envelope.ledger_check(field(arena, meta, 1), field(arena, meta, 2), field(arena, meta, 3));
         if r < 0 {
             return r;
         }
-        return emit_char(out, p, '0' + r);
+        return emit_char(out, 0, '0' + r);
+    }
+    if op == 'Y' && nf == 3 {
+        let r = envelope.ledger_entry(field(arena, meta, 1), field(arena, meta, 2), scratch[600..664]);
+        if r < 0 {
+            return r;
+        }
+        return emit_hex(out, p, scratch[600..664]);
     }
     if op == 'D' && nf == 2 {
         let r = envelope.digest(st, field(arena, meta, 1), scratch[0..32]);
