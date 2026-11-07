@@ -804,6 +804,31 @@ What the checks measured, and what they changed:
 - **The damaged-length case of §14.5, measured:** of 12 single-bit damages to the length field of the last record (four bytes, three bits), **one** looked torn (a length grown past the end of the file); the others were already refused as corrupt. The one that looked torn is refused when the anchor covers it and **cut when it does not**, the entry then fresh and signed once.
 - Not tested, said plainly: the order flush, anchor, signature is not distinguished from anchor-then-flush by any kill point (a process is not killed between two lines here); what the tests show is its observable result (no signature when the anchor cannot be written; a covering anchor after a crash). Durability across a power loss depends on `fs_write` and the file system (it does not call `fsync`); across a process kill the order holds.
 
+## 20. The witness: an anchor kept outside the signer's directory (slice 13)
+
+**Status: design, written before the code.** §19 keeps the anchor `(count, head)` in a second directory, and says its protection holds only if whoever can damage the ledger cannot also rewrite the anchor. This slice puts a **copy** where the signer's directory is not: the **front** keeps the last anchor the signer answered, in its own directory, and hands it back with every request; the signer refuses a ledger that the copy contradicts.
+
+### 20.1 What it protects against, and what it does not
+
+The signer's user holds the wallet key. Someone who owns that user can sign anything, with or without a ledger, so **no anchor protects against them, and none is claimed to.** What a copy elsewhere protects against is what can *write files in the signer's directories but cannot run the signer*: a **snapshot or backup restore** of the signer's volume (the most ordinary way to lose entries: the ledger and its anchor go back together, every envelope signed since can be signed again), a sync or deployment tool that overwrites the directory, an operator who "repairs" the ledger, a disk that loses its last blocks. The local anchor of §19 catches a ledger damaged on its own; the witness catches a ledger and anchor restored **together**. It is only as independent as the front's directory is from the signer's: **a different volume with its own snapshot schedule, or the same volume restored at another time, is what the deployment must provide**; two directories in one snapshot are one copy.
+
+### 20.2 The protocol
+
+- The signer's request line gets a **fifth field**: `<count> <head>` (the front's last witnessed anchor, as in §19.2: a decimal count, a space, 64 lower-case hex digits) or `-` (the front has none). The signer's answer already carries `"anchor":{"count":N,"head":"…"}` (§19.2).
+- The front keeps **`/var/lib/cancho-front/witness`**, one line in the anchor's own format, written (a temporary file and a rename) from the anchor of each `200` answer **before it sends that answer on**; if it cannot write, it answers `503` (`front-witness-write`) and keeps the signature to itself: the next request for the same envelope is *same*, with the same bytes, and only then is the answer given. The front reads the file at each request and puts it on the line; an unreadable or malformed file is `503` (`front-witness`), not "none".
+- The signer, after the §19 checks and before anything is signed: **with a witness `(w, hw)`**, the ledger must hold at least `w` entries and the one at `w` must have id `hw` (`trail.verify`'s anchor test, as for the local anchor), and the ledger may be **at most one entry ahead** of the witness (as for the local anchor: the front writes it after every signature; a crash between the signature and the write leaves one). Refusals: `signer-witness-short`, `signer-witness-mismatch`, `signer-witness-behind`. **With `-`**, the ledger must hold **at most one entry**: `signer-witness-missing` otherwise, so that deleting the front's file does not switch the check off. (The window of one entry is the same as §19.2's, and for the same reason.)
+- A request line with four fields, or six, is `signer-request`: the front is the signer's only caller in the stack, and a signer that quietly accepts a caller without a witness is a signer a restore can get around.
+
+### 20.3 What the front is trusted with
+
+Nothing it could use to sign. A compromised front can send `-` or an **older** witness (weaker or refused: it never makes the signer accept more than the local anchor already does), a **newer** or wrong one (the signer refuses everything: a denial of service the front already had by not forwarding), and cannot reach the key. Its authority grows by **one directory** (`fs_read` and `fs_write` of `/var/lib/cancho-front`), which the report shows. It still holds nothing secret, has no network out and starts one program.
+
+### 20.4 How it is checked
+
+`check_signer.py`: the fifth field in every request; a witness equal to, one behind and two behind the ledger; a witness ahead (short), a witness that names another entry (mismatch), `-` with a ledger of zero, one and two entries; a **restore** (the ledger and the local anchor both put back to an earlier state, which §19's checks cannot see and the witness does); four and six fields; each malformed witness. `check_front.py`: the witness written from each `200` answer and from none else; the file's bytes; a write that fails (`/dev/full`: `503`, and the retry returns the same signature); an unreadable or damaged file (`503`, the signer never started); the witness on the request line; the report of the front. `check_stack.py`: through the real gateway, a restore of the signer's directory is refused. `--mutants` for each. Results are added below when measured.
+
+**Not in this slice, said now.** Signing the witness (a signed checkpoint, so that the front cannot be made to hold a wrong one by someone who writes its directory); a witness kept by a party other than the front; the executor's trail (§19.2).
+
 ## 12. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
