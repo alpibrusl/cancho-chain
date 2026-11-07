@@ -548,6 +548,215 @@ It cannot tell a ledger whose **last** record has a damaged length field from a 
 
 **Not claimed.** A front: nothing listens on a socket (the next slice), so "who the caller is" is whatever the line says. That a ledger whose last record is damaged is noticed (§14.5). Durability beyond `fsync` of one file: the directory entry of a new ledger is not synced. That a hardware key or a second signer could be added: one process, one key. Independent review.
 
+## 15. The front (slice 8)
+
+**Status: built.** Results are in §15.4. The signer (§14) takes one request on standard input. This slice puts a network in front of it without giving the network anything the signer has: a small HTTP service, the **front**, behind `cancho-gateway`.
+
+### 15.1 Three processes, three authorities
+
+| process | holds | can reach |
+|---|---|---|
+| `cancho-gateway` (existing) | the digests of the callers' API keys | the network, to the front only (its upstream set is compiled in) |
+| `front` (`tools/front`) | nothing secret | one TCP port in, **one program to start** (the signer's path, a compile-time constant), the clock, the heap. **No file, no network out** |
+| `signer` (§14) | the wallet key | one directory, the clock, standard input and output. No network, no program to start |
+
+The front is the only one that listens and the only one that can start the signer; the signer is the only one that can read the key. `cancho authority` of each shows exactly its row, and a compromised front can ask for signatures for the envelopes it is given, and nothing else (§14.5).
+
+### 15.2 The API
+
+`POST /sign`, nothing else. A request carries **one header the front believes**, `X-Auth-Identity`: the name of the API key the gateway authenticated (`auth_identity_header`, `cancho-gateway` `docs/auth.md` §3.1: the gateway removes whatever the client sent under that name and sets its own). The front **requires exactly one** such header, whose value is 1 to 32 bytes of `[a-z0-9._-]` (the generator's rule for key names), and refuses (`401`, `front-no-identity`) otherwise: it is the **caller** the signer is told. **A deployment that lets a client reach the front without the gateway has no caller at all:** the front must listen on a port only the gateway can reach (loopback, or a private interface); that is the deployment's, and it is said here because the header proves nothing on its own.
+The body is exactly `{"envelope":"<hex>","signature":"<hex>","message":"<hex>"}`: three members in this order, no whitespace, lower-case hex of even length (the envelope at most 652 digits, the signature exactly 130, the message at most 2,048), at most 4,096 bytes in all. **[choice]** One canonical spelling and not a JSON parser: the issuer's side writes it, there is nothing to be liberal about, and a body that is anything else is `400 front-body`.
+
+The front builds the signer's request line from them and the caller, starts the signer with it on standard input, and reads its one line of output, at most 4,096 bytes, for at most 10 seconds:
+
+| the signer | the front answers |
+|---|---|
+| exit 0, `{"ok":true,...}` | `200`, the signer's line as it is |
+| exit 2, `{"ok":false,"rule":...}` | `422`, the signer's line as it is (a refusal is a successful security outcome; the status says the request is understood and refused) |
+| exit 2 with a rule the signer could not act on (`signer-locked`, `signer-ledger-write`, `signer-ledger-corrupt`, `signer-ledger-full`, `signer-config`, `signer-key`, `signer-same-key`) | `503`, the same line: the signer is unwell, not the request |
+| anything else (no such program, a crash, a timeout, output that is not one line) | `502`, `{"ok":false,"rule":"chain.front-signer","repair":"..."}` made by the front |
+
+Any other path is `404`, any other method on `/sign` is `405`, a body that is too large is `413`, a missing or wrong `Content-Type` is not looked at. Every refusal the front makes has a `chain.front-*` rule tag and no value from the request in its repair. **Serial:** one request is served at a time (the signer allows no other, §14.3), so the front never starts two signers.
+
+### 15.3 How it is checked
+
+`scripts/check_front.py`: the real front and the real signer on loopback, the front built with a test port and the signer's path, the signer with a test directory: a valid request signs (the signature the model's, as in §14.6) and the answer is the signer's line byte for byte; each refusal of the signer arrives with its rule tag and the status above; a missing, duplicate, empty, upper-case, too long or badly spelled `X-Auth-Identity` is `401`; every malformed body (a member missing, doubled, reordered, with whitespace, a non-hex digit, an odd length, a field over its bound, trailing bytes) is `400` and **the signer is never started** (counted by a wrapper); the front's answer to a signer that crashes, hangs, writes nothing or writes too much; `cancho authority` of the front names the one port in, the one program and nothing else (no file, no network out); and `--mutants` as for the other slices.
+`scripts/check_stack.py`: `cancho-gateway` (with `auth_identity_header`), the front and the signer, a client with API keys: the caller the signer sees is the name of the key; a forged `X-Auth-Identity` from the client is replaced; a second key whose name is another principal's cannot use the first one's envelope; no key, a wrong key and a key the route does not allow never reach the front. Results are added below when measured.
+
+### 15.4 Measured
+
+**[measured]** 2026-11-07, Linux x86-64, the self-hosted `cancho` at `162633a7` for the front and the signer, the gateway built by its own harness with the compiler it pins (`2fcf4cde`), `http.server` from the cancho repository.
+`python3 -I scripts/check_front.py` (**117 of 117** checks) and `python3 -I scripts/check_stack.py` (**15 of 15**), with the environment their headers name.
+- **Valid requests (4 random cases):** 200, `application/json`, the signer started once, the signature the model's, a retry `"same"` with the same bytes, and the answer **byte for byte the signer's own line** for the same request.
+- **The signer's refusals** arrive with their rule tags: the envelope's (another issuer, a truncated envelope, another transaction, another caller) as `422`; an unwell signer (a ledger that cannot be written, one held locked, no `signer.conf`, a bad `wallet.key`, an issuer that is the wallet, a damaged ledger) as `503`; and for every tag in the table a signer *made* to say it (a wrapper that prints a given rule) the status the table gives, including `signer-ledger-full`, which a real ledger reaches only after 65,536 entries.
+- **The identity:** 10 bad spellings (missing, twice, twice the same, empty, upper case, 33 bytes, a space, a comma, a slash, non-ASCII) and 5 more at the edges of the character classes (`{`, `:`, `` ` ``, `@`, `[`) are `401 front-no-identity` and **the signer is never started** (counted by the wrapper); headers that only *begin like* the identity (`X-Auth-Identity-Extra`, `X-Auth-Identit`, `X-Auth-Identityx`, `Y-Auth-Identity`) are not it; 1-, 32-byte and punctuated names are within the rule; the header name in any case is the header.
+- **The body:** 31 malformed bodies (empty, not JSON, a member missing, doubled, extra or reordered, whitespace, a newline or a space at the end, an upper-case digit, an odd length, `g`, `` ` ``, `/` and `:` among the digits, an empty envelope or message, a signature a byte short or long, an envelope or message one digit over its bound, a number in place of a string, an escaped digit, each member's name misspelt, the object closed with a bracket) are `400 front-body` and the signer is never started; 4,097 bytes is `413`.
+- **Routes:** another path and a trailing slash are `404`; a query string on `/sign` is the route; `GET`, `PUT`, `DELETE` and `PATCH` are `405` with `Allow: POST`.
+- **A signer that fails** (crashes, says nothing, floods its output, writes a line that is not its own, writes two lines, writes a refusal with no rule, a refusal with an exit status of 3, a line of over 4,096 bytes) is `502 front-signer`; one that **hangs** is `502` after 10 seconds and the next request is served.
+- **Concurrency:** keep-alive (two requests on one connection) works; six clients at once are served one after another, all `200`, one signature, **one ledger entry**.
+- **Authority of the front:** performs `child_signal`, `clock`, `conn_accept`, `conn_read`, `conn_write`, `exec("<the signer's path>")`, `heap`, `net_in("<its port>")`, `pipe_read`, `pipe_write`, `poll`; never touches the console, the filesystem, the command line, signals or foreign code, and the report is **bounded** (no `UNBOUNDED`). The first build was not: it held the unnarrowed `Net`; edition 11's `ports` capability, narrowed to the port, is what bounds it.
+- **The stack** (gateway, front, signer, three API keys): the procurement key signs the envelope issued to `agent-procurement-01` (the name of the key is the caller; the signature is the model's); a client's own `X-Auth-Identity` does not change the caller (the gateway replaces it): the same key forging another name gets the *same* entry, and the other key forging the first's name is `envelope-caller`; the other key presenting the first's envelope is `envelope-caller`, and signs its own; **no key, no key with a forged header, a wrong key, a key the route does not allow and a `GET` never start the signer or change the ledger** (`401`, `401`, `401`, `403`, `405` from the gateway); the gateway's log names the key and holds no key value; a refusal through the whole stack keeps its tag.
+- **What the stack check shows about the deployment, on purpose:** a request sent **straight to the front** with the header is believed (`200`): the front trusts its header, and the gateway is the only thing that makes the header true. The front must listen where only the gateway can connect.
+- `--mutants`: 61 deliberate faults (every bound of the body, each member's name, the hex alphabet and its edges, the identity's bounds and alphabet, the header's name and case, the route and method, how the caller is spelt to the signer, each exit status, the shape of the signer's line, each of the seven unwell tags, the output bound and the deadline, the refusals' statuses): **59 killed, 2 equivalent** (a quote that the next literal checks again; a missing header that `handle` refuses by its index). The first run killed 48 of 61; the survivors were tests missing (boundary characters, names that begin like the header, a signer that lies about its exit status, a rule-less refusal, an over-long line, a tag the real signer reaches only after minutes), and each became a check.
+- **Found while building:** the first body refusal was not valid JSON (its repair text held unescaped quotes), found by the first run that parsed it.
+
+**Not claimed.** TLS between the gateway and the front (loopback or a private link is assumed), rate limiting of the signer's callers beyond the gateway's, logging in the front (there is none: no request value reaches a log), a second signer or a queue (the signer is one at a time by design), and that `exec`'s narrowing is more than a prefix: `exec("/usr/local/lib/cancho-chain/signer")` also admits `.../signer-anything`, so the directory should hold nothing else.
+
+## 16. The RPC codec (slice 9)
+
+**Status: built.** Results are in §16.5. What a transaction does after it is signed is read from a provider that is, by §5, *external and untrusted*. This slice is the part of that which needs no network and can be checked exactly: the JSON-RPC requests, and a **strict reader of the responses** that believes nothing about a transaction it has not compared with what was signed. The lifecycle (submitted, included, final, dropped, replaced) and the executor that polls are the next slice; they are built on what this one can say.
+
+### 16.1 Requests
+
+Fixed texts, `{"jsonrpc":"2.0","id":<n>,"method":"<m>","params":[...]}`, written into a buffer of at least 8,448 bytes (a raw transaction is limited to 4,096 bytes, `-312` beyond): `eth_chainId`, `eth_blockNumber`, `eth_getTransactionCount` (an address, `"latest"` or `"pending"`), `eth_sendRawTransaction`, `eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_getBlockByNumber` (a number, no transaction bodies). Quantities are `0x` and lower-case hex with no leading zero; hashes and addresses are `0x` and lower-case hex; `id` is the caller's integer.
+
+### 16.2 Responses
+
+A response is at most 65,536 bytes (`rpc-json`), one JSON object with `"jsonrpc":"2.0"`, the `id` that was sent (`rpc-id`), and **exactly one** of `result` and `error` (`rpc-shape`). **[choice]** A key that appears twice in the response or in an object read from it, or is written with an escape, is refused (`rpc-duplicate`): `std.json` lets the first win, and a reader that takes the first where another takes the last is how two parties come to disagree about what a provider said. Members the codec does not read are ignored: providers add fields.
+An `error` is its code and nothing else (the message is a provider's free text and is never interpreted: **no decision is taken from the wording of an error**).
+
+| reader | accepts | refuses |
+|---|---|---|
+| quantity | `0x0`, or `0x` and 1 to 15 lower-case hex digits starting with 1 to f | upper case, `0X`, a leading zero, an empty `0x`, 16 digits or more, not a string, an escape (`rpc-quantity`) |
+| hash | `0x` and exactly 64 lower-case hex digits | anything else (`rpc-hash`) |
+| address | `0x` and exactly 40 hex digits, either case (providers return checksummed text) | anything else (`rpc-address`) |
+| data | `0x` and an even number of lower-case hex digits | `rpc-data` |
+| chain id | a quantity equal to the configured chain id | `rpc-chain` |
+
+### 16.3 What a transaction must be, to be believed
+
+**A receipt** (`eth_getTransactionReceipt`): `null` is *not found*, not an error. An object is believed only if its `transactionHash` is the hash we computed from the bytes we signed, its `from` is the wallet, its `to` is the token contract (a receipt with no `to` is a contract creation, not ours), `status` is exactly `0x1` or `0x0` (a receipt without a status is pre-Byzantium and not accepted: `rpc-status`), and `blockNumber`, `blockHash` and `gasUsed` are well-formed. A receipt for another transaction, from another account, or to another contract is `rpc-receipt`: a provider that answers about something else is lying or confused, and either way the answer is not used.
+**A transaction** (`eth_getTransactionByHash`): `null` is not found. An object is believed only if its `hash`, `from`, `to`, `nonce`, `input` and `value` are exactly the hash, wallet, token, nonce, calldata and zero that were signed (`rpc-tx`); `blockNumber` is `null` (pending) or a quantity (mined).
+**A block** (`eth_getBlockByNumber`): `null` or an object whose `number` is the number asked for and whose `hash` is well-formed; it is how a block hash at a height is read again later, so that a reorganisation is a hash that changed.
+
+### 16.4 How it is checked
+
+`scripts/check_rpc.py`: requests are compared with the model's text byte for byte and must parse as JSON with exactly the fields; responses are fixtures in the shapes real clients write (Geth, Erigon, an Infura-style gateway: extra fields, checksummed addresses, `null` for not found, the error codes of `-32000`, `-32601`, `-32602`), with the transaction built and signed by `eth-account` (the hash, the sender and every field of the node's answer come from its transaction, not from this code), and the adversarial ones: a duplicate key at every level, a wrong `id`, both or neither of `result` and `error`, another `jsonrpc`, each quantity and hash and address spoiled each way, a receipt with another hash, sender, contract, or no status, a transaction object that differs from what was signed in each field, a chain id off by one; every response truncated at every byte (never accepted, never a trap); and `--mutants`. Results are added below when measured.
+
+### 18.5 Results (measured)
+
+`CANCHO=... python3 -I scripts/check_executor.py` (the real binary against two mock nodes): **176 checks, 0 failed**. `--mutants`: **78 mutants, 72 killed, 6 survivors, each explained** in `EQUIVALENT` in the script (five are equivalent: a cut or too-long answer is also refused by the length check, the JSON reader or the head check; the write deadline cannot be reached by a request that fits the socket buffer; a failed append is followed by a failed flush). **One is not proven equivalent** (`a receipt without its transaction`): the clause rejects a receipt in block 0 next to a pending transaction, and a test that sends exactly that is refused by the mutated executor too, for a reason I did not trace; so no input is known that this clause alone catches. It stays as defence in depth.
+
+**The checks found a real fault in the executor, now fixed** (corrected in place): when both providers were behind the block they named (tip below the block), `lifecycle.observe` refused with `-321` even though no decision was being made, so a lagging pair of providers stopped the executor with `chain.executor-state` instead of "no decision". The executor now passes the record no block it cannot be in. The same checks also showed that a corrupt `state` file was read as absent; it is now refused (`executor-state`) unless the file is missing.
+
+**Still not done:** TLS (a provider is reached through a loopback forwarder), chunked answers, verifying the signature, wiring the signer's anchor `(count, head)`, constant-time secp256k1 (alpibrusl/cancho#712), an independent review.
+
+**Not in this slice, said now.** A network connection (nothing here opens a socket), a second provider for critical reads (§5 asks for one: the executor will take two answers and require them to agree before a transaction is called final), and the lifecycle's states and transitions.
+
+### 16.5 Measured
+
+**[measured]** 2026-11-07, Linux x86-64, the self-hosted `cancho` at `162633a7`, `eth-account`, `eth-abi`, `rlp`, `eth-utils` and `pycryptodome` from pip. `CANCHO=<compiler> python3 -I scripts/check_rpc.py [--mutants]`: **635 of 635** checks pass.
+- **Requests:** 6 random cases of each of the eight requests, and a fixed grid of 11 ids by 15 block numbers at every decimal and hexadecimal digit-count edge (0, 1, 9, 10, 99, 100, 255, 256, 65,535, 65,536 and 2^53 - 1; 0, 1, 9, 10, 15, 16, 17, 255, 256, 4,095, 4,096, 65,535, 65,536, 2^50 and 2^56 - 1), each the model's text byte for byte; an `id` of 2^53, a raw transaction of 4,097 bytes or none, and an address or hash a byte short are refused; 4,096 bytes is accepted.
+- **Real shapes:** from transactions built and signed by `eth-account` (random chain, nonce, fees, token, recipient and amount; its hash and sender), the receipt (status 1 and 0), the transaction (mined and pending), the block, the chain id and each `null` are read as the model says, with checksummed addresses, `logs`, `logsBloom` and a dozen members the codec does not read; a receipt with 300 more members and a result with 1,500 are read.
+- **Spoiled:** 29 receipts (another hash, sender or contract; no contract (a creation) and no `to` key; a status of 2, `0x01`, a number, a boolean, `0X1`, or none; each quantity with a leading zero, in upper case, of 16 digits, a number, or missing; each hash short, long, upper-case or with no prefix), 24 transactions (every signed field different, malformed, or missing; a `value` that is zero only in disguise), blocks and chain ids, and each of the quantity, hash, address and data readers at its edges, each answers **with the code the design gives**; a name twice (the first saying success), or written with an escape, at every level is `rpc-duplicate`.
+- **The envelope:** 41 shapes of a response (another `id`, below it, and one that wraps an int to it; a string, a float and no `id`; `jsonrpc` 1.0, a number, an escape, or none; a `result` and an `error`, neither, a `result` of `null`; an error with no code, a string code, a code too big for an int, an error that is a string; a batch; a string; trailing bytes, two objects, a trailing comma, single quotes; 65,537 bytes refused and 65,536 read): each its code. **An error is its code and nothing else.**
+- **Truncation and damage:** every proper prefix of a receipt response is `rpc-json` and none traps; 400 responses with 1 to 5 bytes replaced at random never trap; a response nested 5,000 deep is read or refused.
+- `--mutants`: 118 deliberate faults (every bound and digit of the requests, each test of the envelope, each reader's alphabet, length and prefix, and each comparison of the receipt, transaction and block): **106 killed, 12 equivalent**, each explained in the script (a test that the next one repeats, or a length the driver fixes). The first run killed 83 of 118. Of the 35 survivors, 11 were a mutant of mine that changed nothing (a threshold of `-5` against codes that start at `-300`; rewritten), 12 are the equivalents, and the rest were checks missing (a one-digit id, the digit edges of a decimal and a hexadecimal count, an id that is one *less*, a chain id one less, a `jsonrpc` written with an escape, an error code too big for an int, a one-character quantity, a `/` among the digits, a hash with only one digit in upper case, a block one less, no `to` key, a malformed sender or nonce in a transaction).
+- **Found while building:** the driver's integer reader keeps 7 bytes, so the first run of the grid showed block 2^60 - 1 as 2^52 - 1; the codec was right, the driver is documented as 2^56 - 1 and the grid stops there. A quantity of 15 hex digits is read by the codec (tested through a result).
+
+**Not claimed.** A connection (nothing here opens a socket), a second provider, the lifecycle, and that the model and the code agree on *what a provider says* beyond the shapes tested: the fixtures are in the shapes of real clients, written by me, not recorded from a node.
+
+## 17. The lifecycle (slice 10)
+
+**Status: built.** Results are in §17.6. A signed transaction is not a payment: it is bytes, and what becomes of them is read from untrusted providers (§16). This is the part of the executor that decides, as a **pure function** of what was last known and what the providers now say, what a transaction is and what, if anything, may be done about it. The executor that fetches the answers, and the HTTP, are the next slice; this one is checked exhaustively.
+
+### 17.1 The record
+
+74 bytes, canonical, so that it can be kept by a process that is killed at any moment: `[0]` version 1, `[1]` the state, `[2..10]` the nonce, `[10..18]` `sent_at` (ms, the last time a send was tried), `[18..26]` `changed_at` (ms, the last time the state changed), `[26..34]` `consumed_at` (ms, when the account's nonce was first seen past ours with our transaction nowhere: 0 if not), `[34..42]` the block it is in, `[42..74]` that block's hash. `check` refuses anything else: a state outside 1 to 9, a block and hash on a state that is not in a block (and none on one that is), a `consumed_at` on a state that cannot have one.
+
+| state | meaning | may be left? |
+|---|---|---|
+| 1 `SIGNED` | we hold the bytes and have never sent them | yes |
+| 2 `SUBMITTED` | a provider took it, or it was seen pending | yes |
+| 3 `UNCERTAIN` | a send failed or timed out and nothing has shown the transaction since | yes |
+| 4 `INCLUDED` | a receipt with status 1, in a block | yes: a reorganisation can undo it |
+| 5 `REVERTED` | a receipt with status 0, in a block: gas was spent and nothing moved | yes, the same |
+| 6 `FINAL` | `INCLUDED`, with at least `k` confirmations, **and the block still the one it was**: terminal |
+| 7 `FAILED_FINAL` | `REVERTED`, final in the same sense: terminal |
+| 8 `REPLACED` | the account's nonce passed ours, our transaction was nowhere, and that stayed true for `settle_ms`: terminal, **not moved** |
+| 9 `DROPPED` | not seen by the providers for `drop_ms` since the last send, and the nonce still unused | yes: the same bytes may be sent again |
+
+### 17.2 What it is told
+
+Each step is one **observation**, made by the executor from two providers' answers: *agree* (the providers said the same, else the observation is empty and nothing changes: **no decision is taken on one provider's word when two are asked and differ**); *tx* (0 not found, 1 pending, 2 mined); for a mined one, *status* (success or reverted), its *block* and *block hash*, the chain's *tip* and the *hash now at that block's height* (or unknown); the account's *latest nonce*; the *time*; and the configuration `k`, `drop_ms`, `settle_ms`.
+A send is told as `after_send(ok)`.
+
+### 17.3 The rules
+
+**[choice]** The table, in this order, for a state that is not terminal and an observation that *agrees*:
+
+1. **mined**: the state becomes `INCLUDED` (status 1) or `REVERTED` (0) with this block and hash (a different block or hash than before is a reorganisation and is recorded as the change it is); `consumed_at` is cleared. If the tip is at least `block + k - 1` **and** the hash now at that height is the block's hash, it becomes `FINAL` or `FAILED_FINAL`. A tip below the block, or a block that cannot be, is a refused observation.
+2. **pending**: the state becomes `SUBMITTED` (from any non-terminal state, including `INCLUDED` and `REVERTED`: a receipt that was and is not, with the transaction back in the pool, is a reorganisation); `consumed_at` is cleared.
+3. **not found**:
+   * `SIGNED`: answer **submit**.
+   * `INCLUDED` or `REVERTED`: the receipt has vanished: it becomes `UNCERTAIN` and, **if the nonce is still unused**, the answer is **resubmit**.
+   * `SUBMITTED`, `UNCERTAIN`, `DROPPED`, and the account's nonce is past ours: if `consumed_at` is 0 it is set to now and nothing else happens; once `now - consumed_at >= settle_ms` the state becomes `REPLACED` (with a `settle_ms` of 0 the first sight is enough, as the operator asked). (The first sight of a consumed nonce with no transaction might be a provider that has the block and not yet the receipt; only a consumed nonce that *stays* is believed.)
+   * `SUBMITTED` or `UNCERTAIN`, and the nonce unused: once `now - sent_at >= drop_ms` it becomes `DROPPED` and the answer is **resubmit**. `DROPPED` with the nonce unused answers **resubmit** (until a send moves it).
+4. A terminal state never changes, and answers nothing.
+
+`after_send(ok)`: from `SIGNED`, `UNCERTAIN` or `DROPPED`: `SUBMITTED` if ok, `UNCERTAIN` if not (and `sent_at` is now either way); from `SUBMITTED`: ok keeps it, not ok makes it `UNCERTAIN`; from any other state it is refused (`lifecycle-state`): **a transaction in a block, or ended, is never sent again**.
+
+**Resubmitting is safe because the bytes are the same bytes.** The same signed transaction has the same hash and nonce, so a provider that has it ignores it and one that does not takes it; it cannot be paid twice. What the machine must never do is ask for a *new* signature for the same authorisation, and it has no such action: the signer's ledger (§14) would refuse it too.
+
+### 17.4 Properties
+
+Checked exhaustively over small domains and against a model, as predicates, not as a copy of the table: a terminal state is fixed under every observation; `FINAL` is reached **if and only if** a mined, agreeing, success observation has `tip - block + 1 >= k` and a hash at that height equal to the block's; `REPLACED` only after a consumed nonce was seen at least `settle_ms` earlier and is still there with the transaction nowhere; **no observation that disagrees changes anything**; a state in a block comes only from a mined observation; **submit** only from `SIGNED`; **resubmit** only when the nonce is unused and the transaction was not found; every record the machine writes passes `check`; and `check` refuses every single-byte spoiling of a record that makes it non-canonical.
+
+### 17.5 How it is checked
+
+`scripts/check_lifecycle.py`: the machine as a program (`tools/lifedrv`) against a model in Python written separately (a different formulation: the model is a rule list evaluated top-down on a dictionary, not the order of `if`s); the exhaustive product of every state, every observation shape over a small domain (tx 0 to 2, status, block and tip around the finality edge, hash equal or not, nonce below, equal and above, times around the two windows, agree or not), the properties of §17.4 as predicates over the result, random long walks (thousands of steps with a random provider that sometimes lies, reorganises or forgets) that must keep every invariant, and `--mutants`. Results are added below when measured.
+
+**Not in this slice.** Fetching the answers, asking two providers and deciding that they agree, the HTTP, persisting the record, and the evidence events written at each change.
+
+### 17.6 Measured
+
+**[measured]** 2026-11-07, Linux x86-64, the self-hosted `cancho` at `162633a7`. `CANCHO=<compiler> python3 -I scripts/check_lifecycle.py [--walks N] [--mutants]`: **509 of 509** checks pass.
+- **`check`:** 12 records (every state, `consumed_at` set where it may be) and every single-byte spoiling of each (six values at each of 74 offsets), a record one byte short or long, empty, a zero hash on a state in a block and a block on one that is not: 4,591 records and spoilings in all, each agreeing with the model's canonical form.
+- **`after_send`:** every state, both outcomes, four times: the model's record, byte for byte; a state in a block or ended is refused (`E322`) and never written.
+- **`observe`, the full product: 209,088 observations** (12 records by two configurations, `k` of 3 with windows of 100 and 50 ms and `k` of 1 with none; agreeing and not; not found, pending and mined with every status, three blocks, two hashes, a tip at `block - 1`, `block` and the three edges of `k`, the hash at that height known or not and equal or not; a nonce below, at and above; six times around both windows): each answer, the record and the action, **equals the model's**, and **every property of §17.4 holds of every one of them, as a predicate** (`P1` to `P10`: terminal states fixed; a disagreement changes nothing; `FINAL` iff mined, agreeing, confirmed and the same block; in a block only from a mined observation; `REPLACED` only after a consumed nonce stayed consumed; **submit** only from `SIGNED`; **resubmit** only for an absent transaction and an unused nonce; `consumed_at` is when it was first seen; `changed_at` moves with a change and only then; `sent_at` and the nonce are not touched). Refused observations: a `tx` of 3, a tip below the block, a hash a byte short, a `k` of 0, a spoiled record.
+- **Random walks** (default 60, in a world that advances, reorganises up to `k - 1` deep, forgets its pool, and where another transaction can take the nonce; at each step at most one of two providers lies, in six ways): every step keeps every property; **the machine is never `FINAL` unless the truth says the transaction is mined with `k` confirmations and the status it claims, and never `REPLACED` unless the nonce was taken and the transaction is nowhere**; a world with honest providers reaches its end every time (in a run of 120 walks: 96 `FINAL` or `FAILED_FINAL`, 24 `REPLACED`, none stuck, with lying providers as well).
+- `--mutants`: 83 deliberate faults (every bound and offset of the record and its `check`, each of the nine states in the places it matters, the arguments' ranges, the two windows and their edges, the finality edge and its three conditions, the first sight of a consumed nonce, a vanished receipt in each of its two forms, each action): **76 killed, 7 equivalent** (the driver's integers are unsigned, so a negative argument cannot be given; the check is for callers that compute their own). The first run killed 73 of 83; the survivors were a hash zeroed on a state in a block (a single-byte spoiling cannot make it), a window measured from the wrong field (the model's `sent_at` and `changed_at` were equal), and a vanished receipt with `settle_ms` of 0, each of which became a case of the product.
+- **Found while building:** with `settle_ms` of 0 the first sight of a consumed nonce is enough (the property first said otherwise, and is now stated as the rule is); a consumed nonce that is *not* settled cannot end in `REPLACED` through a receipt that vanished, by design.
+
+**Not claimed.** That the world model resembles a chain beyond the cases it has (it is mine); the persistence of the record and the evidence events at each change; fetching, quorum and HTTP, which are the next slice.
+
+## 18. The executor (slice 11)
+
+**Status: built (§18.5).** The executor is what makes a signed transaction happen and be known to have happened: it asks two providers what they see, decides with the lifecycle (§17) whether they agree and what to do, sends the same bytes again when that is what the lifecycle says, and leaves evidence of every change. It is one tick per process, like the signer: run it from a timer; every tick is safe to repeat and to kill.
+
+### 18.1 What it holds, and what it can reach
+
+It holds **no key**. Its authority (`cancho authority`): one directory, **two outbound addresses** (the two providers, compile-time constants, narrowed one each), the clock, the heap, standard output. No `exec`, no listening port, no foreign code. **[choice]** The providers are plain TCP and HTTP/1.1 with `Content-Length` (a chunked answer is `provider-chunked` and refused): the executor does not speak TLS, so a provider that needs it is reached through a local forwarder that does (stunnel or a reverse proxy on loopback). This is a limit, said here and in the README: until a TLS client is in the executor, a provider across the internet is not reached by it directly.
+
+| file | what |
+|---|---|
+| `config` | `chain=<n>`, `k=<n>`, `drop_ms=<n>`, `settle_ms=<n>`, one to a line, in this order |
+| `envelope` | the authorisation envelope (§13), hex: **what was authorised** |
+| `raw` | the signed transaction, hex: **what is sent** |
+| `state` | the lifecycle's 74-byte record, hex; written by `state.new` and a rename |
+| `evidence.seg` | `cancho-log` in trail mode (as the signer's ledger): one `tx.state` event per change |
+
+### 18.2 A tick
+
+1. Take `flock` on `evidence.seg`; verify the trail whole and read-only, then recover a torn tail (the signer's rule, §14.3): a ledger that does not verify stops the tick (`executor-evidence-corrupt`).
+2. Read the job and **check that it is what was authorised**: the envelope well formed, and `txcheck.validate_signed` of `raw` against the envelope's own chain, nonce, token, recipient, amount and caps (so what is sent is exactly what the policy allowed, whoever wrote `raw`); the configured chain is the envelope's. The transaction hash is `keccak256(raw)`, the wallet and token are the envelope's. (The signature is not verified here: a receipt whose `from` is not the wallet is what catches a transaction signed by another key, §16.3.)
+3. If there is no `state`, make one (`SIGNED`, the envelope's nonce) and leave evidence.
+4. **Ask each provider** (a few JSON-RPC requests each, a few seconds' deadline apiece): the chain id (**it must be the configured one, else the provider is refused**), the account's latest nonce, the tip, the transaction by hash, its receipt, and, if it is mined, the block's hash at that height. Each answer is read by `chain.rpc` and believed only as §16.3 says. A provider that cannot be reached, answers wrongly, or contradicts itself (a receipt with no transaction mined, or a transaction mined with another block) is **unusable** this tick.
+5. **Agree:** both providers usable and the same on what they say about the transaction (not found, pending, or mined with the same status, block and block hash), the nonce and, if mined, the hash at the height; the tip is the lower of the two. Otherwise `agree` is false and the lifecycle changes nothing. **One provider's word is never enough, and a provider that is down is not a vote.**
+6. `lifecycle.observe`. If it answers **submit** or **resubmit**, send `raw` to both providers; a provider *took* it if its `result` is this transaction's hash (anything else, an error included, is a failure: **no decision from an error's wording**); the send is ok if either took it; `after_send`.
+7. If the state changed, append the evidence event and flush, **then** write `state`. A tick killed between the two leaves the evidence one step ahead of the state; the next tick sees the same facts, makes the same change and writes the event again: **evidence is at-least-once, the state exactly the lifecycle's**. A tick killed after a send and before the state is written finds the transaction pending, which is `SUBMITTED`: the same bytes are never a second payment.
+8. Print one line: `{"ok":true,"state":"<name>","action":"nothing"|"submit"|"resubmit","sent":<bool>,"agree":<bool>}` and exit 0; a refusal is `{"ok":false,"rule":"chain.<tag>","repair":"..."}` and exit 2.
+
+### 18.3 The evidence event
+
+Kind `tx.state`, payload `{"envelope":"<id hex>","tx":"<hash hex>","state":"<name>","block":<n>}` (the block is 0 outside a block): written when the state changes. It names the envelope's id (§13) and the transaction's hash, so an auditor can walk from the signer's ledger entry (`envelope.consumed`) to what became of it.
+
+### 18.4 How it is checked
+
+`scripts/check_executor.py`: the real executor against **two mock nodes** (Python HTTP servers speaking JSON-RPC from a model of a chain: blocks, a mempool, an account nonce, with a transaction built and signed by `eth-account`) that can be made to forget, reorganise, lie, answer with another chain id, hang, answer in chunks or with garbage, or be down. Ticks are driven by the script. Scenarios: an honest chain to `FINAL` (the evidence has each change, the hash chain verifies with `trailtool`); a reverted transaction to `FAILED_FINAL`; a transaction the mempool forgets (`DROPPED`, resent, final); a reorganisation (back to `SUBMITTED`, then final in the new block); a nonce taken by another transaction (`REPLACED` only after `settle_ms`); one provider lying at each step (nothing changes, nothing is sent twice, and the state is never `FINAL` unless the truth says so); one provider down or hanging; a provider on another chain; a job that is not what the envelope authorised (refused before any request); a killed tick (state and evidence consistent, the same transaction); the authority of the binary; `--mutants`. Results are added below when measured.
+
+**Not in this slice, said now.** TLS, a chunked answer, more than two providers, scheduling (the caller's), verifying the signature, a fee bump or replacement (the lifecycle has no such action by design: §17.3).
+
 ## 12. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?

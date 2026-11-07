@@ -1,0 +1,228 @@
+edition 7;
+
+module chain.executor;
+
+import chain.hex;
+import chain.lifecycle;
+import std.bytes;
+
+// The executor's parts that are not input and output (docs/design.md section 18): its refusals and repairs, its configuration, and the evidence event's payload.
+
+pub fn refused_locked() -> [] int {
+    return -330;
+}
+
+pub fn refused_evidence() -> [] int {
+    return -331;
+}
+
+pub fn refused_evidence_write() -> [] int {
+    return -332;
+}
+
+pub fn refused_config() -> [] int {
+    return -333;
+}
+
+pub fn refused_job() -> [] int {
+    return -334;
+}
+
+pub fn refused_chain() -> [] int {
+    return -335;
+}
+
+pub fn refused_state() -> [] int {
+    return -336;
+}
+
+pub fn refused_state_write() -> [] int {
+    return -337;
+}
+
+pub fn refused_clock() -> [] int {
+    return -338;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -330 {
+        return "executor-locked";
+    }
+    if code == -331 {
+        return "executor-evidence-corrupt";
+    }
+    if code == -332 {
+        return "executor-evidence-write";
+    }
+    if code == -333 {
+        return "executor-config";
+    }
+    if code == -334 {
+        return "executor-job";
+    }
+    if code == -335 {
+        return "executor-chain";
+    }
+    if code == -336 {
+        return "executor-state";
+    }
+    if code == -337 {
+        return "executor-state-write";
+    }
+    if code == -338 {
+        return "executor-clock";
+    }
+    return "executor-unknown";
+}
+
+pub fn repair(code: int) -> [] &static [byte] {
+    if code == -330 {
+        return "another executor holds this directory; run one at a time";
+    }
+    if code == -331 {
+        return "the evidence log does not verify; nothing is done until a person has looked at it";
+    }
+    if code == -332 {
+        return "the evidence could not be written; nothing was changed; check the disk and retry";
+    }
+    if code == -333 {
+        return "config must be exactly chain=, k=, drop_ms= and settle_ms=, one to a line, in that order";
+    }
+    if code == -334 {
+        return "envelope and raw must be hex, and raw must be exactly the transaction the envelope authorises";
+    }
+    if code == -335 {
+        return "a provider answers for another chain than the configured one; nothing was sent";
+    }
+    if code == -336 {
+        return "the state file is not a canonical record for this job";
+    }
+    if code == -337 {
+        return "the state could not be written; the next tick will find the same facts and try again";
+    }
+    if code == -338 {
+        return "the clock could not be read";
+    }
+    return "refused";
+}
+
+fn digits[&t](text: &t [byte], from: int, to: int) -> [] int {
+    if to <= from || to - from > 18 || to - from > 1 && int_of(text[from]) == 48 {
+        return -1;
+    }
+    var v = 0;
+    var i = from;
+    while i < to {
+        let c = int_of(text[i]);
+        if c < 48 || c > 57 {
+            return -1;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// Does `text` hold `lit` at `at`?
+fn at_is[&t, &l](text: &t [byte], at: int, lit: &l [byte]) -> [] bool {
+    if at < 0 || len(text) - at < len(lit) {
+        return false;
+    }
+    var i = 0;
+    while i < len(lit) {
+        if int_of(text[at + i]) != int_of(lit[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// `config`: `chain=<n>`, `k=<n>`, `drop_ms=<n>`, `settle_ms=<n>`, one to a line in this order, each number 1 to 18 digits with no leading zero (`k` at least 1), the last line's newline optional.
+// The four numbers go to `out[0..4]`. 0, or -333.
+pub fn parse_config[&t, &o](text: &t [byte], out: &!o [int]) -> [] int {
+    if len(out) < 4 {
+        return -333;
+    }
+    var at = 0;
+    var which = 0;
+    while which < 4 {
+        var lit = "chain=";
+        if which == 1 {
+            lit = "k=";
+        }
+        if which == 2 {
+            lit = "drop_ms=";
+        }
+        if which == 3 {
+            lit = "settle_ms=";
+        }
+        if !at_is(text, at, lit) {
+            return -333;
+        }
+        at = at + len(lit);
+        var end = at;
+        while end < len(text) && int_of(text[end]) != 10 {
+            end = end + 1;
+        }
+        let v = digits(text, at, end);
+        if v < 0 || which == 1 && v < 1 {
+            return -333;
+        }
+        out[which] = v;
+        if end < len(text) {
+            end = end + 1;
+        } else if which != 3 {
+            return -333;
+        }
+        at = end;
+        which = which + 1;
+    }
+    if at != len(text) {
+        return -333;
+    }
+    return 0;
+}
+
+fn put[&o, &t](out: &!o [byte], at: int, text: &t [byte]) -> [] int {
+    var i = 0;
+    while i < len(text) {
+        out[at + i] = text[i];
+        i = i + 1;
+    }
+    return at + len(text);
+}
+
+fn put_decimal[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    var n = 1;
+    var t = v;
+    while t >= 10 {
+        t = t / 10;
+        n = n + 1;
+    }
+    var u = v;
+    var i = n - 1;
+    while i >= 0 {
+        out[at + i] = byte_of(48 + u % 10);
+        u = u / 10;
+        i = i - 1;
+    }
+    return at + n;
+}
+
+// The evidence event's payload (docs/design.md section 18.3), `{"envelope":"<id hex>","tx":"<hash hex>","state":"<name>","block":<n>}`, into `out` (at least 200 bytes): its length, or -332.
+// `id` and `tx` are 32 bytes each; `state` is a lifecycle state (1 to 9); `block` is 0 or more.
+pub fn payload[&i, &h, &o](id: &i [byte], tx: &h [byte], state: int, block: int, out: &!o [byte]) -> [] int {
+    if len(id) != 32 || len(tx) != 32 || state < 1 || state > 9 || block < 0 || len(out) < 200 {
+        return -332;
+    }
+    var at = put(out, 0, "{\"envelope\":\"");
+    hex.encode(id, out[at..at + 64]);
+    at = put(out, at + 64, "\",\"tx\":\"");
+    hex.encode(tx, out[at..at + 64]);
+    at = put(out, at + 64, "\",\"state\":\"");
+    at = put(out, at, lifecycle.state_name(state));
+    at = put(out, at, "\",\"block\":");
+    at = put_decimal(out, at, block);
+    return put(out, at, "}");
+}

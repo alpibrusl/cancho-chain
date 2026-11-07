@@ -1,0 +1,244 @@
+edition 7;
+
+// The driver of `scripts/check_lifecycle.py` (docs/design.md section 17.5): one command on standard input, one answer on standard output. Not the product's command line.
+// Fields are hex (`_` is empty); an integer is big-endian hex; a record is its 74 bytes.
+//
+//   N <nonce> <now>                  a new record                                 -> "0 <record>"
+//   C <record>                       is it canonical?                             -> "0"
+//   S <record> <ok 00|01> <now>      after_send                                   -> "0 <record>"
+//   O <record> <agree> <tx> <status> <block> <block hash> <tip> <hash known> <hash at> <nonce latest> <now> <k> <drop ms> <settle ms>
+//                                    observe                                      -> "0 <action> <record>"
+//
+// A refusal prints `E<code>` (the code, positive); `C` of a record the machine would not write prints `E320`.
+
+import chain.hex;
+import chain.lifecycle;
+import std.buffer;
+import std.io;
+
+fn read_stdin[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    var c = getchar(io);
+    while c >= 0 {
+        out = buffer.push(heap, out, byte_of(c));
+        c = getchar(io);
+    }
+    return out;
+}
+
+// Splits the line into fields. Field k's bytes (hex-decoded; `_` is empty; the text itself for field 1 of `P`) are at arena[meta[k]..meta[k] + meta[16 + k]].
+// Returns the number of fields, the op included.
+fn split_fields[&t, &a, &m](text: &t [byte], arena: &!a [byte], meta: &!m [int]) -> [] int {
+    let raw = false;
+    var n = 0;
+    var at = 0;
+    var i = 0;
+    while i < len(text) && n < 16 {
+        while i < len(text) && (int_of(text[i]) == 32 || int_of(text[i]) == 10) {
+            i = i + 1;
+        }
+        if i < len(text) {
+            var j = i;
+            while j < len(text) && int_of(text[j]) != 32 && int_of(text[j]) != 10 {
+                j = j + 1;
+            }
+            meta[n] = at;
+            if n == 0 || raw && n == 1 {
+                var k = i;
+                while k < j {
+                    arena[at] = text[k];
+                    at = at + 1;
+                    k = k + 1;
+                }
+            } else if !(j - i == 1 && int_of(text[i]) == '_') {
+                var k = i;
+                while k + 1 < j {
+                    arena[at] = byte_of(hex.value(int_of(text[k])) * 16 + hex.value(int_of(text[k + 1])));
+                    at = at + 1;
+                    k = k + 2;
+                }
+            }
+            meta[16 + n] = at - meta[n];
+            n = n + 1;
+            i = j;
+        }
+    }
+    return n;
+}
+
+fn field[&a, &m](arena: &a [byte], meta: &m [int], k: int) -> [] &a [byte] {
+    return arena[meta[k]..meta[k] + meta[16 + k]];
+}
+
+fn emit_char[&o](out: &!o [byte], pos: int, c: int) -> [] int {
+    out[pos] = byte_of(c);
+    return pos + 1;
+}
+
+fn emit_hex[&o, &b](out: &!o [byte], pos: int, bytes: &b [byte]) -> [] int {
+    var p = pos;
+    var k = 0;
+    while k < len(bytes) {
+        let v = int_of(bytes[k]);
+        p = emit_char(out, p, hex.digit(v >> 4));
+        p = emit_char(out, p, hex.digit(v & 15));
+        k = k + 1;
+    }
+    return p;
+}
+
+fn emit_nat[&o](out: &!o [byte], pos: int, v: int) -> [] int {
+    var n = 1;
+    var t = v;
+    while t >= 10 {
+        t = t / 10;
+        n = n + 1;
+    }
+    var u = v;
+    var i = n - 1;
+    while i >= 0 {
+        out[pos + i] = byte_of(48 + u % 10);
+        u = u / 10;
+        i = i - 1;
+    }
+    return pos + n;
+}
+
+fn emit_text[&o, &b](out: &!o [byte], pos: int, text: &b [byte]) -> [] int {
+    var p = pos;
+    var k = 0;
+    while k < len(text) {
+        p = emit_char(out, p, int_of(text[k]));
+        k = k + 1;
+    }
+    return p;
+}
+
+// The big-endian bytes as an integer (at most 7 bytes: enough for a chain id, a nonce or a gas limit).
+fn int_of_bytes[&b](b: &b [byte]) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < len(b) && i < 7 {
+        v = v * 256 + int_of(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn run[&a, &m, &c, &o](op: int, nf: int, arena: &a [byte], meta: &m [int], rec: &!c [byte], out: &!o [byte]) -> [] int {
+    var p = emit_char(out, 0, '0');
+    p = emit_char(out, p, ' ');
+    if op == 'N' && nf == 3 {
+        let r = lifecycle.new(rec, int_of_bytes(field(arena, meta, 1)), int_of_bytes(field(arena, meta, 2)));
+        if r < 0 {
+            return r;
+        }
+        return emit_hex(out, p, rec);
+    }
+    if op == 'C' && nf == 2 {
+        let r = lifecycle.check(field(arena, meta, 1));
+        if r < 0 {
+            return r;
+        }
+        return emit_char(out, 0, '0');
+    }
+    if op == 'S' && nf == 4 {
+        var i = 0;
+        let given = field(arena, meta, 1);
+        while i < len(given) && i < 74 {
+            rec[i] = given[i];
+            i = i + 1;
+        }
+        if len(given) != 74 {
+            return -320;
+        }
+        let r = lifecycle.after_send(rec, int_of_bytes(field(arena, meta, 2)) == 1, int_of_bytes(field(arena, meta, 3)));
+        if r < 0 {
+            return r;
+        }
+        return emit_hex(out, p, rec);
+    }
+    if op == 'O' && nf == 15 {
+        var i = 0;
+        let given = field(arena, meta, 1);
+        while i < len(given) && i < 74 {
+            rec[i] = given[i];
+            i = i + 1;
+        }
+        if len(given) != 74 {
+            return -320;
+        }
+        let r = lifecycle.observe(rec, int_of_bytes(field(arena, meta, 2)) == 1, int_of_bytes(field(arena, meta, 3)), int_of_bytes(field(arena, meta, 4)) == 1, int_of_bytes(field(arena, meta, 5)), field(arena, meta, 6), int_of_bytes(field(arena, meta, 7)), int_of_bytes(field(arena, meta, 8)) == 1, field(arena, meta, 9), int_of_bytes(field(arena, meta, 10)), int_of_bytes(field(arena, meta, 11)), int_of_bytes(field(arena, meta, 12)), int_of_bytes(field(arena, meta, 13)), int_of_bytes(field(arena, meta, 14)));
+        if r < 0 {
+            return r;
+        }
+        var q = emit_nat(out, p, r);
+        q = emit_char(out, q, ' ');
+        return emit_hex(out, q, rec);
+    }
+    return -999;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    borrow mut heap as &!h in {
+        borrow mut io as &!i in {
+            // Any number of commands, one to a line, each answered on a line of its own: the exhaustive checks send tens of thousands.
+            let text = read_stdin(h, i);
+            let rec = box_slice(h, 74, byte_of(0));
+            let arena = box_slice(h, 2048, byte_of(0));
+            let out = box_slice(h, 2048, byte_of(0));
+            let meta = box_slice(h, 32, 0);
+            var answers = buffer.empty(h, 4096);
+            borrow text as &tx in {
+                borrow mut arena as &!ar in {
+                    borrow mut meta as &!me in {
+                        borrow mut rec as &!rc in {
+                            borrow mut out as &!ou in {
+                                let src = buffer.bytes(tx);
+                                var lo = 0;
+                                while lo < len(src) {
+                                    var hi = lo;
+                                    while hi < len(src) && int_of(src[hi]) != 10 {
+                                        hi = hi + 1;
+                                    }
+                                    if hi > lo {
+                                        let nf = split_fields(src[lo..hi], contents(ar), contents(me));
+                                        let n = run(int_of(src[lo]), nf, contents(ar), contents(me), contents(rc), contents(ou));
+                                        if n < 0 {
+                                            answers = buffer.push(h, answers, byte_of('E'));
+                                            answers = buffer.push_nat(h, answers, 0 - n);
+                                        } else {
+                                            answers = buffer.append(h, answers, contents(ou)[0..n]);
+                                        }
+                                        answers = buffer.push(h, answers, byte_of(10));
+                                    }
+                                    lo = hi + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            borrow answers as &lx in {
+                buffer.write(i, lx);
+            }
+            buffer.drop(h, answers);
+            buffer.drop(h, text);
+            unbox_slice(h, rec);
+            unbox_slice(h, arena);
+            unbox_slice(h, out);
+            unbox_slice(h, meta);
+        }
+    }
+    release(heap);
+    release(io);
+    return 0;
+}
