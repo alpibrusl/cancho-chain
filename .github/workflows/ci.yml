@@ -26,6 +26,14 @@ jobs:
           ref: ${{ steps.pin.outputs.rev }}
           path: cancho
 
+      # The secp256k1 package (cancho#710) is newer than the pinned compiler: its sources are taken from the commit that added it. The compiler that builds them is still the pin.
+      - name: Check out cancho's packages
+        uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/cancho
+          ref: 73723de69829e424213789936e3d3c10527a5688
+          path: cancho-packages
+
       - name: Check out cancho-schema
         uses: actions/checkout@v4
         with:
@@ -61,7 +69,7 @@ jobs:
         working-directory: chain
         run: |
           CANCHO=$GITHUB_WORKSPACE/cancho/target/release/cancho \
-          CANCHO_PACKAGES=$GITHUB_WORKSPACE/cancho/packages \
+          CANCHO_PACKAGES=$GITHUB_WORKSPACE/cancho-packages/packages \
           CANCHO_SCHEMA=$GITHUB_WORKSPACE/cancho-schema/src/schema.cho \
           CANCHO_LOG=$GITHUB_WORKSPACE/cancho-log/src \
           scripts/gate.sh
