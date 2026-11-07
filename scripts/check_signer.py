@@ -613,6 +613,9 @@ def run_checks(st, trailtool, cancho, rng, slow):
                        ("a count over the limit", f"65537 {h1}"), ("a count that is not a number", f"x {h1}"), ("a tab for the space", f"1\t{h1}")):
         line = base if tail is None else f"{base} {tail}"
         expect_refusal(f"the request with {name}", st.run(c, line=line), "signer-request")
+    base3 = " ".join(base.split()[:3])
+    expect_refusal("a request with an empty caller field and no witness shift", st.run(c, line=f"{base3}  -"), "signer-request")
+    expect_refusal("a request with an empty caller field and a witness", st.run(c, line=f"{base3}  1 {h1}"), "signer-request")
     rc, j, out = st.run(c, line=f"{base} 1 {h1}")
     check("a request with a good witness on the line is served", (rc, (j or {}).get("ok"), (j or {}).get("rule")), (0, True, None))
     # (8) no signature when the ledger cannot be written, and no second signer on one ledger
@@ -774,6 +777,8 @@ MUTANTS = [
 
 # Mutants no request can tell from the original, each with the reason.
 EQUIVALENT = {
+    "main: an odd field": "`hex.decode` refuses an odd number of digits with the same refusal, one line below",
+    "main: fewer than four fields": "a line with fewer than four fields reaches the empty-field check with nothing left, and that refuses it with the same tag: each guard is redundant given the other (with both gone it would trap)",
     "signer: an anchor's count of six digits": "every six-digit count is over max_entries (65,536), which the next check refuses with the same tag: the digit bound is defence in depth",
     "main: any torn length is cut": "a file that ends inside a record has a declared length of at most max_len (a larger one is `bad`, not `torn`), so what is left is at most max_len + 3 bytes and the bound is always met: it is defence in depth",
 }

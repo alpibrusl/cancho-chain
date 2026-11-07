@@ -388,7 +388,7 @@ def run_checks(sk, rng):
     # (8) the authority of the front
     r = subprocess.run([cancho_path(), "authority", "--std", os.path.join(ROOT, "tools/front/main.cho"), *front_sources(None)], capture_output=True, text=True)
     perf = r.stdout.split("performs")[1].split("never touches")[0].split()
-    check("authority: performs exactly these (one directory)", sorted(perf), sorted(["child_signal", "clock", "conn_accept", "conn_read", "conn_write", f'exec("{FRONT_PATH}")', f'fs_read("{FRONT_DIR}")', f'fs_write("{FRONT_DIR}")', "file_read", "file_write", "heap", f'net_in("{FRONT_PORT}")', "pipe_read", "pipe_write", "poll"]))
+    check("authority: performs exactly these (one directory)", sorted(perf), sorted(["child_signal", "clock", "conn_accept", "conn_read", "conn_write", f'exec("{FRONT_PATH}")', f'fs_read("{FRONT_DIR}")', f'fs_write("{FRONT_DIR}")', "file_read", "heap", f'net_in("{FRONT_PORT}")', "pipe_read", "pipe_write", "poll"]))
     check("authority: never touches the console, the command line, signals or foreign code", all(w in r.stdout.split("never touches")[1] for w in ("the console", "the command line", "signals", "foreign code")), True)
     check("authority: it is bounded (no UNBOUNDED line)", "UNBOUNDED" not in r.stdout, True)
 
