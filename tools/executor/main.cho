@@ -545,9 +545,11 @@ fn core[&c, &k, &i, &q, &oa, &ob, &l, &hd, &t, &r, &w, &rq, &f, &x, &s, &g, &e, 
         if ints[13] < tip {
             tip = ints[13];
         }
-        let kind = ints[1];
-        if same && kind == 2 && tip < ints[3] {
+        var kind = ints[1];
+        if kind == 2 && tip < ints[3] {
+            // Behind the block it names (the lower tip decides): no decision, and the record is not shown a block it cannot be in.
             same = false;
+            kind = 0;
         }
         var action = 0;
         let hat = alloc_slice[g2](32, byte_of(0));

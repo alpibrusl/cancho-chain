@@ -633,6 +633,14 @@ An `error` is its code and nothing else (the message is a provider's free text a
 
 `scripts/check_rpc.py`: requests are compared with the model's text byte for byte and must parse as JSON with exactly the fields; responses are fixtures in the shapes real clients write (Geth, Erigon, an Infura-style gateway: extra fields, checksummed addresses, `null` for not found, the error codes of `-32000`, `-32601`, `-32602`), with the transaction built and signed by `eth-account` (the hash, the sender and every field of the node's answer come from its transaction, not from this code), and the adversarial ones: a duplicate key at every level, a wrong `id`, both or neither of `result` and `error`, another `jsonrpc`, each quantity and hash and address spoiled each way, a receipt with another hash, sender, contract, or no status, a transaction object that differs from what was signed in each field, a chain id off by one; every response truncated at every byte (never accepted, never a trap); and `--mutants`. Results are added below when measured.
 
+### 18.5 Results (measured)
+
+`CANCHO=... python3 -I scripts/check_executor.py` (the real binary against two mock nodes): **176 checks, 0 failed**. `--mutants`: **78 mutants, 72 killed, 6 survivors, each explained** in `EQUIVALENT` in the script (five are equivalent: a cut or too-long answer is also refused by the length check, the JSON reader or the head check; the write deadline cannot be reached by a request that fits the socket buffer; a failed append is followed by a failed flush). **One is not proven equivalent** (`a receipt without its transaction`): the clause rejects a receipt in block 0 next to a pending transaction, and a test that sends exactly that is refused by the mutated executor too, for a reason I did not trace; so no input is known that this clause alone catches. It stays as defence in depth.
+
+**The checks found a real fault in the executor, now fixed** (corrected in place): when both providers were behind the block they named (tip below the block), `lifecycle.observe` refused with `-321` even though no decision was being made, so a lagging pair of providers stopped the executor with `chain.executor-state` instead of "no decision". The executor now passes the record no block it cannot be in. The same checks also showed that a corrupt `state` file was read as absent; it is now refused (`executor-state`) unless the file is missing.
+
+**Still not done:** TLS (a provider is reached through a loopback forwarder), chunked answers, verifying the signature, wiring the signer's anchor `(count, head)`, constant-time secp256k1 (alpibrusl/cancho#712), an independent review.
+
 **Not in this slice, said now.** A network connection (nothing here opens a socket), a second provider for critical reads (§5 asks for one: the executor will take two answers and require them to agree before a transaction is called final), and the lifecycle's states and transitions.
 
 ### 16.5 Measured
@@ -714,7 +722,7 @@ Checked exhaustively over small domains and against a model, as predicates, not 
 
 ## 18. The executor (slice 11)
 
-**Status: design, written before the code.** The executor is what makes a signed transaction happen and be known to have happened: it asks two providers what they see, decides with the lifecycle (§17) whether they agree and what to do, sends the same bytes again when that is what the lifecycle says, and leaves evidence of every change. It is one tick per process, like the signer: run it from a timer; every tick is safe to repeat and to kill.
+**Status: built (§18.5).** The executor is what makes a signed transaction happen and be known to have happened: it asks two providers what they see, decides with the lifecycle (§17) whether they agree and what to do, sends the same bytes again when that is what the lifecycle says, and leaves evidence of every change. It is one tick per process, like the signer: run it from a timer; every tick is safe to repeat and to kill.
 
 ### 18.1 What it holds, and what it can reach
 
