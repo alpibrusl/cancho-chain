@@ -648,6 +648,58 @@ An `error` is its code and nothing else (the message is a provider's free text a
 
 **Not claimed.** A connection (nothing here opens a socket), a second provider, the lifecycle, and that the model and the code agree on *what a provider says* beyond the shapes tested: the fixtures are in the shapes of real clients, written by me, not recorded from a node.
 
+## 17. The lifecycle (slice 10)
+
+**Status: design, written before the code.** A signed transaction is not a payment: it is bytes, and what becomes of them is read from untrusted providers (§16). This is the part of the executor that decides, as a **pure function** of what was last known and what the providers now say, what a transaction is and what, if anything, may be done about it. The executor that fetches the answers, and the HTTP, are the next slice; this one is checked exhaustively.
+
+### 17.1 The record
+
+73 bytes, canonical, so that it can be kept by a process that is killed at any moment: `[0]` version 1, `[1]` the state, `[2..10]` the nonce, `[10..18]` `sent_at` (ms, the last time a send was tried), `[18..26]` `changed_at` (ms, the last time the state changed), `[26..34]` `consumed_at` (ms, when the account's nonce was first seen past ours with our transaction nowhere: 0 if not), `[34..42]` the block it is in, `[42..74]` that block's hash. `check` refuses anything else: a state outside 1 to 9, a block and hash on a state that is not in a block (and none on one that is), a `consumed_at` on a state that cannot have one.
+
+| state | meaning | may be left? |
+|---|---|---|
+| 1 `SIGNED` | we hold the bytes and have never sent them | yes |
+| 2 `SUBMITTED` | a provider took it, or it was seen pending | yes |
+| 3 `UNCERTAIN` | a send failed or timed out and nothing has shown the transaction since | yes |
+| 4 `INCLUDED` | a receipt with status 1, in a block | yes: a reorganisation can undo it |
+| 5 `REVERTED` | a receipt with status 0, in a block: gas was spent and nothing moved | yes, the same |
+| 6 `FINAL` | `INCLUDED`, with at least `k` confirmations, **and the block still the one it was**: terminal |
+| 7 `FAILED_FINAL` | `REVERTED`, final in the same sense: terminal |
+| 8 `REPLACED` | the account's nonce passed ours, our transaction was nowhere, and that stayed true for `settle_ms`: terminal, **not moved** |
+| 9 `DROPPED` | not seen by the providers for `drop_ms` since the last send, and the nonce still unused | yes: the same bytes may be sent again |
+
+### 17.2 What it is told
+
+Each step is one **observation**, made by the executor from two providers' answers: *agree* (the providers said the same, else the observation is empty and nothing changes: **no decision is taken on one provider's word when two are asked and differ**); *tx* (0 not found, 1 pending, 2 mined); for a mined one, *status* (success or reverted), its *block* and *block hash*, the chain's *tip* and the *hash now at that block's height* (or unknown); the account's *latest nonce*; the *time*; and the configuration `k`, `drop_ms`, `settle_ms`.
+A send is told as `after_send(ok)`.
+
+### 17.3 The rules
+
+**[choice]** The table, in this order, for a state that is not terminal and an observation that *agrees*:
+
+1. **mined**: the state becomes `INCLUDED` (status 1) or `REVERTED` (0) with this block and hash (a different block or hash than before is a reorganisation and is recorded as the change it is); `consumed_at` is cleared. If the tip is at least `block + k - 1` **and** the hash now at that height is the block's hash, it becomes `FINAL` or `FAILED_FINAL`. A tip below the block, or a block that cannot be, is a refused observation.
+2. **pending**: the state becomes `SUBMITTED` (from any non-terminal state, including `INCLUDED` and `REVERTED`: a receipt that was and is not, with the transaction back in the pool, is a reorganisation); `consumed_at` is cleared.
+3. **not found**:
+   * `SIGNED`: answer **submit**.
+   * `INCLUDED` or `REVERTED`: the receipt has vanished: it becomes `UNCERTAIN` and, **if the nonce is still unused**, the answer is **resubmit**.
+   * `SUBMITTED`, `UNCERTAIN`, `DROPPED`, and the account's nonce is past ours: if `consumed_at` is 0 it is set to now and nothing else happens; once `now - consumed_at >= settle_ms` the state becomes `REPLACED`. (The first sight of a consumed nonce with no transaction might be a provider that has the block and not yet the receipt; only a consumed nonce that *stays* is believed.)
+   * `SUBMITTED` or `UNCERTAIN`, and the nonce unused: once `now - sent_at >= drop_ms` it becomes `DROPPED` and the answer is **resubmit**. `DROPPED` with the nonce unused answers **resubmit** (until a send moves it).
+4. A terminal state never changes, and answers nothing.
+
+`after_send(ok)`: from `SIGNED`, `UNCERTAIN` or `DROPPED`: `SUBMITTED` if ok, `UNCERTAIN` if not (and `sent_at` is now either way); from `SUBMITTED`: ok keeps it, not ok makes it `UNCERTAIN`; from any other state it is refused (`lifecycle-state`): **a transaction in a block, or ended, is never sent again**.
+
+**Resubmitting is safe because the bytes are the same bytes.** The same signed transaction has the same hash and nonce, so a provider that has it ignores it and one that does not takes it; it cannot be paid twice. What the machine must never do is ask for a *new* signature for the same authorisation, and it has no such action: the signer's ledger (§14) would refuse it too.
+
+### 17.4 Properties
+
+Checked exhaustively over small domains and against a model, as predicates, not as a copy of the table: a terminal state is fixed under every observation; `FINAL` is reached **if and only if** a mined, agreeing, success observation has `tip - block + 1 >= k` and a hash at that height equal to the block's; `REPLACED` only after a consumed nonce was seen at least `settle_ms` earlier and is still there with the transaction nowhere; **no observation that disagrees changes anything**; a state in a block comes only from a mined observation; **submit** only from `SIGNED`; **resubmit** only when the nonce is unused and the transaction was not found; every record the machine writes passes `check`; and `check` refuses every single-byte spoiling of a record that makes it non-canonical.
+
+### 17.5 How it is checked
+
+`scripts/check_lifecycle.py`: the machine as a program (`tools/lifedrv`) against a model in Python written separately (a different formulation: the model is a rule list evaluated top-down on a dictionary, not the order of `if`s); the exhaustive product of every state, every observation shape over a small domain (tx 0 to 2, status, block and tip around the finality edge, hash equal or not, nonce below, equal and above, times around the two windows, agree or not), the properties of §17.4 as predicates over the result, random long walks (thousands of steps with a random provider that sometimes lies, reorganises or forgets) that must keep every invariant, and `--mutants`. Results are added below when measured.
+
+**Not in this slice.** Fetching the answers, asking two providers and deciding that they agree, the HTTP, persisting the record, and the evidence events written at each change.
+
 ## 12. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
