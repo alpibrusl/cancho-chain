@@ -712,6 +712,43 @@ Checked exhaustively over small domains and against a model, as predicates, not 
 
 **Not claimed.** That the world model resembles a chain beyond the cases it has (it is mine); the persistence of the record and the evidence events at each change; fetching, quorum and HTTP, which are the next slice.
 
+## 18. The executor (slice 11)
+
+**Status: design, written before the code.** The executor is what makes a signed transaction happen and be known to have happened: it asks two providers what they see, decides with the lifecycle (§17) whether they agree and what to do, sends the same bytes again when that is what the lifecycle says, and leaves evidence of every change. It is one tick per process, like the signer: run it from a timer; every tick is safe to repeat and to kill.
+
+### 18.1 What it holds, and what it can reach
+
+It holds **no key**. Its authority (`cancho authority`): one directory, **two outbound addresses** (the two providers, compile-time constants, narrowed one each), the clock, the heap, standard output. No `exec`, no listening port, no foreign code. **[choice]** The providers are plain TCP and HTTP/1.1 with `Content-Length` (a chunked answer is `provider-chunked` and refused): the executor does not speak TLS, so a provider that needs it is reached through a local forwarder that does (stunnel or a reverse proxy on loopback). This is a limit, said here and in the README: until a TLS client is in the executor, a provider across the internet is not reached by it directly.
+
+| file | what |
+|---|---|
+| `config` | `chain=<n>`, `k=<n>`, `drop_ms=<n>`, `settle_ms=<n>`, one to a line, in this order |
+| `envelope` | the authorisation envelope (§13), hex: **what was authorised** |
+| `raw` | the signed transaction, hex: **what is sent** |
+| `state` | the lifecycle's 74-byte record, hex; written by `state.new` and a rename |
+| `evidence.seg` | `cancho-log` in trail mode (as the signer's ledger): one `tx.state` event per change |
+
+### 18.2 A tick
+
+1. Take `flock` on `evidence.seg`; verify the trail whole and read-only, then recover a torn tail (the signer's rule, §14.3): a ledger that does not verify stops the tick (`executor-evidence-corrupt`).
+2. Read the job and **check that it is what was authorised**: the envelope well formed, and `txcheck.validate_signed` of `raw` against the envelope's own chain, nonce, token, recipient, amount and caps (so what is sent is exactly what the policy allowed, whoever wrote `raw`); the configured chain is the envelope's. The transaction hash is `keccak256(raw)`, the wallet and token are the envelope's. (The signature is not verified here: a receipt whose `from` is not the wallet is what catches a transaction signed by another key, §16.3.)
+3. If there is no `state`, make one (`SIGNED`, the envelope's nonce) and leave evidence.
+4. **Ask each provider** (a few JSON-RPC requests each, a few seconds' deadline apiece): the chain id (**it must be the configured one, else the provider is refused**), the account's latest nonce, the tip, the transaction by hash, its receipt, and, if it is mined, the block's hash at that height. Each answer is read by `chain.rpc` and believed only as §16.3 says. A provider that cannot be reached, answers wrongly, or contradicts itself (a receipt with no transaction mined, or a transaction mined with another block) is **unusable** this tick.
+5. **Agree:** both providers usable and the same on what they say about the transaction (not found, pending, or mined with the same status, block and block hash), the nonce and, if mined, the hash at the height; the tip is the lower of the two. Otherwise `agree` is false and the lifecycle changes nothing. **One provider's word is never enough, and a provider that is down is not a vote.**
+6. `lifecycle.observe`. If it answers **submit** or **resubmit**, send `raw` to both providers; a provider *took* it if its `result` is this transaction's hash (anything else, an error included, is a failure: **no decision from an error's wording**); the send is ok if either took it; `after_send`.
+7. If the state changed, append the evidence event and flush, **then** write `state`. A tick killed between the two leaves the evidence one step ahead of the state; the next tick sees the same facts, makes the same change and writes the event again: **evidence is at-least-once, the state exactly the lifecycle's**. A tick killed after a send and before the state is written finds the transaction pending, which is `SUBMITTED`: the same bytes are never a second payment.
+8. Print one line: `{"ok":true,"state":"<name>","action":"nothing"|"submit"|"resubmit","sent":<bool>,"agree":<bool>}` and exit 0; a refusal is `{"ok":false,"rule":"chain.<tag>","repair":"..."}` and exit 2.
+
+### 18.3 The evidence event
+
+Kind `tx.state`, payload `{"envelope":"<id hex>","tx":"<hash hex>","state":"<name>","block":<n>}` (the block is 0 outside a block): written when the state changes. It names the envelope's id (§13) and the transaction's hash, so an auditor can walk from the signer's ledger entry (`envelope.consumed`) to what became of it.
+
+### 18.4 How it is checked
+
+`scripts/check_executor.py`: the real executor against **two mock nodes** (Python HTTP servers speaking JSON-RPC from a model of a chain: blocks, a mempool, an account nonce, with a transaction built and signed by `eth-account`) that can be made to forget, reorganise, lie, answer with another chain id, hang, answer in chunks or with garbage, or be down. Ticks are driven by the script. Scenarios: an honest chain to `FINAL` (the evidence has each change, the hash chain verifies with `trailtool`); a reverted transaction to `FAILED_FINAL`; a transaction the mempool forgets (`DROPPED`, resent, final); a reorganisation (back to `SUBMITTED`, then final in the new block); a nonce taken by another transaction (`REPLACED` only after `settle_ms`); one provider lying at each step (nothing changes, nothing is sent twice, and the state is never `FINAL` unless the truth says so); one provider down or hanging; a provider on another chain; a job that is not what the envelope authorised (refused before any request); a killed tick (state and evidence consistent, the same transaction); the authority of the binary; `--mutants`. Results are added below when measured.
+
+**Not in this slice, said now.** TLS, a chunked answer, more than two providers, scheduling (the caller's), verifying the signature, a fee bump or replacement (the lifecycle has no such action by design: §17.3).
+
 ## 12. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
