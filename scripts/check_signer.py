@@ -21,6 +21,7 @@ PKGS = os.environ.get("CANCHO_PACKAGES", os.path.join(ROOT, "../cancho/packages"
 SCHEMA = os.environ.get("CANCHO_SCHEMA", os.path.join(ROOT, "../alpibrusl/cancho-schema/src/schema.cho"))
 LOGSRC = os.environ.get("CANCHO_LOG", os.path.join(ROOT, "../cancho-log/src"))
 CONST = "/var/lib/cancho-signer"
+ANCH = "/var/lib/cancho-anchor"   # the anchor's directory; a copy of the binary is built with <state>-anchor in its place
 
 
 def sources(libdir):
@@ -34,7 +35,8 @@ def sources(libdir):
 def build(cancho, libdir, main_text, state_dir, out):
     with tempfile.TemporaryDirectory() as t:
         main = os.path.join(t, "main.cho")
-        open(main, "w").write(main_text.replace(CONST, state_dir))
+        open(main, "w").write(main_text.replace(CONST, state_dir).replace(ANCH, state_dir + "-anchor"))
+        os.makedirs(state_dir + "-anchor", exist_ok=True)
         r = subprocess.run([cancho, "build", "--std", main, *sources(libdir), "-o", out], capture_output=True, text=True)
         if r.returncode != 0:
             raise SystemExit("build failed:\n" + r.stderr[:1500])
@@ -56,14 +58,30 @@ def check(name, got, want=True):
 class State:
     def __init__(self, path, exe):
         self.dir, self.exe = path, exe
+        self.adir = path + "-anchor"
+        os.makedirs(self.adir, exist_ok=True)
+
+    def anchor(self):
+        return os.path.join(self.adir, "anchor")
+
+    def anchor_text(self):
+        return open(self.anchor(), "rb").read() if os.path.isfile(self.anchor()) else None
+
+    def adopt(self, count=None, head=None):
+        """What an operator does for a ledger that exists: write the anchor from its count and head, as the independent reader gives them."""
+        ev = read_events(self.ledger())
+        n = len(ev) if count is None else count
+        h = read_events.ids[n - 1] if head is None else head
+        open(self.anchor(), "wb").write(f"{n} ".encode() + h + b"\n")
 
     def reset(self, c=None, conf=True, key=True):
-        for f in os.listdir(self.dir):
-            p = os.path.join(self.dir, f)
-            if os.path.islink(p) or os.path.isfile(p):
-                os.unlink(p)
-            else:
-                shutil.rmtree(p)
+        for d in (self.dir, self.adir):
+            for f in os.listdir(d):
+                p = os.path.join(d, f)
+                if os.path.islink(p) or os.path.isfile(p):
+                    os.unlink(p)
+                else:
+                    shutil.rmtree(p)
         if c is not None:
             if conf:
                 open(os.path.join(self.dir, "signer.conf"), "w").write(f"issuer={c.issuer.hex()}\nchain={c.tx.chain}\n")
@@ -118,7 +136,7 @@ def crc32c(data):
 
 def read_events(path):
     data = open(path, "rb").read()
-    at, events, parent = 0, [], b""
+    at, events, parent, ids = 0, [], b"", []
     while at < len(data):
         (length,) = struct.unpack_from("<I", data, at)
         body = data[at + 8:at + 4 + length]
@@ -135,9 +153,15 @@ def read_events(path):
         d = dict(pairs)
         eid = hashlib.sha256(b"\0".join([d[b"kind"], d[b"parent"], d[b"payload"], d[b"ts_ms"]])).hexdigest().encode()
         assert d[b"id"] == eid and d[b"parent"] == parent, "bad event"
-        events.append((d[b"kind"], json.loads(d[b"payload"]), int(d[b"ts_ms"])))
+        try:
+            payload = json.loads(d[b"payload"])
+        except ValueError:
+            payload = None   # an event that is not a ledger entry still has an id
+        events.append((d[b"kind"], payload, int(d[b"ts_ms"])))
         parent = eid
+        ids.append(eid)
         at += 4 + length
+    read_events.ids = ids
     return events
 
 
@@ -359,16 +383,166 @@ def run_checks(st, trailtool, cancho, rng, slow):
                           ("a payload with another quote", b"{\"id\":\"" + b"0" * 64 + b"\",\"digest\":'" + b"0" * 64 + b"\"}"), ("a payload one byte too long", b"{\"id\":\"" + b"0" * 64 + b"\",\"digest\":\"" + b"0" * 64 + b"\"} ")):
         st.reset(c)
         write_chain(st.ledger(), [(b"envelope.consumed", payload, 1000)])
+        st.adopt()
         raw = open(st.ledger(), "rb").read()
         expect_refusal("a whole event with " + name, st.run(envs[0]), "signer-ledger-corrupt", st, raw)
     # a ledger the signer wrote, extended by a model-written chain that is valid, is read
     st.reset(c)
     entries = [(b"envelope.consumed", json.dumps({"id": d.id.hex(), "digest": ce.kec(d.tx.unsigned()).hex()}, separators=(",", ":")).encode(), 1000 + i) for i, d in enumerate(envs[:3])]
     write_chain(st.ledger(), entries)
+    st.adopt()
     rc, j, _ = st.run(envs[1])
     check("a ledger written by the model is read: an entry in it is the same", (rc, (j or {}).get("entry")), (0, "same"))
     rc, j, _ = st.run(envs[3])
     check("and a new envelope is fresh after it", (rc, (j or {}).get("entry"), len(read_events(st.ledger()))), (0, "fresh", 4))
+    # (7b) the anchor (docs/design.md section 19)
+    def anchor_of(path):
+        read_events(path)
+        ids = read_events.ids
+        return (len(ids), ids[-1].decode()) if ids else (0, "")
+
+    def refused_unchanged(name, tag):
+        """A request that must be refused with `tag`, with the ledger and the anchor exactly as they were."""
+        led = open(st.ledger(), "rb").read() if os.path.exists(st.ledger()) else b""
+        anc = st.anchor_text()
+        expect_refusal(name, st.run(envs[0]), tag)
+        check(f"{name}: the ledger is untouched (nothing is cut)", open(st.ledger(), "rb").read() if os.path.exists(st.ledger()) else b"", led)
+        check(f"{name}: the anchor is untouched", st.anchor_text(), anc)
+
+    # after each fresh request the anchor is (count, head) as the independent reader computes them, in the file and in the answer; a retry changes neither
+    st.reset(c)
+    for k, d in enumerate(envs):
+        rc, j, out = st.run(d)
+        count, head = anchor_of(st.ledger())
+        check(f"anchor after request {k + 1}: the file is `<count> <head>` and a newline", st.anchor_text(), f"{count} {head}\n".encode())
+        check(f"anchor after request {k + 1}: the answer carries the same", (j or {}).get("anchor"), {"count": count, "head": head})
+        before = st.anchor_text()
+        rc, j, out = st.run(d)
+        check(f"anchor after a retry {k + 1}: the same entry, the same anchor", ((j or {}).get("entry"), st.anchor_text(), (j or {}).get("anchor")), ("same", before, {"count": count, "head": head}))
+    with tempfile.TemporaryDirectory() as t:
+        shutil.copy(st.ledger(), os.path.join(t, "0.seg"))
+        count, head = anchor_of(st.ledger())
+        v = subprocess.run([trailtool, "verify", t, str(count), head], capture_output=True, text=True).stdout.split()
+        check("trailtool confirms the signer's anchor against the ledger", v[v.index("anchor") + 1], "1")
+    good = filled(3)
+    offs = ledger_record_offsets(st.ledger())
+    c3, h3 = anchor_of(st.ledger())
+    sig2 = st.run(envs[2])[1]["signature"]
+    # no anchor with entries: refused, and it is not made up
+    os.unlink(st.anchor())
+    refused_unchanged("no anchor and a ledger of three", "signer-anchor-missing")
+    # no anchor and exactly one entry is what a crash at the first entry leaves: covered, and it goes on
+    st.reset(c)
+    st.run(envs[0])
+    os.unlink(st.anchor())
+    rc, j, out = st.run(envs[0])
+    check("no anchor and one entry: covered, the same entry", (rc, (j or {}).get("entry"), st.anchor_text()), (0, "same", f"1 {anchor_of(st.ledger())[1]}\n".encode()))
+    st.reset(c)
+    for d in envs[:2]:
+        st.run(d)
+    os.unlink(st.anchor())
+    refused_unchanged("no anchor and a ledger of two", "signer-anchor-missing")
+    # an anchor that is not exactly what the signer writes
+    h = h3
+    for name, text in (("a leading zero", f"03 {h}\n"), ("a count of zero", f"0 {h}\n"), ("a count over the limit", f"65537 {h}\n"), ("a six-digit count", f"100000 {h}\n"), ("no newline", f"3 {h}"),
+                       ("two newlines", f"3 {h}\n\n"), ("two lines", f"3 {h}\n3 {h}\n"), ("upper-case digits", f"3 {h.upper()}\n"), ("a head of 63 digits", f"3 {h[:-1]}\n"), ("a head of 65 digits", f"3 {h}0\n"),
+                       ("a tab for the space", f"3\t{h}\n"), ("two spaces", f"3  {h}\n"), ("an empty file", ""), ("a count that is not a number", f"x {h}\n"), ("a head that is not hex", f"3 {'g' * 64}\n"),
+                       ("a sign on the count", f"+3 {h}\n"), ("a colon in the count", f"3: {h}\n"), ("a carriage return", f"3 {h}\r\n"), ("a file much longer than an anchor", f"3 {h}\n" + "0" * 5000)):
+        open(st.anchor(), "w").write(text)
+        refused_unchanged(f"an anchor with {name}", "signer-anchor-corrupt")
+    os.unlink(st.anchor())
+    os.mkdir(st.anchor())
+    refused_unchanged("an anchor that is a directory", "signer-anchor-corrupt")
+    os.rmdir(st.anchor())
+    # a corrupt anchor with an empty ledger is refused too (it is not "no anchor")
+    st.reset(c)
+    open(st.anchor(), "w").write("zzz\n")
+    expect_refusal("a corrupt anchor and an empty ledger", st.run(envs[0]), "signer-anchor-corrupt")
+    # the ledger cut below the anchor: at every record boundary, the whole ledger or nothing
+    for cut in (0, offs[1], offs[2]):
+        st.reset(c)
+        open(st.ledger(), "wb").write(good[:cut])
+        open(st.anchor(), "w").write(f"{c3} {h3}\n")
+        refused_unchanged(f"a ledger cut to {cut} bytes below an anchor of three", "signer-anchor-short")
+    # a torn or damaged last record that the anchor covers is refused, not cut: the length field of the last record, damaged in each of its four bytes
+    for b in range(4):
+        for bit in (0x01, 0x40):
+            st.reset(c)
+            damaged = good[:offs[2] + b] + bytes([good[offs[2] + b] ^ bit]) + good[offs[2] + b + 1:]
+            open(st.ledger(), "wb").write(damaged)
+            open(st.anchor(), "w").write(f"{c3} {h3}\n")
+            res = st.run(envs[2])
+            tag = (res[1] or {}).get("rule")
+            check(f"a damaged length (byte {b}, bit {bit:#x}) of a covered last record: refused, never signed, never cut", (res[0], tag in ("chain.signer-anchor-short", "chain.signer-ledger-corrupt"), open(st.ledger(), "rb").read(), '"signature"' in res[2]), (2, True, damaged, False))
+    # ... and one beyond the anchor was never signed, so it is cut (the one case section 14.5 could not decide)
+    st.reset(c)
+    open(st.ledger(), "wb").write(good[:offs[2]])
+    h2 = anchor_of(st.ledger())[1]
+    cut_seen = 0
+    for b in range(4):
+        for bit in (0x01, 0x40, 0x80):
+            st.reset(c)
+            damaged = good[:offs[2] + b] + bytes([good[offs[2] + b] ^ bit]) + good[offs[2] + b + 1:]
+            open(st.ledger(), "wb").write(damaged)
+            open(st.anchor(), "w").write(f"2 {h2}\n")
+            rc, j, out = st.run(envs[2])
+            if rc == 0:
+                # the record only looked torn: it is cut, it was never signed, so the entry is fresh and now covered
+                cut_seen += 1
+                check(f"a damaged length (byte {b}, bit {bit:#x}) of a last record beyond the anchor: cut, and the entry is fresh and signed", ((j or {}).get("entry"), len(read_events(st.ledger()))), ("fresh", 3))
+                check(f"a damaged length (byte {b}, bit {bit:#x}) beyond the anchor: the anchor now covers three entries", st.anchor_text(), f"3 {anchor_of(st.ledger())[1]}\n".encode())
+            else:
+                check(f"a damaged length (byte {b}, bit {bit:#x}) that does not look torn, beyond the anchor: refused as corrupt, nothing cut", ((j or {}).get("rule"), open(st.ledger(), "rb").read()), ("chain.signer-ledger-corrupt", damaged))
+    check("at least one damaged length looks torn and is cut (the case of design 14.5)", cut_seen >= 1, True)
+    # the ledger rewritten consistently (another entry at the anchor's count): refused
+    st.reset(c)
+    evs = [(b"envelope.consumed", json.dumps({"id": d.id.hex(), "digest": ce.kec(d.tx.unsigned()).hex()}, separators=(",", ":")).encode(), 1000 + i) for i, d in enumerate(envs[:3])]
+    write_chain(st.ledger(), evs)
+    st.adopt()
+    other = evs[:2] + [(b"envelope.consumed", json.dumps({"id": "ab" * 32, "digest": "cd" * 32}, separators=(",", ":")).encode(), 1002)]
+    write_chain(st.ledger(), other)
+    refused_unchanged("a ledger rewritten consistently with another third entry", "signer-anchor-mismatch")
+    write_chain(st.ledger(), [(b"envelope.consumed", json.dumps({"id": "ab" * 32, "digest": "cd" * 32}, separators=(",", ":")).encode(), 1000 + i) for i in range(3)])
+    refused_unchanged("a ledger rewritten whole with the same number of entries", "signer-anchor-mismatch")
+    # a ledger longer than the anchor by more than one: the anchor was restored from an older copy
+    st.reset(c)
+    for d in envs:
+        st.run(d)
+    st.adopt(count=2)
+    refused_unchanged("a ledger of four and an anchor of two", "signer-anchor-behind")
+    st.adopt(count=1)
+    refused_unchanged("a ledger of four and an anchor of one", "signer-anchor-behind")
+    # a ledger one ahead of its anchor is what a crash between the flush and the anchor write leaves: the next start covers it, before any signature
+    st.reset(c)
+    for d in envs[:3]:
+        st.run(d)
+    st.adopt(count=2)
+    rc, j, out = st.run(envs[2])
+    check("one ahead of the anchor: the entry is the same, signed, and the anchor now covers it", (rc, (j or {}).get("entry"), st.anchor_text()), (0, "same", f"3 {anchor_of(st.ledger())[1]}\n".encode()))
+    check("one ahead of the anchor: the signature is the one a clean run gives", (j or {}).get("signature"), sig2)
+    st.adopt(count=2)
+    rc, j, out = st.run(envs[3])
+    check("one ahead of the anchor: a fresh envelope is appended and the anchor covers four", (rc, (j or {}).get("entry"), st.anchor_text()), (0, "fresh", f"4 {anchor_of(st.ledger())[1]}\n".encode()))
+    # an anchor and no ledger
+    st.reset(c)
+    open(st.anchor(), "w").write(f"1 {'0' * 64}\n")
+    expect_refusal("an anchor and no ledger", st.run(envs[0]), "signer-anchor-short")
+    # the anchor cannot be written: no signature; the entry is on the ledger, and the next run covers it and signs
+    st.reset(c)
+    os.symlink("/dev/full", os.path.join(st.adir, "anchor.new"))
+    res = st.run(envs[0])
+    expect_refusal("an anchor that cannot be written (/dev/full)", res, "signer-anchor-write")
+    check("an anchor that cannot be written: the entry is on the ledger and there is no anchor", (len(read_events(st.ledger())), st.anchor_text()), (1, None))
+    os.unlink(os.path.join(st.adir, "anchor.new"))
+    rc, j, out = st.run(envs[0])
+    check("the next run: the same entry, the anchor covers it, and the signature is the model's", (rc, (j or {}).get("entry"), st.anchor_text(), (j or {}).get("signature")), (0, "same", f"1 {anchor_of(st.ledger())[1]}\n".encode(), ce.sign(ce.kec(envs[0].tx.unsigned()), c.wallet_key).hex()))
+    # a ledger that is not clean is refused as it was before, whatever the anchor says
+    st.reset(c)
+    for d in envs[:3]:
+        st.run(d)
+    damaged = good[:offs[1] + 60] + bytes([good[offs[1] + 60] ^ 1]) + good[offs[1] + 61:]
+    open(st.ledger(), "wb").write(damaged)
+    expect_refusal("damage in the middle, with an anchor", st.run(envs[0]), "signer-ledger-corrupt", st, damaged)
     # (8) no signature when the ledger cannot be written, and no second signer on one ledger
     st.reset(c)
     os.symlink("/dev/full", st.ledger())
@@ -401,12 +575,13 @@ def run_checks(st, trailtool, cancho, rng, slow):
     # (9) the authority: the one directory, the clock, standard input and output, and nothing else
     r = subprocess.run([cancho, "authority", "--std", os.path.join(ROOT, "tools/signer/main.cho"), *sources(os.path.join(ROOT, "lib"))], capture_output=True, text=True)
     perf = r.stdout.split("performs")[1].split("never touches")[0].split()
-    check("authority: performs exactly these", perf, ["clock", "file_read", "file_write", f'fs_read("{CONST}")', f'fs_write("{CONST}")', "heap", "io_read", "io_write"])
+    check("authority: performs exactly these (two directories)", sorted(perf), sorted(["clock", "file_read", "file_write", f'fs_read("{CONST}")', f'fs_write("{CONST}")', f'fs_read("{ANCH}")', f'fs_write("{ANCH}")', "heap", "io_read", "io_write"]))
     check("authority: never touches the network, the command line, signals, other programs or foreign code", all(w in r.stdout for w in ("the network", "the command line", "signals", "other programs", "foreign code")), True)
     if slow:
         c = live_case(rng)
         st.reset(c)
         write_chain(st.ledger(), [(b"envelope.consumed", json.dumps({"id": i.to_bytes(32, "big").hex(), "digest": "0" * 64}, separators=(",", ":")).encode(), 1000) for i in range(65537)])
+        st.adopt(count=65536)  # one behind the ledger: allowed, and then the ledger is full
         expect_refusal("a ledger over 65,536 entries", st.run(c), "signer-ledger-full", st)
 
 
@@ -427,7 +602,7 @@ MUTANTS = [
     ("main: the clock in seconds", "main", "ms / 1000, detail)", "ms / 100, detail)"),
     ("main: the signature is hedged", "main", "secp256k1.sign(env[65..97], key, sg[0..0], sg, work)", "secp256k1.sign(env[65..97], key, env[1..33], sg, work)"),
     ("main: the wrong digest is signed", "main", "secp256k1.sign(env[65..97], key", "secp256k1.sign(env[33..65], key"),
-    ("main: the entry label is swapped", "main", "if seen == 0 {\n                say(io, \"\\\",\\\"entry\\\":\\\"fresh\\\"}\");", "if seen == 1 {\n                say(io, \"\\\",\\\"entry\\\":\\\"fresh\\\"}\");"),
+    ("main: the entry label is swapped", "main", "if seen == 0 {\n                say(io, \"\\\",\\\"entry\\\":\\\"fresh\\\",", "if seen == 1 {\n                say(io, \"\\\",\\\"entry\\\":\\\"fresh\\\","),
     ("main: a refusal exits 0", "main", "    io.newline(io);\n    return 2;\n}\n\n// The whole of the file", "    io.newline(io);\n    return 0;\n}\n\n// The whole of the file"),
     ("main: the first event names a parent", "main", "if log.records(lg) > 0 {\n                plen = 64;", "if true {\n                plen = 64;"),
     ("main: the parent is cut short", "main", "plen = 64;", "plen = 63;"),
@@ -462,10 +637,47 @@ MUTANTS = [
     ("signer: another refusal tag", "signer", "return \"signer-locked\";", "return \"signer-busy\";"),
     ("signer: the key's tag", "signer", "return \"signer-key\";", "return \"signer-wallet\";"),
     ("signer: the request's tag", "signer", "return \"signer-request\";", "return \"signer-line\";"),
+    # the anchor (section 19)
+    ("main: the anchor is not given to verify", "main", "head, an, ahead);", "head, 0, \"\");"),
+    ("main: a missing anchor is accepted", "main", "if v.2 > 1 {\n                                                    arefuse = -281;", "if v.2 > 1000000 {\n                                                    arefuse = -281;"),
+    ("main: a missing anchor with one entry is refused", "main", "if v.2 > 1 {\n                                                    arefuse = -281;", "if v.2 > 0 {\n                                                    arefuse = -281;"),
+    ("main: a corrupt anchor is taken for a missing one", "main", "if ac == -280 {\n                                                arefuse = -280;", "if ac == -999 {\n                                                arefuse = -280;"),
+    ("main: a cut ledger is accepted", "main", "} else if v.4 == trail.anchor_short() {", "} else if v.4 == 99 {"),
+    ("main: a rewritten ledger is accepted", "main", "} else if v.4 == trail.anchor_mismatch() {", "} else if v.4 == 99 {"),
+    ("main: an anchor far behind the ledger is accepted", "main", "} else if v.2 - ac > 1 {", "} else if v.2 - ac > 1000000 {"),
+    ("main: a ledger one ahead of the anchor is refused", "main", "} else if v.2 - ac > 1 {", "} else if v.2 - ac > 0 {"),
+    ("main: the anchor's refusal is not reported", "main", "} else if arefuse != 0 {\n                            status = refuse(io, arefuse);", "} else if false {\n                            status = refuse(io, arefuse);"),
+    ("main: the anchor is never written", "main", "    if total != acount {\n", "    if total == 424242 {\n"),
+    ("main: the anchor is written only when it changed by two", "main", "    if total != acount {\n", "    if total != acount && total - acount > 1 {\n"),
+    ("main: a fresh entry is not counted in the anchor", "main", "    if seen == 0 {\n        total = total + 1;", "    if seen == 7 {\n        total = total + 1;"),
+    ("main: a failed anchor write does not stop the signature", "main", "if write_anchor(anc, total, head) != 0 {", "if write_anchor(anc, total, head) == 99 {"),
+    ("main: the anchor is renamed to itself", "main", "\"/var/lib/cancho-anchor/anchor.new\", \"/var/lib/cancho-anchor/anchor\")", "\"/var/lib/cancho-anchor/anchor.new\", \"/var/lib/cancho-anchor/anchor.new\")"),
+    ("main: a short anchor write is not noticed", "main", "text[0..n]) == n {", "text[0..n]) != 99 {"),
+    ("main: the anchor's count in the answer", "main", "say_count(io, total);", "say_count(io, total + 1);"),
+    ("main: the anchor's digits in the answer", "main", "buf[at] = byte_of(48 + v % 10);", "buf[at] = byte_of(47 + v % 10);"),
+    ("main: the anchor's head in the answer", "main", "io.write_all(io, head[0..64]);", "io.write_all(io, head[32..64]);"),
+    ("main: an anchor file of any size is read", "main", "if size > 0 && size <= len(buf) {", "if size > 0 {"),
+    ("signer: an anchor's leading zero", "signer", "if sp > 1 && int_of(text[0]) == 48 {", "if sp > 7 && int_of(text[0]) == 48 {"),
+    ("signer: an anchor's count of zero", "signer", "if count < 1 || count > max_entries() {\n        return -280;\n    }\n    k = 0;", "if count < 0 || count > max_entries() {\n        return -280;\n    }\n    k = 0;"),
+    ("signer: an anchor's count over the limit", "signer", "if count < 1 || count > max_entries() {\n        return -280;\n    }\n    k = 0;", "if count < 1 || count > max_entries() * 2 {\n        return -280;\n    }\n    k = 0;"),
+    ("signer: an anchor's count of six digits", "signer", "if sp < 1 || sp > 5 ||", "if sp < 1 || sp > 6 ||"),
+    ("signer: an anchor's newline", "signer", "if int_of(text[sp + 65]) != 10 {", "if int_of(text[sp + 65]) != 13 {"),
+    ("signer: an anchor's length", "signer", "|| len(text) != sp + 66 {", "|| len(text) < sp + 66 {"),
+    ("signer: an anchor's count digit", "signer", "if c < 48 || c > 57 {\n            return -280;", "if c < 48 || c > 58 {\n            return -280;"),
+    ("signer: an anchor's head in upper case", "signer", "if !is_lower_hex(int_of(text[sp + 1 + k])) {", "if !is_lower_hex(int_of(text[sp + 1 + k])) && int_of(text[sp + 1 + k]) < 71 {"),
+    ("signer: an anchor's head is not copied", "signer", "head[k] = text[sp + 1 + k];", "head[k] = text[sp + 1];"),
+    ("signer: an anchor's separator", "signer", "while sp < len(text) && int_of(text[sp]) != 32 {", "while sp < len(text) && int_of(text[sp]) != 9 {"),
+    ("signer: the anchor's file text", "signer", "out[digits] = byte_of(32);", "out[digits] = byte_of(9);"),
+    ("signer: the anchor's file newline", "signer", "out[digits + 65] = byte_of(10);", "out[digits + 65] = byte_of(13);"),
+    ("signer: the anchor's file length", "signer", "return digits + 66;", "return digits + 65;"),
+    ("signer: the anchor's count digits", "signer", "out[at] = byte_of(48 + v % 10);", "out[at] = byte_of(49 + v % 10);"),
+    ("signer: the anchor's tag", "signer", "return \"signer-anchor-short\";", "return \"signer-anchor-cut\";"),
+    ("signer: another anchor tag", "signer", "return \"signer-anchor-write\";", "return \"signer-anchor-disk\";"),
 ]
 
 # Mutants no request can tell from the original, each with the reason.
 EQUIVALENT = {
+    "signer: an anchor's count of six digits": "every six-digit count is over max_entries (65,536), which the next check refuses with the same tag: the digit bound is defence in depth",
     "main: any torn length is cut": "a file that ends inside a record has a declared length of at most max_len (a larger one is `bad`, not `torn`), so what is left is at most max_len + 3 bytes and the bound is always met: it is defence in depth",
 }
 
@@ -496,7 +708,8 @@ def mutants(cancho, trailtool):
                 open(os.path.join(libdir, "signer/signer.cho"), "w").write(body)
             with tempfile.TemporaryDirectory() as t:
                 m = os.path.join(t, "main.cho")
-                open(m, "w").write(main.replace(CONST, state))
+                open(m, "w").write(main.replace(CONST, state).replace(ANCH, state + "-anchor"))
+                os.makedirs(state + "-anchor", exist_ok=True)
                 r = subprocess.run([cancho, "build", "--std", m, *sources(libdir), "-o", exe], capture_output=True, text=True)
             if r.returncode != 0:
                 return name, "did not build: " + r.stderr[:200]
