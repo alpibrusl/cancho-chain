@@ -1,0 +1,331 @@
+edition 7;
+
+// The driver of `scripts/check_rpc.py` (docs/design.md section 16.4): one command on standard input, one answer on standard output. Not the product's command line.
+// Fields are hex (`_` is empty); an integer is big-endian hex; a response is the hex of its text.
+//
+//   Q c <id>                         eth_chainId request            -> "0 <hex of the text>"
+//   Q b <id>                         eth_blockNumber
+//   Q n <id> <addr20> <pending 0|1>  eth_getTransactionCount
+//   Q s <id> <raw>                   eth_sendRawTransaction
+//   Q r <id> <hash32>                eth_getTransactionReceipt
+//   Q t <id> <hash32>                eth_getTransactionByHash
+//   Q k <id> <number>                eth_getBlockByNumber
+//   P <id> <response>                the envelope of a response     -> "0 result" | "0 error <code>"
+//   U q <id> <response>              a quantity result              -> "0 <decimal>"
+//   U h|a <id> <response>            a hash (32) or an address (20) -> "0 <hex>"
+//   U d <id> <response> <want>       data against `want`            -> "0 <0|1>"
+//   U c <id> <response> <chain>      a chain id against `chain`     -> "0"
+//   U r <id> <response> <hash> <wallet> <token>
+//                                    a receipt                      -> "0 <0|1|2> <block> <gas used> <block hash>"
+//   U x <id> <response> <hash> <wallet> <token> <nonce> <calldata>
+//                                    a transaction                  -> "0 <0|1|2> <block>"
+//   U k <id> <response> <number>     a block                        -> "0 <0|1> <hash>"
+//
+// A refusal prints `E<code>` (the code, positive). An `error` answer to `U` prints `ERR <code>` (signed).
+
+import chain.hex;
+import chain.rpc;
+import std.buffer;
+import std.io;
+import std.json;
+
+fn read_stdin[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    var c = getchar(io);
+    while c >= 0 {
+        out = buffer.push(heap, out, byte_of(c));
+        c = getchar(io);
+    }
+    return out;
+}
+
+// Splits the line into fields. Field k's bytes (hex-decoded; `_` is empty; the text itself for field 1 of `P`) are at arena[meta[k]..meta[k] + meta[16 + k]].
+// Returns the number of fields, the op included.
+fn split_fields[&t, &a, &m](text: &t [byte], arena: &!a [byte], meta: &!m [int]) -> [] int {
+    let raw = int_of(text[0]) == 'Q' || int_of(text[0]) == 'U';
+    var n = 0;
+    var at = 0;
+    var i = 0;
+    while i < len(text) && n < 16 {
+        while i < len(text) && (int_of(text[i]) == 32 || int_of(text[i]) == 10) {
+            i = i + 1;
+        }
+        if i < len(text) {
+            var j = i;
+            while j < len(text) && int_of(text[j]) != 32 && int_of(text[j]) != 10 {
+                j = j + 1;
+            }
+            meta[n] = at;
+            if n == 0 || raw && n == 1 {
+                var k = i;
+                while k < j {
+                    arena[at] = text[k];
+                    at = at + 1;
+                    k = k + 1;
+                }
+            } else if !(j - i == 1 && int_of(text[i]) == '_') {
+                var k = i;
+                while k + 1 < j {
+                    arena[at] = byte_of(hex.value(int_of(text[k])) * 16 + hex.value(int_of(text[k + 1])));
+                    at = at + 1;
+                    k = k + 2;
+                }
+            }
+            meta[16 + n] = at - meta[n];
+            n = n + 1;
+            i = j;
+        }
+    }
+    return n;
+}
+
+fn field[&a, &m](arena: &a [byte], meta: &m [int], k: int) -> [] &a [byte] {
+    return arena[meta[k]..meta[k] + meta[16 + k]];
+}
+
+fn emit_char[&o](out: &!o [byte], pos: int, c: int) -> [] int {
+    out[pos] = byte_of(c);
+    return pos + 1;
+}
+
+fn emit_hex[&o, &b](out: &!o [byte], pos: int, bytes: &b [byte]) -> [] int {
+    var p = pos;
+    var k = 0;
+    while k < len(bytes) {
+        let v = int_of(bytes[k]);
+        p = emit_char(out, p, hex.digit(v >> 4));
+        p = emit_char(out, p, hex.digit(v & 15));
+        k = k + 1;
+    }
+    return p;
+}
+
+fn emit_nat[&o](out: &!o [byte], pos: int, v: int) -> [] int {
+    var n = 1;
+    var t = v;
+    while t >= 10 {
+        t = t / 10;
+        n = n + 1;
+    }
+    var u = v;
+    var i = n - 1;
+    while i >= 0 {
+        out[pos + i] = byte_of(48 + u % 10);
+        u = u / 10;
+        i = i - 1;
+    }
+    return pos + n;
+}
+
+fn emit_text[&o, &b](out: &!o [byte], pos: int, text: &b [byte]) -> [] int {
+    var p = pos;
+    var k = 0;
+    while k < len(text) {
+        p = emit_char(out, p, int_of(text[k]));
+        k = k + 1;
+    }
+    return p;
+}
+
+// The big-endian bytes as an integer (at most 7 bytes: enough for a chain id, a nonce or a gas limit).
+fn int_of_bytes[&b](b: &b [byte]) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < len(b) && i < 7 {
+        v = v * 256 + int_of(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+// The response in field 3 against request id `id` (field 2): answers 0 and puts the result node in `info[0]`, 1 for an `error` (the code in `info[0]`), or a refusal.
+fn read_response[&a, &m, &t, &i](arena: &a [byte], meta: &m [int], tape: &!t [int], info: &!i [int]) -> [] int {
+    let resp = field(arena, meta, 3);
+    return rpc.response(resp, tape, int_of_bytes(field(arena, meta, 2)), info);
+}
+
+fn run[&a, &m, &t, &i, &c, &o](op: int, nf: int, arena: &a [byte], meta: &m [int], tape: &!t [int], info: &!i [int], scratch: &!c [byte], out: &!o [byte]) -> [] int {
+    var p = emit_char(out, 0, '0');
+    p = emit_char(out, p, ' ');
+    let f1 = field(arena, meta, 1);
+    if op == 'Q' && nf >= 3 {
+        let id = int_of_bytes(field(arena, meta, 2));
+        var n = -313;
+        if int_of(f1[0]) == 'c' {
+            n = rpc.req_chain_id(id, scratch);
+        } else if int_of(f1[0]) == 'b' {
+            n = rpc.req_block_number(id, scratch);
+        } else if int_of(f1[0]) == 'n' && nf == 5 {
+            n = rpc.req_nonce(id, field(arena, meta, 3), int_of_bytes(field(arena, meta, 4)) == 1, scratch);
+        } else if int_of(f1[0]) == 's' && nf == 4 {
+            n = rpc.req_send_raw(id, field(arena, meta, 3), scratch);
+        } else if int_of(f1[0]) == 'r' && nf == 4 {
+            n = rpc.req_receipt(id, field(arena, meta, 3), scratch);
+        } else if int_of(f1[0]) == 't' && nf == 4 {
+            n = rpc.req_tx(id, field(arena, meta, 3), scratch);
+        } else if int_of(f1[0]) == 'k' && nf == 4 {
+            n = rpc.req_block(id, int_of_bytes(field(arena, meta, 3)), scratch);
+        }
+        if n < 0 {
+            return n;
+        }
+        return emit_hex(out, p, scratch[0..n]);
+    }
+    if (op == 'P' || op == 'U') && nf >= 3 {
+        // `P <id> <response>` has the response in field 2; `U <op> <id> <response>` in field 3. Shift `P` into the `U` layout.
+        var base = 0;
+        if op == 'P' {
+            base = 1;
+        }
+        let resp = field(arena, meta, 3 - base);
+        let id = int_of_bytes(field(arena, meta, 2 - base));
+        let kind = rpc.response(resp, tape, id, info);
+        if kind < 0 {
+            return kind;
+        }
+        if kind == 1 {
+            var q = emit_text(out, 0, "ERR ");
+            if info[0] < 0 {
+                q = emit_char(out, q, '-');
+                return emit_nat(out, q, 0 - info[0]);
+            }
+            return emit_nat(out, q, info[0]);
+        }
+        if op == 'P' {
+            return emit_text(out, p, "result");
+        }
+        let node = info[0];
+        let kind_letter = int_of(f1[0]);
+        if kind_letter == 'q' {
+            let v = rpc.quantity(resp, tape, node);
+            if v < 0 {
+                return v;
+            }
+            return emit_nat(out, p, v);
+        }
+        if kind_letter == 'h' {
+            let r = rpc.hash32(resp, tape, node, scratch[0..32]);
+            if r < 0 {
+                return r;
+            }
+            return emit_hex(out, p, scratch[0..32]);
+        }
+        if kind_letter == 'a' {
+            let r = rpc.address(resp, tape, node, scratch[0..20]);
+            if r < 0 {
+                return r;
+            }
+            return emit_hex(out, p, scratch[0..20]);
+        }
+        if kind_letter == 'd' && nf == 5 {
+            let r = rpc.data_is(resp, tape, node, field(arena, meta, 4));
+            if r < 0 {
+                return r;
+            }
+            return emit_nat(out, p, r);
+        }
+        if kind_letter == 'c' && nf == 5 {
+            let r = rpc.chain_id_is(resp, tape, node, int_of_bytes(field(arena, meta, 4)));
+            if r < 0 {
+                return r;
+            }
+            return emit_char(out, 0, '0');
+        }
+        if kind_letter == 'r' && nf == 7 {
+            let r = rpc.receipt(resp, tape, node, field(arena, meta, 4), field(arena, meta, 5), field(arena, meta, 6), info, scratch[0..32]);
+            if r < 0 {
+                return r;
+            }
+            var q = emit_nat(out, p, r);
+            q = emit_char(out, q, ' ');
+            q = emit_nat(out, q, info[0]);
+            q = emit_char(out, q, ' ');
+            q = emit_nat(out, q, info[1]);
+            q = emit_char(out, q, ' ');
+            return emit_hex(out, q, scratch[0..32]);
+        }
+        if kind_letter == 'x' && nf == 9 {
+            let r = rpc.tx_check(resp, tape, node, field(arena, meta, 4), field(arena, meta, 5), field(arena, meta, 6), int_of_bytes(field(arena, meta, 7)), field(arena, meta, 8), info);
+            if r < 0 {
+                return r;
+            }
+            var q = emit_nat(out, p, r);
+            q = emit_char(out, q, ' ');
+            return emit_nat(out, q, info[0]);
+        }
+        if kind_letter == 'k' && nf == 5 {
+            let r = rpc.block_check(resp, tape, node, int_of_bytes(field(arena, meta, 4)), scratch[0..32]);
+            if r < 0 {
+                return r;
+            }
+            var q = emit_nat(out, p, r);
+            q = emit_char(out, q, ' ');
+            return emit_hex(out, q, scratch[0..32]);
+        }
+    }
+    return -999;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    borrow mut heap as &!h in {
+        borrow mut io as &!i in {
+            let text = read_stdin(h, i);
+            let tape = box_slice(h, 3 * 70000, 0);
+            let info = box_slice(h, 4, 0);
+            let scratch = box_slice(h, 9000, byte_of(0));
+            let arena = box_slice(h, 80000, byte_of(0));
+            let out = box_slice(h, 20000, byte_of(0));
+            let meta = box_slice(h, 32, 0);
+            var n = -999;
+            borrow text as &tx in {
+                borrow mut arena as &!ar in {
+                    borrow mut meta as &!me in {
+                        let src = buffer.bytes(tx);
+                        let nf = split_fields(src, contents(ar), contents(me));
+                        borrow mut tape as &!tp in {
+                            borrow mut info as &!inf in {
+                                borrow mut scratch as &!sc in {
+                                    borrow mut out as &!ou in {
+                                        n = run(int_of(src[0]), nf, contents(ar), contents(me), contents(tp), contents(inf), contents(sc), contents(ou));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            var line = buffer.empty(h, 32);
+            if n < 0 {
+                line = buffer.push(h, line, byte_of('E'));
+                line = buffer.push_nat(h, line, 0 - n);
+            } else {
+                borrow out as &ob in {
+                    line = buffer.append(h, line, contents(ob)[0..n]);
+                }
+            }
+            line = buffer.push(h, line, byte_of(10));
+            borrow line as &lx in {
+                buffer.write(i, lx);
+            }
+            buffer.drop(h, line);
+            buffer.drop(h, text);
+            unbox_slice(h, tape);
+            unbox_slice(h, info);
+            unbox_slice(h, scratch);
+            unbox_slice(h, arena);
+            unbox_slice(h, out);
+            unbox_slice(h, meta);
+        }
+    }
+    release(heap);
+    release(io);
+    return 0;
+}
