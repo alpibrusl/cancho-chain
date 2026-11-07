@@ -50,8 +50,12 @@ jobs:
         working-directory: cancho
         run: cargo build --release -p cancho
 
+      # In a virtual environment: the checks run `python3 -I`, which ignores the user site where a plain `pip install` goes.
       - name: Python oracles
-        run: pip install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils jsonschema
+        run: |
+          python3 -m venv "$HOME/venv"
+          "$HOME/venv/bin/pip" install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils jsonschema
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
 
       - name: Gate
         working-directory: chain
