@@ -273,6 +273,17 @@ def run_checks(st, trailtool, cancho, rng, slow):
         ("an upper-case issuer", f"issuer={c.issuer.hex().upper()}\nchain=1\n", c.wallet_key.hex() + "\n", "signer-config"),
         ("a chain with a leading zero", f"issuer={c.issuer.hex()}\nchain=01\n", c.wallet_key.hex() + "\n", "signer-config"),
         ("a chain that is not a number", f"issuer={c.issuer.hex()}\nchain=1x\n", c.wallet_key.hex() + "\n", "signer-config"),
+        ("issuer with a colon instead of =", f"issuer:{c.issuer.hex()}\nchain=1\n", c.wallet_key.hex() + "\n", "signer-config"),
+        ("chain with a colon instead of =", f"issuer={c.issuer.hex()}\nchain:1\n", c.wallet_key.hex() + "\n", "signer-config"),
+        ("the issuer's last digit in upper case", f"issuer={c.issuer.hex()[:-1]}A\nchain=1\n", c.wallet_key.hex() + "\n", "signer-config"),
+        ("the issuer's first digit in upper case", f"issuer=A{c.issuer.hex()[1:]}\nchain=1\n", c.wallet_key.hex() + "\n", "signer-config"),
+        ("a chain of 19 digits", f"issuer={c.issuer.hex()}\nchain=9999999999999999999\n", c.wallet_key.hex() + "\n", "signer-config"),
+        ("an empty chain", f"issuer={c.issuer.hex()}\nchain=\n", c.wallet_key.hex() + "\n", "signer-config"),
+        ("a chain with a colon in it", f"issuer={c.issuer.hex()}\nchain=1:\n", c.wallet_key.hex() + "\n", "signer-config"),
+        ("a chain with a slash in it", f"issuer={c.issuer.hex()}\nchain=1/\n", c.wallet_key.hex() + "\n", "signer-config"),
+        ("a config longer than the buffer", f"issuer={c.issuer.hex()}\nchain=1\n" + " " * 300, c.wallet_key.hex() + "\n", "signer-config"),
+        ("a key of 66 digits", f"issuer={c.issuer.hex()}\nchain={c.tx.chain}\n", c.wallet_key.hex() + "00\n", "signer-key"),
+        ("a key file longer than the buffer", f"issuer={c.issuer.hex()}\nchain={c.tx.chain}\n", c.wallet_key.hex() + " " * 200, "signer-key"),
         ("a third line", f"issuer={c.issuer.hex()}\nchain=1\nextra=1\n", c.wallet_key.hex() + "\n", "signer-config"),
         ("the lines swapped", f"chain=1\nissuer={c.issuer.hex()}\n", c.wallet_key.hex() + "\n", "signer-config"),
         ("no wallet.key", f"issuer={c.issuer.hex()}\nchain={c.tx.chain}\n", None, "signer-key"),
@@ -295,7 +306,7 @@ def run_checks(st, trailtool, cancho, rng, slow):
     ok = f"{c.env.hex()} {ce.sign(ce.env_digest(c.env), c.issuer_key).hex()} {c.tx.unsigned().hex()} {c.caller.hex()}"
     parts = ok.split()
     for name, line in (("an empty line", ""), ("three fields", " ".join(parts[:3])), ("five fields", ok + " 00"), ("an odd number of digits", ok[:-1]), ("a digit that is not hex", ok[:-1] + "g"),
-                       ("a double space", ok.replace(" ", "  ", 1)), ("a line over 4096 bytes", ok + " " + "0" * 5000), ("a trailing space", ok + " "), ("an empty field", f"{parts[0]} {parts[1]} {parts[2]} ")):
+                       ("a double space", ok.replace(" ", "  ", 1)), ("a line over 4096 bytes", ok + " " + "0" * 5000), ("a trailing space", ok + " "), ("a double space with four fields", f"{parts[0]}  {parts[1]} {parts[2]}"), ("an empty field", f"{parts[0]} {parts[1]} {parts[2]} ")):
         st.reset(c)
         expect_refusal(name, st.run(c, line=line), "signer-request", st, b"")
     # (7) the ledger: damage is never repaired by cutting anything but a torn tail, and a ledger that does not verify signs nothing
@@ -344,7 +355,8 @@ def run_checks(st, trailtool, cancho, rng, slow):
     st.reset(c)
     # an event that verifies as an event but is not a ledger entry
     for name, payload in (("a payload of another shape", b'{"id":"' + b"0" * 64 + b'"}'), ("an upper-case digit in the payload", b'{"id":"' + b"A" * 64 + b'","digest":"' + b"0" * 64 + b'"}'),
-                          ("an empty payload", b"")):
+                          ("an empty payload", b""),
+                          ("a payload with another quote", b"{\"id\":\"" + b"0" * 64 + b"\",\"digest\":'" + b"0" * 64 + b"\"}"), ("a payload one byte too long", b"{\"id\":\"" + b"0" * 64 + b"\",\"digest\":\"" + b"0" * 64 + b"\"} ")):
         st.reset(c)
         write_chain(st.ledger(), [(b"envelope.consumed", payload, 1000)])
         raw = open(st.ledger(), "rb").read()
@@ -398,9 +410,123 @@ def run_checks(st, trailtool, cancho, rng, slow):
         expect_refusal("a ledger over 65,536 entries", st.run(c), "signer-ledger-full", st)
 
 
+# (name, file, old, new): `old` must occur exactly once in the file. "main" is tools/signer/main.cho, "signer" is lib/signer/signer.cho.
+MUTANTS = [
+    ("main: the issuer may be the wallet", "main", "} else if bytes_equal(wallet, issuer) {", "} else if false {"),
+    ("main: a failed lock is ignored", "main", "Done::Failed(e) => {\n                                    locked = false;", "Done::Failed(e) => {\n                                    locked = true;"),
+    ("main: any torn length is cut", "main", "tail < max_log_len() + 4", "tail < max_log_len() * 1000"),
+    ("main: a ledger that is not clean is accepted", "main", "if v.0 == trail.clean() || v.0 == trail.torn() && tail < max_log_len() + 4 {", "if v.0 != 99 {"),
+    ("main: a torn tail is refused", "main", "if v.0 == trail.clean() || v.0 == trail.torn() && tail < max_log_len() + 4 {", "if v.0 == trail.clean() {"),
+    ("main: the entry is looked up by the wrong bytes", "main", "envelope.ledger_check(ledger, env[1..33], env[65..97])", "envelope.ledger_check(ledger, env[33..65], env[65..97])"),
+    ("main: the digest is looked up by the wrong bytes", "main", "envelope.ledger_check(ledger, env[1..33], env[65..97])", "envelope.ledger_check(ledger, env[1..33], env[33..65])"),
+    ("main: a fresh entry is not written", "main", "    if seen == 0 {\n        // Fresh:", "    if seen == 7 {\n        // Fresh:"),
+    ("main: a failed write does not stop the signature", "main", "if r.0 == 0 && log.flush(lg) == 0 {", "if true {"),
+    ("main: a failed flush does not stop the signature", "main", "if r.0 == 0 && log.flush(lg) == 0 {", "if r.0 == 0 {"),
+    ("main: the entry is not flushed", "main", "log.flush(lg) == 0", "log.size(lg) >= 0"),
+    ("main: the event time", "main", "\"envelope.consumed\", parent[0..plen], body, ms, max_log_len()", "\"envelope.consumed\", parent[0..plen], body, ms + 1000000, max_log_len()"),
+    ("main: the clock in seconds", "main", "ms / 1000, detail)", "ms / 100, detail)"),
+    ("main: the signature is hedged", "main", "secp256k1.sign(env[65..97], key, sg[0..0], sg, work)", "secp256k1.sign(env[65..97], key, env[1..33], sg, work)"),
+    ("main: the wrong digest is signed", "main", "secp256k1.sign(env[65..97], key", "secp256k1.sign(env[33..65], key"),
+    ("main: the entry label is swapped", "main", "if seen == 0 {\n                say(io, \"\\\",\\\"entry\\\":\\\"fresh\\\"}\");", "if seen == 1 {\n                say(io, \"\\\",\\\"entry\\\":\\\"fresh\\\"}\");"),
+    ("main: a refusal exits 0", "main", "    io.newline(io);\n    return 2;\n}\n\n// The whole of the file", "    io.newline(io);\n    return 0;\n}\n\n// The whole of the file"),
+    ("main: the first event names a parent", "main", "if log.records(lg) > 0 {\n                plen = 64;", "if true {\n                plen = 64;"),
+    ("main: the parent is cut short", "main", "plen = 64;", "plen = 63;"),
+    ("main: a line may be one byte over", "main", "if n >= len(out) {\n            return -275;", "if n > len(out) {\n            return -275;"),
+    ("main: five fields", "main", "if n >= 4 || j - i == 0", "if n >= 5 || j - i == 0"),
+    ("main: an empty field", "main", "if n >= 4 || j - i == 0 ||", "if n >= 4 ||"),
+    ("main: a trailing space", "main", "if n != 4 || int_of(text[len(text) - 1]) == 32 {", "if n != 4 {"),
+    ("main: fewer than four fields", "main", "if n != 4 || int_of(text[len(text) - 1]) == 32 {", "if n > 4 || int_of(text[len(text) - 1]) == 32 {"),
+    ("main: the file may be longer than its buffer", "main", "if size <= len(out) {", "if size <= len(out) + 1000000 {"),
+    ("main: the ledger is read from the wrong pair", "main", "signer.parse_payload(window[p3.2..p3.2 + p3.3]", "signer.parse_payload(window[p2.2..p2.2 + p2.3]"),
+    ("main: the ledger is read to the wrong place", "main", "ledger[k * 64..k * 64 + 32], ledger[k * 64 + 32..k * 64 + 64]", "ledger[k * 64 + 32..k * 64 + 64], ledger[k * 64..k * 64 + 32]"),
+    ("signer: the config's issuer prefix", "signer", "let a = \"issuer=\";\n    var k = 0;\n    while k < 7 {", "let a = \"issuer=\";\n    var k = 0;\n    while k < 6 {"),
+    ("signer: the issuer's last digit", "signer", "while k < 40 {\n        if !is_lower_hex(int_of(text[7 + k])) {", "while k < 39 {\n        if !is_lower_hex(int_of(text[7 + k])) {"),
+    ("signer: the issuer may be upper case", "signer", "fn is_lower_hex(c: int) -> [] bool {\n    return c >= 48 && c <= 57 || c >= 97 && c <= 102;", "fn is_lower_hex(c: int) -> [] bool {\n    return c >= 48 && c <= 57 || c >= 97 && c <= 102 || c >= 65 && c <= 70;"),
+    ("signer: the newline after the issuer", "signer", "if int_of(text[47]) != 10 {", "if int_of(text[47]) != 32 {"),
+    ("signer: the chain prefix", "signer", "let b = \"chain=\";\n    k = 0;\n    while k < 6 {", "let b = \"chain=\";\n    k = 0;\n    while k < 5 {"),
+    ("signer: a chain with a leading zero", "signer", "digits > 1 && int_of(text[54]) == 48", "digits > 2 && int_of(text[54]) == 48"),
+    ("signer: a chain of 19 digits", "signer", "digits < 1 || digits > 18 ||", "digits < 1 || digits > 19 ||"),
+    ("signer: an empty chain", "signer", "digits < 1 || digits > 18 ||", "digits < 0 || digits > 18 ||"),
+    ("signer: a chain digit", "signer", "if c < 48 || c > 57 {\n            return -276;", "if c < 48 || c > 58 {\n            return -276;"),
+    ("signer: the chain's value", "signer", "chain = chain * 10 + (c - 48);", "chain = chain * 10 + (c - 47);"),
+    ("signer: the final newline of the config", "signer", "if int_of(text[end - 1]) == 10 {\n        end = end - 1;", "if int_of(text[end - 1]) == 11 {\n        end = end - 1;"),
+    ("signer: a key of 65 digits", "signer", "if n == 65 && int_of(text[64]) == 10 {", "if n >= 65 {"),
+    ("signer: the payload's first byte", "signer", "var p = 0;\n    let a = \"{\\\"id\\\":\\\"\";\n    while p < 7 {", "var p = 1;\n    let a = \"{\\\"id\\\":\\\"\";\n    while p < 7 {"),
+    ("signer: the payload's id offset", "signer", "hex.encode(id, out[7..71]);", "hex.encode(id, out[7..71]);\n    hex.encode(digest, out[7..71]);"),
+    ("signer: the payload's digest offset", "signer", "hex.encode(digest, out[83..147]);", "hex.encode(id, out[83..147]);"),
+    ("signer: a payload digit", "signer", "let inhex = k >= 7 && k < 71 || k >= 83 && k < 147;", "let inhex = k >= 7 && k < 71 || k >= 83 && k < 146;"),
+    ("signer: the payload's first hex digit", "signer", "let inhex = k >= 7 && k < 71 || k >= 83 && k < 147;", "let inhex = k >= 8 && k < 71 || k >= 83 && k < 147;"),
+    ("signer: the payload's text is not compared", "signer", "} else if int_of(text[k]) != int_of(m[k]) {", "} else if int_of(text[k]) == 1000 {"),
+    ("signer: the payload's length", "signer", "if len(text) != 149 || len(id) != 32 || len(digest) != 32 {", "if len(text) < 149 || len(id) != 32 || len(digest) != 32 {"),
+    ("signer: a refusal tag", "signer", "return \"signer-ledger-corrupt\";", "return \"signer-ledger-damaged\";"),
+    ("signer: another refusal tag", "signer", "return \"signer-locked\";", "return \"signer-busy\";"),
+    ("signer: the key's tag", "signer", "return \"signer-key\";", "return \"signer-wallet\";"),
+    ("signer: the request's tag", "signer", "return \"signer-request\";", "return \"signer-line\";"),
+]
+
+# Mutants no request can tell from the original, each with the reason.
+EQUIVALENT = {
+    "main: any torn length is cut": "a file that ends inside a record has a declared length of at most max_len (a larger one is `bad`, not `torn`), so what is left is at most max_len + 3 bytes and the bound is always met: it is defence in depth",
+}
+
+
+def mutants(cancho, trailtool):
+    main_text = open(os.path.join(ROOT, "tools/signer/main.cho")).read()
+    signer_text = open(os.path.join(ROOT, "lib/signer/signer.cho")).read()
+    work = []
+    for name, which, old, new in MUTANTS:
+        text = main_text if which == "main" else signer_text
+        if text.count(old) != 1:
+            sys.exit(f"mutant {name!r}: the pattern occurs {text.count(old)} times")
+        work.append((name, which, text.replace(old, new)))
+
+    def one(item):
+        name, which, body = item
+        d = tempfile.mkdtemp()
+        try:
+            libdir = os.path.join(d, "lib")
+            shutil.copytree(os.path.join(ROOT, "lib"), libdir)
+            state = os.path.join(d, "state")
+            os.mkdir(state)
+            exe = os.path.join(d, "signer")
+            main = main_text
+            if which == "main":
+                main = body
+            else:
+                open(os.path.join(libdir, "signer/signer.cho"), "w").write(body)
+            with tempfile.TemporaryDirectory() as t:
+                m = os.path.join(t, "main.cho")
+                open(m, "w").write(main.replace(CONST, state))
+                r = subprocess.run([cancho, "build", "--std", m, *sources(libdir), "-o", exe], capture_output=True, text=True)
+            if r.returncode != 0:
+                return name, "did not build: " + r.stderr[:200]
+            r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--exe", exe, "--state", state, "--trailtool", trailtool], capture_output=True, text=True, timeout=3000)
+            return name, ("killed" if r.returncode != 0 else "SURVIVED")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    survivors, broken = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=int(os.environ.get("JOBS", "5"))) as pool:
+        for name, verdict in pool.map(one, work):
+            if verdict == "SURVIVED":
+                survivors.append(name)
+                print("SURVIVED:", name, flush=True)
+            elif verdict != "killed":
+                broken.append(name)
+                print(f"INVALID: {name}: {verdict}", flush=True)
+    unexplained = [n for n in survivors if n not in EQUIVALENT]
+    print(f"mutants: {len(work) - len(survivors) - len(broken)}/{len(work)} killed, {len(survivors) - len(unexplained)} explained, {len(unexplained)} unexplained survivors, {len(broken)} invalid")
+    sys.exit(1 if unexplained or broken else 0)
+
+
 def main():
     cancho = os.environ.get("CANCHO", "cancho")
     slow = "--slow" in sys.argv
+    arg = lambda name: sys.argv[sys.argv.index(name) + 1]
+    if "--exe" in sys.argv:  # a child of --mutants: the binary, the directory compiled into it and cancho-log's tool are given
+        run_checks(State(arg("--state"), arg("--exe")), arg("--trailtool"), cancho, random.Random(31337), False)
+        print(f"{COUNT[0]} checks, {len(FAILS)} failed")
+        sys.exit(1 if FAILS else 0)
     with tempfile.TemporaryDirectory() as t:
         state = os.path.join(t, "state")
         os.mkdir(state)
@@ -410,6 +536,8 @@ def main():
         r = subprocess.run([cancho, "build", "--std", *[os.path.join(LOGSRC, f) for f in ("trailtool.cho", "trail.cho", "log.cho", "segment.cho", "record.cho", "crc.cho")], "-o", trailtool], capture_output=True, text=True)
         if r.returncode != 0:
             raise SystemExit("trailtool build failed:\n" + r.stderr[:800])
+        if "--mutants" in sys.argv:
+            mutants(cancho, trailtool)
         run_checks(State(state, exe), trailtool, cancho, random.Random(31337), slow)
     print(f"{COUNT[0]} checks, {len(FAILS)} failed")
     sys.exit(1 if FAILS else 0)
