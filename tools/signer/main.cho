@@ -1,0 +1,435 @@
+edition 7;
+
+// The signer (docs/design.md section 14): one request on standard input, one JSON line on standard output, exit status 0 for a signature and 2 for a refusal.
+//
+//   <envelope hex> <signature hex> <message hex> <caller hex>
+//
+// Its authority is the one directory below, read and written, the clock and standard input and output: no network, no `exec`, no signals, no foreign code (`cancho authority`).
+// The directory is a compile-time constant on purpose: a path from the command line would make the report unbounded. `scripts/check_signer.py` builds a copy with another path.
+
+import chain.address;
+import chain.envelope;
+import chain.hex;
+import chain.keccak;
+import chain.signer;
+import chain.txcheck;
+import crc;
+import log;
+import record;
+import secp256k1;
+import segment;
+import std.io;
+import trail;
+
+fn max_log_len() -> [] int {
+    return 4096;
+}
+
+fn say[&i](io: &!i Io, text: &static [byte]) -> [io_write] int {
+    io.write_all(io, text);
+    return 0;
+}
+
+// A refusal: one JSON line, the rule tag, a repair with nothing of the request in it. Answers the exit status.
+fn refuse[&i](io: &!i Io, code: int) -> [io_write] int {
+    say(io, "{\"ok\":false,\"rule\":\"chain.");
+    io.write_all(io, signer.refusal_tag(code));
+    say(io, "\",\"repair\":\"");
+    io.write_all(io, signer.repair(code));
+    say(io, "\"}");
+    io.newline(io);
+    return 2;
+}
+
+// The whole of the file `path` (at most `max` bytes) into `out`; answers its length, or a negative refusal `code` if it cannot be read or is longer.
+fn read_small[&c, &p, &o](fs: &c Fs("/var/lib/cancho-signer"), path: &p [byte], out: &!o [byte], code: int) -> [fs_read("/var/lib/cancho-signer"), file_read] int {
+    var got = code;
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+            got = code;
+        }
+        Opened::Ok(opened) => {
+            var f = opened;
+            borrow mut f as &!h in {
+                match file_size(h) {
+                    Done::Failed(e) => {
+                        got = code;
+                    }
+                    Done::Ok(size) => {
+                        if size <= len(out) {
+                            var have = 0;
+                            var ok = true;
+                            while have < size && ok {
+                                match file_pread(h, have, out[have..size]) {
+                                    Read::Got(n) => {
+                                        have = have + n;
+                                    }
+                                    Read::End => {
+                                        ok = false;
+                                    }
+                                    Read::Failed(e) => {
+                                        ok = false;
+                                    }
+                                }
+                            }
+                            if ok {
+                                got = size;
+                            }
+                        }
+                    }
+                }
+            }
+            file_close(f);
+        }
+    }
+    return got;
+}
+
+// The request line from standard input into `out`; answers its length (no newline), or -275 if it is empty or longer than `out`.
+fn read_line[&i, &o](io: &!i Io, out: &!o [byte]) -> [io_read] int {
+    var n = 0;
+    var c = getchar(io);
+    while c >= 0 && c != 10 {
+        if n >= len(out) {
+            return -275;
+        }
+        out[n] = byte_of(c);
+        n = n + 1;
+        c = getchar(io);
+    }
+    if n == 0 {
+        return -275;
+    }
+    return n;
+}
+
+// The four hex fields of the request into `arena`, field k at `arena[meta[k]..meta[k] + meta[4 + k]]`. 0, or -275.
+fn split_request[&t, &a, &m](text: &t [byte], arena: &!a [byte], meta: &!m [int]) -> [] int {
+    var n = 0;
+    var at = 0;
+    var i = 0;
+    while i < len(text) {
+        var j = i;
+        while j < len(text) && int_of(text[j]) != 32 {
+            j = j + 1;
+        }
+        if n >= 4 || j - i == 0 || (j - i) % 2 != 0 {
+            return -275;
+        }
+        meta[n] = at;
+        let w = hex.decode(text[i..j], arena[at..at + (j - i) / 2]);
+        if w < 0 {
+            return -275;
+        }
+        meta[4 + n] = (j - i) / 2;
+        at = at + (j - i) / 2;
+        n = n + 1;
+        i = j + 1;
+    }
+    // A line that ends in a space has an empty fifth field.
+    if n != 4 || int_of(text[len(text) - 1]) == 32 {
+        return -275;
+    }
+    return 0;
+}
+
+// The ledger's entries (`id || digest`, 64 bytes each) from the events of the log, into `ledger`. 0, or -272.
+fn read_ledger[&l, &w, &g](lg: &!l log.Log, window: &!w [byte], ledger: &!g [byte]) -> [file_read] int {
+    var at = 0;
+    var k = 0;
+    var going = true;
+    while going {
+        let r = log.read_at(lg, at, window);
+        if r.0 == 0 {
+            // The fourth pair is the payload.
+            let p0 = record.pair_at(window, record.first_pair(0));
+            let p1 = record.pair_at(window, p0.4);
+            let p2 = record.pair_at(window, p1.4);
+            let p3 = record.pair_at(window, p2.4);
+            if (k + 1) * 64 > len(ledger) {
+                return -272;
+            }
+            if signer.parse_payload(window[p3.2..p3.2 + p3.3], ledger[k * 64..k * 64 + 32], ledger[k * 64 + 32..k * 64 + 64]) != 0 {
+                return -272;
+            }
+            k = k + 1;
+            at = at + r.1;
+        } else {
+            going = false;
+            if r.0 != 1 {
+                return -272;
+            }
+        }
+    }
+    return k;
+}
+
+fn serve[&c, &k, &i, &q, &t, &d](fs: &c Fs("/var/lib/cancho-signer"), clock: &k Clock, io: &!i Io, hp: &!q Heap, st: &!t [int], work: &!d [int]) -> [fs_read("/var/lib/cancho-signer"), fs_write("/var/lib/cancho-signer"), file_read, file_write, clock, heap, io_read, io_write] int {
+    var status = 2;
+    region a {
+        let line = alloc_slice[a](4096, byte_of(0));
+        let arena = alloc_slice[a](2048, byte_of(0));
+        let meta = alloc_slice[a](8, 0);
+        let conf = alloc_slice[a](256, byte_of(0));
+        let keytext = alloc_slice[a](128, byte_of(0));
+        let issuer = alloc_slice[a](20, byte_of(0));
+        let wallet = alloc_slice[a](20, byte_of(0));
+        let key = alloc_slice[a](32, byte_of(0));
+        let detail = alloc_slice[a](2, 0);
+        // The configuration and the key come first: nothing is read from the request until the signer knows what it is.
+        let cn = read_small(fs, "/var/lib/cancho-signer/signer.conf", conf, -276);
+        var chain = -276;
+        if cn > 0 {
+            chain = signer.parse_config(conf[0..cn], issuer);
+        }
+        let kn = read_small(fs, "/var/lib/cancho-signer/wallet.key", keytext, -277);
+        var code = 0;
+        if chain < 0 {
+            code = chain;
+        } else if kn <= 0 {
+            code = -277;
+        } else {
+            code = signer.parse_key(keytext[0..kn], key);
+        }
+        if code == 0 {
+            // The wallet's address is the key's, and the issuer must be somebody else.
+            let pk = alloc_slice[a](65, byte_of(0));
+            if secp256k1.public_key(key, pk, work) != 0 || address.from_public_key(st, pk, wallet) != 0 {
+                code = -277;
+            } else if bytes_equal(wallet, issuer) {
+                code = -271;
+            }
+        }
+        if code != 0 {
+            status = refuse(io, code);
+        } else {
+            let n = read_line(io, line);
+            if n < 0 {
+                status = refuse(io, n);
+            } else {
+                code = split_request(line[0..n], arena, meta);
+                if code != 0 {
+                    status = refuse(io, code);
+                } else {
+                    status = with_ledger(fs, clock, io, hp, arena, meta, issuer, wallet, chain, key, st, work, detail);
+                }
+            }
+        }
+    }
+    return status;
+}
+
+fn bytes_equal[&x, &y](x: &x [byte], y: &y [byte]) -> [] bool {
+    if len(x) != len(y) {
+        return false;
+    }
+    var i = 0;
+    while i < len(x) {
+        if int_of(x[i]) != int_of(y[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Opens the ledger, locks it, recovers and verifies it, and hands the request on.
+fn with_ledger[&c, &k, &i, &q, &a, &m, &s, &w, &y, &t, &d, &x](fs: &c Fs("/var/lib/cancho-signer"), clock: &k Clock, io: &!i Io, hp: &!q Heap, arena: &a [byte], meta: &m [int], issuer: &s [byte], wallet: &w [byte], chain: int, key: &y [byte], st: &!t [int], work: &!d [int], detail: &!x [int]) -> [fs_read("/var/lib/cancho-signer"), fs_write("/var/lib/cancho-signer"), file_read, file_write, clock, heap, io_write] int {
+    var status = 2;
+    region r {
+        let window = alloc_slice[r](max_log_len() + 4096, byte_of(0));
+        let head = alloc_slice[r](64, byte_of(0));
+        let path = "/var/lib/cancho-signer/ledger.seg";
+        match open_append(fs, path) {
+            Opened::Failed(e) => {
+                status = refuse(io, -274);
+            }
+            Opened::Ok(w0) => {
+                match open_rw(fs, path) {
+                    Opened::Failed(e) => {
+                        status = refuse(io, -274);
+                        file_close(w0);
+                    }
+                    Opened::Ok(rw0) => {
+                        var rw = rw0;
+                        var rec = (0, 0, 0, 0 - 1, 0 - 1);
+                        var v = (0, 0, 0, 0, 0);
+                        var locked = false;
+                        borrow mut rw as &!h in {
+                            match file_lock(h) {
+                                Done::Ok(n) => {
+                                    locked = true;
+                                }
+                                Done::Failed(e) => {
+                                    locked = false;
+                                }
+                            }
+                            if locked {
+                                // A read-only walk first. `recover` would cut a ledger at the first thing that is not a whole record, and for damage in the middle of the file that would
+                                // throw away entries that were consumed: so only a torn tail, shorter than one record, is ever cut (docs/design.md section 14.3).
+                                match file_size(h) {
+                                    Done::Ok(size) => {
+                                        v = trail.verify(h, size, window, max_log_len(), head, 0, "");
+                                        let tail = size - v.1;
+                                        if v.0 == trail.clean() || v.0 == trail.torn() && tail < max_log_len() + 4 {
+                                            rec = log.recover(h, window, max_log_len());
+                                            if rec.2 != v.2 {
+                                                v = (9, 0, 0, 0, 0);
+                                            }
+                                        } else {
+                                            v = (9, 0, 0, 0, 0);
+                                            rec = (1, 0, 0, 0 - 1, 0 - 1);
+                                        }
+                                    }
+                                    Done::Failed(e) => {
+                                        rec = (1, 0, 0, 0 - 1, 0 - 1);
+                                        v = (9, 0, 0, 0, 0);
+                                    }
+                                }
+                            }
+                        }
+                        if !locked {
+                            status = refuse(io, -270);
+                            file_close(w0);
+                        } else if rec.0 != 0 || v.0 == 9 {
+                            status = refuse(io, -272);
+                            file_close(w0);
+                        } else if rec.2 > signer.max_entries() {
+                            status = refuse(io, -273);
+                            file_close(w0);
+                        } else {
+                            match open_read(fs, path) {
+                                Opened::Failed(e) => {
+                                    status = refuse(io, -274);
+                                    file_close(w0);
+                                }
+                                Opened::Ok(rd) => {
+                                    var lg = log.attach(w0, rd, rec.1, rec.2, rec.3, rec.4, max_log_len());
+                                    // The ledger is read into the heap: a region holds 64 KiB in all, and 65,536 entries are 4 MiB.
+                                    let ledger = box_slice(hp, (rec.2 + 1) * 64, byte_of(0));
+                                    borrow mut ledger as &!lb in {
+                                        borrow mut lg as &!l in {
+                                            let entries = read_ledger(l, window, contents(lb));
+                                            if entries < 0 {
+                                                status = refuse(io, -272);
+                                            } else {
+                                                status = decide(l, clock, io, arena, meta, issuer, wallet, chain, key, st, work, detail, contents(lb)[0..entries * 64], head);
+                                            }
+                                        }
+                                    }
+                                    unbox_slice(hp, ledger);
+                                    log.close(lg);
+                                }
+                            }
+                        }
+                        file_close(rw);
+                    }
+                }
+            }
+        }
+    }
+    return status;
+}
+
+// The request against the ledger: verify, check single use, record, then sign.
+fn decide[&l, &k, &i, &a, &m, &s, &w, &y, &t, &d, &x, &g, &h](lg: &!l log.Log, clock: &k Clock, io: &!i Io, arena: &a [byte], meta: &m [int], issuer: &s [byte], wallet: &w [byte], chain: int, key: &y [byte], st: &!t [int], work: &!d [int], detail: &!x [int], ledger: &g [byte], head: &!h [byte]) -> [file_write, clock, io_write] int {
+    let env = arena[meta[0]..meta[0] + meta[4]];
+    let sig = arena[meta[1]..meta[1] + meta[5]];
+    let msg = arena[meta[2]..meta[2] + meta[6]];
+    let caller = arena[meta[3]..meta[3] + meta[7]];
+    let ms = clock_unix_ms(clock);
+    if ms < 0 {
+        return refuse(io, -279);
+    }
+    var code = envelope.verify(st, work, env, sig, msg, issuer, chain, wallet, caller, ms / 1000, detail);
+    if code != 0 {
+        return refuse(io, code);
+    }
+    // verify has shown the envelope well formed: the id is bytes 1 to 33 and the transaction digest 65 to 97.
+    let seen = envelope.ledger_check(ledger, env[1..33], env[65..97]);
+    if seen < 0 {
+        return refuse(io, seen);
+    }
+    if seen == 0 {
+        // Fresh: the entry is on the disk before the signature exists.
+        var written = -274;
+        region p {
+            let body = alloc_slice[p](149, byte_of(0));
+            let scratch = alloc_slice[p](1024, byte_of(0));
+            let parent = alloc_slice[p](64, byte_of(0));
+            signer.payload(env[1..33], env[65..97], body);
+            var plen = 0;
+            if log.records(lg) > 0 {
+                plen = 64;
+                var q = 0;
+                while q < 64 {
+                    parent[q] = head[q];
+                    q = q + 1;
+                }
+            }
+            let r = trail.append(lg, head, scratch, "envelope.consumed", parent[0..plen], body, ms, max_log_len());
+            if r.0 == 0 && log.flush(lg) == 0 {
+                written = 0;
+            }
+        }
+        if written != 0 {
+            return refuse(io, -274);
+        }
+    }
+    var out = 0;
+    region s2 {
+        let sg = alloc_slice[s2](65, byte_of(0));
+        let hexed = alloc_slice[s2](130, byte_of(0));
+        code = secp256k1.sign(env[65..97], key, sg[0..0], sg, work);
+        if code != 0 {
+            out = refuse(io, -278);
+        } else {
+            hex.encode(sg, hexed);
+            say(io, "{\"ok\":true,\"signature\":\"");
+            io.write_all(io, hexed);
+            if seen == 0 {
+                say(io, "\",\"entry\":\"fresh\"}");
+            } else {
+                say(io, "\",\"entry\":\"same\"}");
+            }
+            io.newline(io);
+            out = 0;
+        }
+    }
+    return out;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(args);
+    release(net);
+    release(signals);
+    release(exec);
+    var status = 2;
+    var out = io;
+    var pool = heap;
+    let dir = narrow(fs, "/var/lib/cancho-signer");
+    borrow mut pool as &!hp in {
+        let st = box_slice(hp, keccak.state_len(), 0);
+        let work = box_slice(hp, secp256k1.work_len(), 0);
+        borrow mut st as &!s1 in {
+            borrow mut work as &!w1 in {
+                borrow dir as &c in {
+                    borrow clock as &k in {
+                        borrow mut out as &!o in {
+                            status = serve(c, k, o, hp, contents(s1), contents(w1));
+                        }
+                    }
+                }
+            }
+        }
+        unbox_slice(hp, st);
+        unbox_slice(hp, work);
+    }
+    release(pool);
+    release(dir);
+    release(clock);
+    release(out);
+    return status;
+}
