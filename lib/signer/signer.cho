@@ -82,6 +82,23 @@ pub fn refused_anchor_write() -> [] int {
     return -285;
 }
 
+// The witness's refusals (docs/design.md section 20).
+pub fn refused_witness_missing() -> [] int {
+    return -286;
+}
+
+pub fn refused_witness_short() -> [] int {
+    return -287;
+}
+
+pub fn refused_witness_mismatch() -> [] int {
+    return -288;
+}
+
+pub fn refused_witness_behind() -> [] int {
+    return -289;
+}
+
 // The rule tag of a refusal, without the `chain.` prefix: the envelope's own (-240 to -261) or the signer's.
 pub fn refusal_tag(code: int) -> [] &static [byte] {
     if code <= -240 && code >= -261 {
@@ -135,6 +152,18 @@ pub fn refusal_tag(code: int) -> [] &static [byte] {
     if code == -285 {
         return "signer-anchor-write";
     }
+    if code == -286 {
+        return "signer-witness-missing";
+    }
+    if code == -287 {
+        return "signer-witness-short";
+    }
+    if code == -288 {
+        return "signer-witness-mismatch";
+    }
+    if code == -289 {
+        return "signer-witness-behind";
+    }
     return "signer-unknown";
 }
 
@@ -187,6 +216,18 @@ pub fn repair(code: int) -> [] &static [byte] {
     }
     if code == -285 {
         return "the anchor could not be written, so nothing was signed; check the anchor directory and retry";
+    }
+    if code == -286 {
+        return "the front has no witness and the ledger has more than one entry; restore the front's witness file, or a person must look at the ledger";
+    }
+    if code == -287 {
+        return "the ledger has fewer entries than the front's witness counted: the signer's directory was restored or cut; nothing is signed until a person has looked";
+    }
+    if code == -288 {
+        return "the ledger's entry at the witness's count is not the witness's: the ledger was replaced; nothing is signed until a person has looked";
+    }
+    if code == -289 {
+        return "the ledger is more than one entry ahead of the front's witness: the front's witness was restored from an older copy; a person must look";
     }
     if code == -250 {
         return "the envelope is not a whole version-1 envelope";

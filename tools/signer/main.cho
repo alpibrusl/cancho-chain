@@ -190,17 +190,21 @@ fn read_line[&i, &o](io: &!i Io, out: &!o [byte]) -> [io_read] int {
     return n;
 }
 
-// The four hex fields of the request into `arena`, field k at `arena[meta[k]..meta[k] + meta[4 + k]]`. 0, or -275.
+// The request into `arena` and `meta`: four hex fields, field k at `arena[meta[k]..meta[k] + meta[4 + k]]`, then the front's witness (docs/design.md section 20.2), which is `-` (none: `meta[8]` is -1) or `<count> <head>`
+// (the count in `meta[8]`, the head's 64 digits at `arena[meta[9]..meta[9] + 64]`). 0, or -275.
 fn split_request[&t, &a, &m](text: &t [byte], arena: &!a [byte], meta: &!m [int]) -> [] int {
     var n = 0;
     var at = 0;
     var i = 0;
-    while i < len(text) {
+    while n < 4 {
+        if i >= len(text) {
+            return -275;
+        }
         var j = i;
         while j < len(text) && int_of(text[j]) != 32 {
             j = j + 1;
         }
-        if n >= 4 || j - i == 0 || (j - i) % 2 != 0 {
+        if j - i == 0 || (j - i) % 2 != 0 {
             return -275;
         }
         meta[n] = at;
@@ -213,11 +217,33 @@ fn split_request[&t, &a, &m](text: &t [byte], arena: &!a [byte], meta: &!m [int]
         n = n + 1;
         i = j + 1;
     }
-    // A line that ends in a space has an empty fifth field.
-    if n != 4 || int_of(text[len(text) - 1]) == 32 {
+    // The rest is the witness. A line that ends in a space has an empty one.
+    if i >= len(text) {
         return -275;
     }
-    return 0;
+    let rest = text[i..len(text)];
+    if len(rest) == 1 && int_of(rest[0]) == 45 {
+        meta[8] = -1;
+        meta[9] = 0;
+        return 0;
+    }
+    var code = -275;
+    region w {
+        // `parse_anchor` reads a file's text: the witness is that text without its newline.
+        let buf = alloc_slice[w](len(rest) + 1, byte_of(10));
+        var k = 0;
+        while k < len(rest) {
+            buf[k] = rest[k];
+            k = k + 1;
+        }
+        let count = signer.parse_anchor(buf, arena[at..at + 64]);
+        if count > 0 {
+            meta[8] = count;
+            meta[9] = at;
+            code = 0;
+        }
+    }
+    return code;
 }
 
 // The ledger's entries (`id || digest`, 64 bytes each) from the events of the log, into `ledger`. 0, or -272.
@@ -255,8 +281,8 @@ fn serve[&c, &ac, &k, &i, &q, &t, &d](fs: &c Fs("/var/lib/cancho-signer"), anc: 
     var status = 2;
     region a {
         let line = alloc_slice[a](4096, byte_of(0));
-        let arena = alloc_slice[a](2048, byte_of(0));
-        let meta = alloc_slice[a](8, 0);
+        let arena = alloc_slice[a](2176, byte_of(0)); // four fields of at most 2,047 bytes in all, then the witness's 64 digits
+        let meta = alloc_slice[a](10, 0);
         let conf = alloc_slice[a](256, byte_of(0));
         let keytext = alloc_slice[a](128, byte_of(0));
         let issuer = alloc_slice[a](20, byte_of(0));
@@ -326,6 +352,7 @@ fn with_ledger[&c, &ac, &k, &i, &q, &a, &m, &s, &w, &y, &t, &d, &x](fs: &c Fs("/
     region r {
         let window = alloc_slice[r](max_log_len() + 4096, byte_of(0));
         let head = alloc_slice[r](64, byte_of(0));
+        let head2 = alloc_slice[r](64, byte_of(0));
         let abuf = alloc_slice[r](72, byte_of(0));
         let ahead = alloc_slice[r](64, byte_of(0));
         var ac = -1;
@@ -382,6 +409,24 @@ fn with_ledger[&c, &ac, &k, &i, &q, &a, &m, &s, &w, &y, &t, &d, &x](fs: &c Fs("/
                                                 arefuse = -283;
                                             } else if v.2 - ac > 1 {
                                                 arefuse = -284;
+                                            }
+                                            if arefuse == 0 {
+                                                // The front's witness, held outside this directory (design section 20.2): none is allowed for a ledger of at most one entry, and a witness must be
+                                                // confirmed by the ledger and at most one entry behind it.
+                                                if meta[8] < 0 {
+                                                    if v.2 > 1 {
+                                                        arefuse = -286;
+                                                    }
+                                                } else {
+                                                    let wv = trail.verify(h, size, window, max_log_len(), head2, meta[8], arena[meta[9]..meta[9] + 64]);
+                                                    if wv.4 == trail.anchor_short() {
+                                                        arefuse = -287;
+                                                    } else if wv.4 == trail.anchor_mismatch() {
+                                                        arefuse = -288;
+                                                    } else if v.2 - meta[8] > 1 {
+                                                        arefuse = -289;
+                                                    }
+                                                }
                                             }
                                             if arefuse != 0 {
                                                 v = (9, 0, 0, 0, 0);

@@ -2,7 +2,7 @@ edition 11;
 
 // The front (docs/design.md section 15): `POST /sign` over HTTP, behind `cancho-gateway`, answered by starting the signer once per request.
 //
-// Authority (`cancho authority`): one port in, **one program to start** (the signer's path below), the clock, the heap, standard error. No file, no network out, no foreign code.
+// Authority (`cancho authority`): one port in, **one program to start** (the signer's path below), **one directory** (the witness, design section 20), the clock, the heap, standard error. No network out, no foreign code.
 // The port and the program are compile-time constants on purpose, so that the report names them; `scripts/check_front.py` builds a copy with others.
 //
 // The caller is the one `X-Auth-Identity` header, which only the gateway may set (its `auth_identity_header` removes a client's and sets its own). A front that a client can
@@ -138,6 +138,123 @@ fn refusal[&h](heap: &!h Heap, out: buffer.Buffer, status: int, tag: &static [by
     return answer;
 }
 
+// The witness (docs/design.md section 20): the signer's last anchor `<count> <head>`, kept here, outside the signer's directories, and handed back on every request.
+// Its text into `out` (at most 72 bytes) without the newline: the length, or -1 if there is no file (none yet), or -2 if it is there and is not one line of `[0-9a-f ]` of at most 71 bytes.
+// How strict the text is is the signer's to say (`signer-request`); the front only keeps it from breaking the line.
+fn read_witness[&f, &o](fs: &f Fs("/var/lib/cancho-front"), out: &!o [byte]) -> [fs_read("/var/lib/cancho-front"), file_read] int {
+    var got = 0 - 1;
+    match open_read(fs, "/var/lib/cancho-front/witness") {
+        Opened::Failed(e) => {
+            got = 0 - 1;
+        }
+        Opened::Ok(opened) => {
+            got = 0 - 2;
+            var f = opened;
+            borrow mut f as &!fh in {
+                match file_size(fh) {
+                    Done::Failed(e) => {
+                        got = 0 - 2;
+                    }
+                    Done::Ok(size) => {
+                        if size >= 3 && size <= len(out) {
+                            var have = 0;
+                            var ok = true;
+                            while have < size && ok {
+                                match file_pread(fh, have, out[have..size]) {
+                                    Read::Got(n) => {
+                                        have = have + n;
+                                    }
+                                    Read::End => {
+                                        ok = false;
+                                    }
+                                    Read::Failed(e) => {
+                                        ok = false;
+                                    }
+                                }
+                            }
+                            var k = 0;
+                            while ok && k < size - 1 {
+                                let c = int_of(out[k]);
+                                if !(c >= 48 && c <= 57 || c >= 97 && c <= 102 || c == 32) {
+                                    ok = false;
+                                }
+                                k = k + 1;
+                            }
+                            if ok && int_of(out[size - 1]) == 10 {
+                                got = size - 1;
+                            }
+                        }
+                    }
+                }
+            }
+            file_close(f);
+        }
+    }
+    return got;
+}
+
+// The anchor of a `200` answer `{"ok":true,...,"anchor":{"count":<n>,"head":"<64 hex>"}}` and a newline, as the witness's line `<n> <head>` and a newline into `out`
+// (at least 72 bytes): its length, or -1 if the answer holds no such anchor.
+fn witness_of[&a, &o](answer: &a [byte], out: &!o [byte]) -> [] int {
+    let n = len(answer);
+    if len(out) < 72 || n < 100 || int_of(answer[n - 1]) != 10 {
+        return 0 - 1;
+    }
+    // From the end: `,"head":"` 64 digits `"}}` newline.
+    if expect(answer, n - 68 - 9, ",\"head\":\"") < 0 || expect(answer, n - 4, "\"}}") < 0 {
+        return 0 - 1;
+    }
+    var at = 0 - 1;
+    var i = 0;
+    while i + 18 <= n - 77 && at < 0 {
+        if expect(answer, i, "\"anchor\":{\"count\":") >= 0 {
+            at = i + 18;
+        }
+        i = i + 1;
+    }
+    if at < 0 {
+        return 0 - 1;
+    }
+    var digits = 0;
+    var p = at;
+    while p < n - 77 && int_of(answer[p]) >= 48 && int_of(answer[p]) <= 57 {
+        out[digits] = answer[p];
+        digits = digits + 1;
+        p = p + 1;
+    }
+    if digits < 1 || digits > 5 || p != n - 77 {
+        return 0 - 1;
+    }
+    out[digits] = byte_of(32);
+    var k = 0;
+    while k < 64 {
+        if !is_lower_hex(int_of(answer[n - 68 + k])) {
+            return 0 - 1;
+        }
+        out[digits + 1 + k] = answer[n - 68 + k];
+        k = k + 1;
+    }
+    out[digits + 65] = byte_of(10);
+    return digits + 66;
+}
+
+// The witness into `witness.new` and renamed over `witness`: 0, or -1.
+fn keep_witness[&f, &t](fs: &f Fs("/var/lib/cancho-front"), text: &t [byte]) -> [fs_write("/var/lib/cancho-front")] int {
+    if fs_write(fs, "/var/lib/cancho-front/witness.new", text) != len(text) {
+        return 0 - 1;
+    }
+    var out = 0 - 1;
+    match fs_rename(fs, "/var/lib/cancho-front/witness.new", "/var/lib/cancho-front/witness") {
+        Done::Ok(z) => {
+            out = 0;
+        }
+        Done::Failed(e) => {
+            out = 0 - 1;
+        }
+    }
+    return out;
+}
+
 fn hex_char(v: int) -> [] int {
     if v < 10 {
         return 48 + v;
@@ -147,7 +264,7 @@ fn hex_char(v: int) -> [] int {
 
 // Is the rule `tag` (after `chain.` in the signer's answer) one of an unwell signer's, not of a bad request?
 fn unwell[&t](tag: &t [byte]) -> [] bool {
-    return bytes.equal(tag, "signer-locked") || bytes.equal(tag, "signer-ledger-write") || bytes.equal(tag, "signer-ledger-corrupt") || bytes.equal(tag, "signer-ledger-full") || bytes.equal(tag, "signer-config") || bytes.equal(tag, "signer-key") || bytes.equal(tag, "signer-same-key");
+    return bytes.equal(tag, "signer-locked") || bytes.equal(tag, "signer-ledger-write") || bytes.equal(tag, "signer-ledger-corrupt") || bytes.equal(tag, "signer-ledger-full") || bytes.equal(tag, "signer-config") || bytes.equal(tag, "signer-key") || bytes.equal(tag, "signer-same-key") || bytes.equal(tag, "signer-anchor-corrupt") || bytes.equal(tag, "signer-anchor-missing") || bytes.equal(tag, "signer-anchor-short") || bytes.equal(tag, "signer-anchor-mismatch") || bytes.equal(tag, "signer-anchor-behind") || bytes.equal(tag, "signer-anchor-write") || bytes.equal(tag, "signer-witness-missing") || bytes.equal(tag, "signer-witness-short") || bytes.equal(tag, "signer-witness-mismatch") || bytes.equal(tag, "signer-witness-behind");
 }
 
 // The rule tag of a refusal `{"ok":false,"rule":"chain.<tag>",...}`: the span of the tag in `answer`, or (0, 0).
@@ -168,7 +285,7 @@ fn rule_of[&a](answer: &a [byte]) -> [] (int, int) {
 }
 
 // Start the signer with `line` on its standard input and answer what it printed.
-fn ask_signer[&h, &k, &x, &l](heap: &!h Heap, clock: &k Clock, exec: &x Exec("/usr/local/lib/cancho-chain/signer"), line: &l [byte], out: buffer.Buffer, keep: bool) -> [heap, clock, exec("/usr/local/lib/cancho-chain/signer"), poll] buffer.Buffer {
+fn ask_signer[&h, &k, &x, &l, &f](heap: &!h Heap, clock: &k Clock, exec: &x Exec("/usr/local/lib/cancho-chain/signer"), fs: &f Fs("/var/lib/cancho-front"), line: &l [byte], out: buffer.Buffer, keep: bool) -> [heap, clock, exec("/usr/local/lib/cancho-chain/signer"), poll, fs_write("/var/lib/cancho-front")] buffer.Buffer {
     match process.channels() {
         process.Channels::Failed(e) => {
             return refusal(heap, out, 502, "front-signer", "the signer could not be started", keep, "");
@@ -226,7 +343,22 @@ fn ask_signer[&h, &k, &x, &l](heap: &!h Heap, clock: &k Clock, exec: &x Exec("/u
                                 status = 503;
                             }
                         }
-                        if status == 502 {
+                        // A signature is given only once its anchor is kept (design section 20.2): the answer must carry one, and it is written before the answer goes on.
+                        var witness_failed = false;
+                        if status == 200 {
+                            region wr {
+                                let wtext = alloc_slice[wr](72, byte_of(0));
+                                let wn = witness_of(text, wtext);
+                                if wn < 0 {
+                                    status = 502;
+                                } else if keep_witness(fs, wtext[0..wn]) != 0 {
+                                    witness_failed = true;
+                                }
+                            }
+                        }
+                        if witness_failed {
+                            result = refusal(heap, result, 503, "front-witness-write", "the witness could not be written, so the signature is not given; check the front's directory and retry the same request", keep, "");
+                        } else if status == 502 {
                             result = refusal(heap, result, 502, "front-signer", "the signer did not answer as it should", keep, "");
                         } else {
                             result = server.reply_as(heap, result, status, "application/json", text[0..len(text) - 1], keep, "");
@@ -241,7 +373,7 @@ fn ask_signer[&h, &k, &x, &l](heap: &!h Heap, clock: &k Clock, exec: &x Exec("/u
 }
 
 // One request in, one response appended to `out`.
-fn handle[&h, &k, &x, &q, &t, &b](heap: &!h Heap, clock: &k Clock, exec: &x Exec("/usr/local/lib/cancho-chain/signer"), request: &q [byte], table: &t [int], body: &b [byte], out: buffer.Buffer) -> [heap, clock, exec("/usr/local/lib/cancho-chain/signer"), poll] buffer.Buffer {
+fn handle[&h, &k, &x, &f, &q, &t, &b](heap: &!h Heap, clock: &k Clock, exec: &x Exec("/usr/local/lib/cancho-chain/signer"), fs: &f Fs("/var/lib/cancho-front"), request: &q [byte], table: &t [int], body: &b [byte], out: buffer.Buffer) -> [heap, clock, exec("/usr/local/lib/cancho-chain/signer"), poll, fs_read("/var/lib/cancho-front"), fs_write("/var/lib/cancho-front"), file_read] buffer.Buffer {
     let keep = http.keeps_alive(table);
     if !bytes.equal(http.path(request, table), "/sign") {
         return refusal(heap, out, 404, "front-not-found", "the only route is POST /sign", keep, "");
@@ -259,7 +391,11 @@ fn handle[&h, &k, &x, &q, &t, &b](heap: &!h Heap, clock: &k Clock, exec: &x Exec
     var answer = out;
     region r {
         let spans = alloc_slice[r](6, 0);
-        if parse_body(body, spans) != 0 {
+        let wbuf = alloc_slice[r](72, byte_of(0));
+        let wn = read_witness(fs, wbuf);
+        if wn == 0 - 2 {
+            answer = refusal(heap, answer, 503, "front-witness", "the witness file is not one line of lower-case hex digits and spaces; restore it from the signer's last answer or remove it for a ledger of at most one entry", keep, "");
+        } else if parse_body(body, spans) != 0 {
             answer = refusal(heap, answer, 400, "front-body", "the body must be exactly the three members envelope, signature and message, in that order, as lower-case hex strings with no whitespace", keep, "");
         } else {
             // The signer's line: envelope, signature, message and the caller in hex.
@@ -276,9 +412,15 @@ fn handle[&h, &k, &x, &q, &t, &b](heap: &!h Heap, clock: &k Clock, exec: &x Exec
                 line = buffer.push(heap, line, byte_of(hex_char(int_of(caller[i]) & 15)));
                 i = i + 1;
             }
+            line = buffer.push(heap, line, byte_of(32));
+            if wn < 0 {
+                line = buffer.push(heap, line, byte_of(45));
+            } else {
+                line = buffer.append(heap, line, wbuf[0..wn]);
+            }
             line = buffer.push(heap, line, byte_of(10));
             borrow line as &lb in {
-                answer = ask_signer(heap, clock, exec, buffer.bytes(lb), answer, keep);
+                answer = ask_signer(heap, clock, exec, fs, buffer.bytes(lb), answer, keep);
             }
             buffer.drop(heap, line);
         }
@@ -286,7 +428,7 @@ fn handle[&h, &k, &x, &q, &t, &b](heap: &!h Heap, clock: &k Clock, exec: &x Exec
     return answer;
 }
 
-fn run[&h, &k, &l, &x](heap: &!h Heap, clock: &k Clock, listener: &!l Listener, exec: &x Exec("/usr/local/lib/cancho-chain/signer")) -> [heap, conn_accept, conn_read, conn_write, poll, clock, exec("/usr/local/lib/cancho-chain/signer")] int {
+fn run[&h, &k, &l, &x, &f](heap: &!h Heap, clock: &k Clock, listener: &!l Listener, exec: &x Exec("/usr/local/lib/cancho-chain/signer"), fs: &f Fs("/var/lib/cancho-front")) -> [heap, conn_accept, conn_read, conn_write, poll, clock, exec("/usr/local/lib/cancho-chain/signer"), fs_read("/var/lib/cancho-front"), fs_write("/var/lib/cancho-front"), file_read] int {
     match poller_new() {
         Polling::Ok(p) => {
             var srv = server.open(heap, p, listener, 16384, 0, 9);
@@ -306,7 +448,7 @@ fn run[&h, &k, &l, &x](heap: &!h Heap, clock: &k Clock, listener: &!l Listener, 
                             buffer.clear(ob);
                         }
                         borrow srv as &sr in {
-                            out = handle(heap, clock, exec, server.head(sr), server.parsed(sr), server.body(sr), out);
+                            out = handle(heap, clock, exec, fs, server.head(sr), server.parsed(sr), server.body(sr), out);
                         }
                         borrow mut srv as &!sw in {
                             borrow out as &ob in {
@@ -328,7 +470,6 @@ fn run[&h, &k, &l, &x](heap: &!h Heap, clock: &k Clock, listener: &!l Listener, 
 
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, out, ports, clock, signals, exec, tty } = split(world);
-    release(fs);
     release(ffi);
     release(args);
     release(signals);
@@ -336,6 +477,7 @@ fn main(world: World) -> [] int {
     release(out);
     release(tty);
     var status = 3;
+    let dir = narrow(fs, "/var/lib/cancho-front");
     let signer = narrow(exec, "/usr/local/lib/cancho-chain/signer");
     let inbound = narrow(ports, "8742");
     borrow inbound as &nn in {
@@ -347,7 +489,9 @@ fn main(world: World) -> [] int {
                     borrow mut heap as &!h in {
                         borrow clock as &c in {
                             borrow signer as &sx in {
-                                status = run(h, c, lh, sx);
+                                borrow dir as &fx in {
+                                    status = run(h, c, lh, sx, fx);
+                                }
                             }
                         }
                     }
@@ -359,6 +503,7 @@ fn main(world: World) -> [] int {
         }
     }
     release(signer);
+    release(dir);
     release(inbound);
     release(clock);
     release(heap);
