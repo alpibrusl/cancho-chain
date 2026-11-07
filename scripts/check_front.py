@@ -267,7 +267,7 @@ def run_checks(sk, rng):
         sk.set_mode("rule=" + tag)
         status, _, out = sk.post(good)
         check(f"a signer that says chain.{tag}: {want}", (status, json.loads(out).get("rule")), (want, "chain." + tag))
-    for mode, name in (("norule", "a refusal with no rule"), ("badexit", "a refusal and an exit status of 3"), ("bigline", "a line over 4,096 bytes")):
+    for mode, name in (("norule", "a refusal with no rule"), ("nobrace", "a refusal that is not closed"), ("tworefusals", "two refusals"), ("badexit", "a refusal and an exit status of 3"), ("bigline", "a line over 4,096 bytes")):
         sk.set_mode(mode)
         status, _, out = sk.post(good)
         check(f"a signer that writes {name}: 502 front-signer", (status, json.loads(out).get("rule")), (502, "chain.front-signer"))
@@ -357,7 +357,7 @@ def run_checks(sk, rng):
     check("a restore of the signer's directory to two entries: 503 signer-witness-short, nothing signed", (status, json.loads(out).get("rule"), b'"signature":' in out, sk.witness()), (503, "chain.signer-witness-short", False, w4))
     # what the front accepts as the signer's 200: it must carry a well-formed anchor
     state.reset(c)
-    for mode, name in (("noanchor", "no anchor"), ("upperhead", "an anchor with an upper-case head"), ("sixdigits", "an anchor with a six-digit count"), ("emptycount", "an anchor with an empty count"), ("countjunk", "an anchor with a letter after the count")):
+    for mode, name in (("noanchor", "no anchor"), ("upperhead", "an anchor with an upper-case head"), ("sixdigits", "an anchor with a six-digit count"), ("emptycount", "an anchor with an empty count"), ("countjunk", "an anchor with a letter after the count"), ("lasthead", "an anchor whose last head digit is not hex")):
         sk.set_mode(mode)
         status, _, out = sk.post(good)
         check(f"a signer whose 200 has {name}: 502 front-signer and no witness", (status, json.loads(out).get("rule"), sk.witness()), (502, "chain.front-signer", None))
@@ -416,8 +416,11 @@ case "$mode" in
   rule=*) printf '{{"ok":false,"rule":"chain.%s","repair":"x"}}\\n' "${{mode#rule=}}"; exit 2;;
   norule) printf '{{"ok":false,"repair":"xxxxxxxxxxxxxxxxxxxx"}}\\n'; exit 2;;
   badexit) printf '{{"ok":false,"rule":"chain.envelope-expired","repair":"x"}}\\n'; exit 3;;
-  bigline) printf '{{"ok":true,"x":"'; head -c 5000 /dev/zero | tr '\\0' 'a'; printf '"}}\\n'; exit 0;;
-  twolines) printf '{{"ok":true,"signature":"00"}}\\n{{"ok":true}}\\n'; exit 0;;
+  bigline) printf '{{"ok":true,"x":"'; head -c 5000 /dev/zero | tr '\\0' 'a'; printf '","anchor":{{"count":1,"head":"%s"}}}}\\n' "$(printf 'a%.0s' $(seq 64))"; exit 0;;
+  twolines) printf '{{"ok":true,"signature":"00"}}\\n{{"ok":true,"signature":"00","entry":"fresh","anchor":{{"count":1,"head":"%s"}}}}\\n' "$(printf 'a%.0s' $(seq 64))"; exit 0;;
+  nobrace) printf '{{"ok":false,"rule":"chain.envelope-expired","repair":"xxxxxxxxxxxx"\\n'; exit 2;;
+  tworefusals) printf '{{"ok":false,"rule":"chain.envelope-expired","repair":"x"}}\\n{{"ok":false,"rule":"chain.envelope-expired","repair":"x"}}\\n'; exit 2;;
+  lasthead) printf '{{"ok":true,"signature":"00","entry":"fresh","anchor":{{"count":1,"head":"%sG"}}}}\\n' "$(printf 'a%.0s' $(seq 63))"; exit 0;;
   hang) sleep 60; exit 0;;
   noanchor) printf '{{"ok":true,"signature":"00","entry":"fresh"}}\n'; exit 0;;
   upperhead) printf '{{"ok":true,"signature":"00","entry":"fresh","anchor":{{"count":1,"head":"%s"}}}}\n' "$(printf 'A%.0s' $(seq 64))"; exit 0;;
@@ -537,6 +540,7 @@ MUTANTS = [
 
 # Mutants no request can tell from the original, each with the reason.
 EQUIVALENT = {
+    "witness_of: a short answer": "a 200 line that holds the anchor's tail and the key before it is at least 107 bytes, so the length bound never decides: for a shorter text `expect` already refuses a negative position",
     "identity_header: none": "with no such header `found` stays -1 whatever `n > 1` says, and `handle` refuses a negative index",
     "hex_run: the closing quote": "the quote that follows each run is checked again by `expect` of the next literal (or of the closing `\"}`), so a run that is not followed by one is refused there",
 }
