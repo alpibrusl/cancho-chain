@@ -194,11 +194,14 @@ def run_checks(sk, rng):
     n0 = sk.starts()
     for name, kw in (("missing", dict(ident_headers=[])), ("twice", dict(ident_headers=["a", "b"])), ("twice, the same", dict(ident_headers=["a", "a"])), ("empty", dict(identity="")),
                      ("upper case", dict(identity="Agent")), ("33 bytes", dict(identity="a" * 33)), ("a space inside", dict(identity="a b")), ("a comma", dict(identity="a,b")),
-                     ("a slash", dict(identity="a/b")), ("non-ascii", dict(identity="café".encode("utf-8")))):
+                     ("a slash", dict(identity="a/b")), ("a brace", dict(identity="a{")), ("a colon", dict(identity="a:")), ("a backquote", dict(identity="a`")), ("an at sign", dict(identity="a@")), ("a bracket", dict(identity="a[")), ("non-ascii", dict(identity="café".encode("utf-8")))):
         status, _, out = sk.post(body, **kw)
         j = json.loads(out)
         check(f"identity {name}: 401 front-no-identity", (status, j.get("rule")), (401, "chain.front-no-identity"))
     check("identity: the signer was never started", sk.starts() - n0, 0)
+    for other in (b"X-Auth-Identity-Extra: z\r\n", b"X-Auth-Identit: z\r\n", b"X-Auth-Identityx: z\r\n", b"Y-Auth-Identity: z\r\n"):
+        status, _, out = sk.post(body, extra=other)
+        check(f"identity: a header named {other.split(b':')[0].decode()} is not the identity", (status, json.loads(out).get("ok")), (200, True))
     status, _, out = sk.post(body, extra=b"x-auth-identity: agent-procurement-01\r\n", ident_headers=[])
     check("identity: the header name in any case is the header", (status, json.loads(out).get("ok")), (200, True))
     for name_ in ("a", "a" * 32, "a.b_c-9"):
@@ -219,7 +222,12 @@ def run_checks(sk, rng):
     for name, b in (("an empty body", b""), ("not JSON", b"hello"), ("a member missing", json.dumps({"envelope": obj["envelope"], "signature": obj["signature"]}, separators=(",", ":")).encode()),
                     ("a member doubled", good[:-1] + b',"message":"00"}'), ("members reordered", reorder), ("whitespace", json.dumps(obj).encode()), ("a newline at the end", good + b"\n"),
                     ("trailing bytes", good + b" "), ("an upper-case digit", spell(message=obj["message"][:-1].replace("a", "b") + "A")), ("an odd length", spell(message=obj["message"][:-1])),
-                    ("a non-hex digit", spell(message=obj["message"][:-2] + "zz")), ("an empty message", spell(message="")), ("a short signature", spell(signature=obj["signature"][:-2])),
+                    ("a non-hex digit", spell(message=obj["message"][:-2] + "zz")),
+                    ("a g among the digits", spell(message=obj["message"][:-2] + "0g")), ("a backquote among the digits", spell(message=obj["message"][:-2] + "0`")),
+                    ("a slash among the digits", spell(message="/0" + obj["message"][2:])), ("a colon among the digits", spell(message=":0" + obj["message"][2:])),
+                    ("an empty envelope", spell(envelope="")), ("the envelope member misspelt", good.replace(b'"envelope"', b'"envelopx"')),
+                    ("the signature member misspelt", good.replace(b'"signature"', b'"signaturx"')), ("the message member misspelt", good.replace(b'"message"', b'"messagx"')),
+                    ("the object closed with a bracket", good[:-1] + b"]"), ("a different opening", b"[" + good[1:]), ("an empty message", spell(message="")), ("a short signature", spell(signature=obj["signature"][:-2])),
                     ("a long signature", spell(signature=obj["signature"] + "00")), ("an envelope of 654 digits", spell(envelope="00" * 327)), ("a message of 2,050 digits", spell(message="00" * 1025)),
                     ("an extra member", good[:-1] + b',"x":"00"}'), ("a number for a member", b'{"envelope":1,"signature":2,"message":3}'), ("an escaped digit", spell(message="\\u0030" + obj["message"][2:]).replace(b"\\\\u", b"\\u"))):
         status, _, out = sk.post(b)
@@ -243,6 +251,15 @@ def run_checks(sk, rng):
         sk.set_mode(mode)
         status, _, out = sk.post(good)
         check(f"a signer that {name}: 502 front-signer", (status, json.loads(out).get("rule")), (502, "chain.front-signer"))
+    for tag, want in (("signer-locked", 503), ("signer-ledger-write", 503), ("signer-ledger-corrupt", 503), ("signer-ledger-full", 503), ("signer-config", 503), ("signer-key", 503), ("signer-same-key", 503),
+                      ("envelope-expired", 422), ("signer-request", 422), ("envelope-replayed", 422)):
+        sk.set_mode("rule=" + tag)
+        status, _, out = sk.post(good)
+        check(f"a signer that says chain.{tag}: {want}", (status, json.loads(out).get("rule")), (want, "chain." + tag))
+    for mode, name in (("norule", "a refusal with no rule"), ("badexit", "a refusal and an exit status of 3"), ("bigline", "a line over 4,096 bytes")):
+        sk.set_mode(mode)
+        status, _, out = sk.post(good)
+        check(f"a signer that writes {name}: 502 front-signer", (status, json.loads(out).get("rule")), (502, "chain.front-signer"))
     sk.set_mode("ok")
     t0 = time.time()
     sk.set_mode("hang")
@@ -297,6 +314,10 @@ case "$mode" in
   silent) exit 0;;
   flood) head -c 100000 /dev/zero | tr '\\0' 'a'; exit 0;;
   badjson) echo hello; exit 0;;
+  rule=*) printf '{{"ok":false,"rule":"chain.%s","repair":"x"}}\\n' "${{mode#rule=}}"; exit 2;;
+  norule) printf '{{"ok":false,"repair":"xxxxxxxxxxxxxxxxxxxx"}}\\n'; exit 2;;
+  badexit) printf '{{"ok":false,"rule":"chain.envelope-expired","repair":"x"}}\\n'; exit 3;;
+  bigline) printf '{{"ok":true,"x":"'; head -c 5000 /dev/zero | tr '\\0' 'a'; printf '"}}\\n'; exit 0;;
   twolines) printf '{{"ok":true,"signature":"00"}}\\n{{"ok":true}}\\n'; exit 0;;
   hang) sleep 60; exit 0;;
 esac
@@ -373,7 +394,10 @@ MUTANTS = [
 ]
 
 # Mutants no request can tell from the original, each with the reason.
-EQUIVALENT = {}
+EQUIVALENT = {
+    "identity_header: none": "with no such header `found` stays -1 whatever `n > 1` says, and `handle` refuses a negative index",
+    "hex_run: the closing quote": "the quote that follows each run is checked again by `expect` of the next literal (or of the closing `\"}`), so a run that is not followed by one is refused there",
+}
 
 
 def mutants(cancho):
