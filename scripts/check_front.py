@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""The front, with the real signer behind it (docs/design.md section 15.3).
+
+    CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages CANCHO_SCHEMA=../alpibrusl/cancho-schema/src/schema.cho CANCHO_LOG=../cancho-log/src \
+        python3 -I scripts/check_front.py [--mutants]
+    needs what check_signer.py needs
+
+The front is built with a test port and the path of a wrapper script in place of the signer's: the wrapper counts how often it is started and, for the failure tests, crashes, hangs,
+says nothing or floods; otherwise it is the real signer built for a test directory. Requests are written on a socket by hand, so that a header can be doubled or a body malformed.
+"""
+import concurrent.futures, json, os, random, shutil, socket, stat, subprocess, sys, tempfile, threading, time
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+import check_envelope as ce
+import check_signer as cs
+
+PKGS = cs.PKGS
+FRONT_PATH = "/usr/local/lib/cancho-chain/signer"
+FRONT_PORT = "8742"
+FAILS, COUNT = cs.FAILS, cs.COUNT
+check = cs.check
+
+
+def front_sources(libdir):
+    return [os.path.join(PKGS, "http-server", "server.cho")]
+
+
+def build_front(cancho, text, port, signer_path, out):
+    with tempfile.TemporaryDirectory() as t:
+        m = os.path.join(t, "main.cho")
+        open(m, "w").write(text.replace(FRONT_PATH, signer_path).replace(FRONT_PORT, str(port)))
+        r = subprocess.run([cancho, "build", "--std", m, *front_sources(None), "-o", out], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit("front build failed:\n" + r.stderr[:1500])
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+class Stack:
+    """The front on a port, the wrapper that counts the signer's starts, and the signer's state directory."""
+
+    def __init__(self, tmp, front_exe, signer_exe, state, port):
+        self.tmp, self.port = tmp, port
+        self.count = os.path.join(tmp, "count")
+        self.mode = os.path.join(tmp, "mode")
+        self.wrapper = os.path.join(tmp, "signer")
+        self.state = cs.State(state, signer_exe)
+        self.proc = subprocess.Popen([front_exe], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for _ in range(100):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise SystemExit("the front did not start")
+
+    def starts(self):
+        return open(self.count).read().count("x") if os.path.exists(self.count) else 0
+
+    def set_mode(self, mode):
+        open(self.mode, "w").write(mode)
+
+    def stop(self):
+        self.proc.kill()
+        self.proc.wait()
+
+    def request(self, raw, timeout=30):
+        """raw bytes on a fresh connection; the first response read whole: (status, headers dict (lower-case), body)."""
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=timeout)
+        try:
+            s.sendall(raw)
+            return read_response(s)
+        finally:
+            s.close()
+
+    def post(self, body, identity="agent-procurement-01", extra=b"", path=b"/sign", method=b"POST", ident_headers=None):
+        hdr = b""
+        for v in ([identity] if ident_headers is None else ident_headers):
+            if v is not None:
+                hdr += b"X-Auth-Identity: " + (v.encode() if isinstance(v, str) else v) + b"\r\n"
+        raw = method + b" " + path + b" HTTP/1.1\r\nHost: front\r\n" + hdr + extra + b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+        return self.request(raw)
+
+
+def read_response(s):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    head, _, rest = data.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split()[1])
+    headers = {}
+    for l in lines[1:]:
+        k, _, v = l.partition(b":")
+        headers[k.strip().lower().decode()] = v.strip().decode()
+    n = int(headers.get("content-length", "0"))
+    while len(rest) < n:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        rest += chunk
+    return status, headers, rest[:n]
+
+
+def sign_body(c, env=None, sig=None, msg=None):
+    e = c.env if env is None else env
+    s = sig if sig is not None else ce.sign(ce.env_digest(e), c.issuer_key)
+    m = c.tx.unsigned() if msg is None else msg
+    return json.dumps({"envelope": e.hex(), "signature": s.hex(), "message": m.hex()}, separators=(",", ":")).encode()
+
+
+def run_checks(sk, rng):
+    state = sk.state
+    # (1) a valid request: 200 and the signer's line, byte for byte what the signer says to the same line
+    for i in range(4):
+        c = cs.live_case(rng)
+        c.caller = b"agent-procurement-01"
+        c.decision = ce.decision_record(c.decision[4:36], c.decision[36:68], c.decided, c.expires, c.tx.amount, c.caller)
+        c.env = ce.layout(c)
+        state.reset(c)
+        n0 = sk.starts()
+        status, h, body = sk.post(sign_body(c))
+        check(f"valid {i}: 200, JSON, and the signer started once", (status, h.get("content-type"), sk.starts() - n0), (200, "application/json", 1))
+        j = json.loads(body)
+        tdigest = ce.kec(c.tx.unsigned())
+        check(f"valid {i}: the signature is the model's", bytes.fromhex(j.get("signature", "")), ce.sign(tdigest, c.wallet_key))
+        check(f"valid {i}: the entry is fresh", j.get("entry"), "fresh")
+        # the same request again: the same bytes, "same"
+        status2, _, body2 = sk.post(sign_body(c))
+        j2 = json.loads(body2)
+        check(f"valid {i}: a retry is 200 with the same signature", (status2, j2.get("signature"), j2.get("entry")), (200, j["signature"], "same"))
+        # and what the signer itself says to this line
+        direct = state.run(c)
+        check(f"valid {i}: the answer is the signer's line as it is", body2, direct[2].encode())
+    # (2) the signer's refusals arrive with their tags and status
+    c = cs.live_case(rng)
+    c.caller = b"agent-procurement-01"
+    c.decision = ce.decision_record(c.decision[4:36], c.decision[36:68], c.decided, c.expires, c.tx.amount, c.caller)
+    c.env = ce.layout(c)
+    other_key = (rng.randrange(1, ce.N)).to_bytes(32, "big")
+    for name, kw, tag in (("another issuer", dict(sig=ce.sign(ce.env_digest(c.env), other_key)), "envelope-issuer"), ("a truncated envelope", dict(env=c.env[:-1]), "envelope-format"),
+                          ("another transaction", dict(msg=c.tx.unsigned()[:-1] + bytes([c.tx.unsigned()[-1] ^ 1])), "envelope-digest")):
+        state.reset(c)
+        body = sign_body(c, **kw) if "env" not in kw else sign_body(c, env=kw["env"], sig=ce.sign(ce.env_digest(c.env), c.issuer_key))
+        status, _, out = sk.post(body)
+        j = json.loads(out)
+        check(f"refusal {name}: 422 and chain.{tag}", (status, j.get("rule"), j.get("ok")), (422, "chain." + tag, False))
+    state.reset(c)
+    status, _, out = sk.post(sign_body(c), identity="someone-else")
+    check("a caller the envelope was not issued to is 422 envelope-caller", (status, json.loads(out).get("rule")), (422, "chain.envelope-caller"))
+    # an unwell signer is 503, with the signer's own line
+    state.reset(c)
+    os.symlink("/dev/full", state.ledger())
+    status, _, out = sk.post(sign_body(c))
+    check("a ledger that cannot be written is 503 signer-ledger-write", (status, json.loads(out).get("rule")), (503, "chain.signer-ledger-write"))
+    state.reset(c)
+    open(state.ledger(), "wb").close()
+    import fcntl
+    fd = os.open(state.ledger(), os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    status, _, out = sk.post(sign_body(c))
+    check("a ledger held locked is 503 signer-locked", (status, json.loads(out).get("rule")), (503, "chain.signer-locked"))
+    os.close(fd)
+    state.reset(c)
+    open(os.path.join(state.dir, "wallet.key"), "w").write("zz")
+    status, _, out = sk.post(sign_body(c))
+    check("a bad wallet.key is 503 signer-key", (status, json.loads(out).get("rule")), (503, "chain.signer-key"))
+    state.reset(c)
+    open(os.path.join(state.dir, "signer.conf"), "w").write(f"issuer={c.wallet.hex()}\nchain={c.tx.chain}\n")
+    status, _, out = sk.post(sign_body(c))
+    check("an issuer that is the wallet is 503 signer-same-key", (status, json.loads(out).get("rule")), (503, "chain.signer-same-key"))
+    state.reset(c)
+    sk.post(sign_body(c))
+    raw = open(state.ledger(), "rb").read()
+    open(state.ledger(), "wb").write(raw[:60] + bytes([raw[60] ^ 1]) + raw[61:])
+    status, _, out = sk.post(sign_body(c))
+    check("a damaged ledger is 503 signer-ledger-corrupt", (status, json.loads(out).get("rule")), (503, "chain.signer-ledger-corrupt"))
+    state.reset(c, conf=False)
+    status, _, out = sk.post(sign_body(c))
+    check("no signer.conf is 503 signer-config", (status, json.loads(out).get("rule")), (503, "chain.signer-config"))
+    # (3) the identity: exactly one valid header, or the signer is never started
+    state.reset(c)
+    body = sign_body(c)
+    n0 = sk.starts()
+    for name, kw in (("missing", dict(ident_headers=[])), ("twice", dict(ident_headers=["a", "b"])), ("twice, the same", dict(ident_headers=["a", "a"])), ("empty", dict(identity="")),
+                     ("upper case", dict(identity="Agent")), ("33 bytes", dict(identity="a" * 33)), ("a space inside", dict(identity="a b")), ("a comma", dict(identity="a,b")),
+                     ("a slash", dict(identity="a/b")), ("non-ascii", dict(identity="café".encode("utf-8")))):
+        status, _, out = sk.post(body, **kw)
+        j = json.loads(out)
+        check(f"identity {name}: 401 front-no-identity", (status, j.get("rule")), (401, "chain.front-no-identity"))
+    check("identity: the signer was never started", sk.starts() - n0, 0)
+    status, _, out = sk.post(body, extra=b"x-auth-identity: agent-procurement-01\r\n", ident_headers=[])
+    check("identity: the header name in any case is the header", (status, json.loads(out).get("ok")), (200, True))
+    for name_ in ("a", "a" * 32, "a.b_c-9"):
+        c3 = cs.live_case(rng)
+        c3.caller = name_.encode()
+        c3.decision = ce.decision_record(c3.decision[4:36], c3.decision[36:68], c3.decided, c3.expires, c3.tx.amount, c3.caller)
+        c3.env = ce.layout(c3)
+        state.reset(c3)
+        status, _, out = sk.post(sign_body(c3), identity=name_)
+        check(f"identity: the name {name_!r} is within the rule", (status, json.loads(out).get("ok")), (200, True))
+    state.reset(c)
+    # (4) the body: exactly three members, or the signer is never started
+    good = sign_body(c)
+    obj = json.loads(good)
+    spell = lambda **kw: json.dumps({**obj, **kw}, separators=(",", ":")).encode()
+    reorder = json.dumps({"signature": obj["signature"], "envelope": obj["envelope"], "message": obj["message"]}, separators=(",", ":")).encode()
+    n0 = sk.starts()
+    for name, b in (("an empty body", b""), ("not JSON", b"hello"), ("a member missing", json.dumps({"envelope": obj["envelope"], "signature": obj["signature"]}, separators=(",", ":")).encode()),
+                    ("a member doubled", good[:-1] + b',"message":"00"}'), ("members reordered", reorder), ("whitespace", json.dumps(obj).encode()), ("a newline at the end", good + b"\n"),
+                    ("trailing bytes", good + b" "), ("an upper-case digit", spell(message=obj["message"][:-1].replace("a", "b") + "A")), ("an odd length", spell(message=obj["message"][:-1])),
+                    ("a non-hex digit", spell(message=obj["message"][:-2] + "zz")), ("an empty message", spell(message="")), ("a short signature", spell(signature=obj["signature"][:-2])),
+                    ("a long signature", spell(signature=obj["signature"] + "00")), ("an envelope of 654 digits", spell(envelope="00" * 327)), ("a message of 2,050 digits", spell(message="00" * 1025)),
+                    ("an extra member", good[:-1] + b',"x":"00"}'), ("a number for a member", b'{"envelope":1,"signature":2,"message":3}'), ("an escaped digit", spell(message="\\u0030" + obj["message"][2:]).replace(b"\\\\u", b"\\u"))):
+        status, _, out = sk.post(b)
+        check(f"body {name}: 400 front-body", (status, (json.loads(out).get("rule") if out[:1] == b"{" else None)), (400, "chain.front-body"))
+    status, _, out = sk.post(b"x" * 4097)
+    check("body: 4,097 bytes is 413", status, 413)
+    check("body: the signer was never started", sk.starts() - n0, 0)
+    # (5) routes and methods
+    status, h, out = sk.post(good, path=b"/other")
+    check("another path is 404", (status, json.loads(out).get("rule")), (404, "chain.front-not-found"))
+    status, h, out = sk.post(good, path=b"/sign/")
+    check("a path with a slash is 404", status, 404)
+    status, h, out = sk.post(good, path=b"/sign?x=1")
+    check("a query on /sign is the route /sign (not 404)", status in (200, 422), True)
+    for m in (b"GET", b"PUT", b"DELETE", b"PATCH"):
+        status, h, out = sk.post(b"" if m == b"GET" else good, method=m)
+        check(f"{m.decode()} /sign is 405 with Allow: POST", (status, h.get("allow"), json.loads(out).get("rule")), (405, "POST", "chain.front-method"))
+    # (6) a signer that fails is 502, in each way it can
+    for mode, name in (("crash", "crashes"), ("silent", "says nothing"), ("flood", "floods its output"), ("badjson", "writes a line that is not the signer's"), ("twolines", "writes two lines")):
+        state.reset(c)
+        sk.set_mode(mode)
+        status, _, out = sk.post(good)
+        check(f"a signer that {name}: 502 front-signer", (status, json.loads(out).get("rule")), (502, "chain.front-signer"))
+    sk.set_mode("ok")
+    t0 = time.time()
+    sk.set_mode("hang")
+    status, _, out = sk.post(good)
+    took = time.time() - t0
+    check("a signer that hangs: 502 after about 10 seconds", (status, 9 < took < 20), (502, True))
+    sk.set_mode("ok")
+    status, _, out = sk.post(good)
+    check("and the front serves the next request", status in (200, 422), True)
+    # (7) one connection, two requests; two connections at once
+    state.reset(c)
+    s = socket.create_connection(("127.0.0.1", sk.port), timeout=30)
+    raw = b"POST /sign HTTP/1.1\r\nHost: front\r\nX-Auth-Identity: agent-procurement-01\r\nContent-Length: " + str(len(good)).encode() + b"\r\n\r\n" + good
+    s.sendall(raw)
+    r1 = read_response(s)
+    s.sendall(raw)
+    r2 = read_response(s)
+    s.close()
+    check("keep-alive: two requests on one connection", (r1[0], r2[0], json.loads(r2[2]).get("entry")), (200, 200, "same"))
+    state.reset(c)
+    results = []
+
+    def go():
+        results.append(sk.post(good))
+    ts = [threading.Thread(target=go) for _ in range(6)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    check("six clients at once: all 200 with one signature, one ledger entry", (sorted(r[0] for r in results), len({json.loads(r[2])["signature"] for r in results}), len(cs.read_events(state.ledger()))), ([200] * 6, 1, 1))
+    # (8) the authority of the front
+    r = subprocess.run([cancho_path(), "authority", "--std", os.path.join(ROOT, "tools/front/main.cho"), *front_sources(None)], capture_output=True, text=True)
+    perf = r.stdout.split("performs")[1].split("never touches")[0].split()
+    check("authority: performs exactly these", perf, ["child_signal", "clock", "conn_accept", "conn_read", "conn_write", f'exec("{FRONT_PATH}")', "heap", f'net_in("{FRONT_PORT}")', "pipe_read", "pipe_write", "poll"])
+    check("authority: never touches the console, the filesystem, the command line, signals or foreign code", all(w in r.stdout.split("never touches")[1] for w in ("the console", "the filesystem", "the command line", "signals", "foreign code")), True)
+    check("authority: it is bounded (no UNBOUNDED line)", "UNBOUNDED" not in r.stdout, True)
+
+
+def cancho_path():
+    return os.environ.get("CANCHO", "cancho")
+
+
+def make_stack(cancho, front_text, signer_main_text, libdir, tmp, port):
+    state = os.path.join(tmp, "state")
+    os.makedirs(state, exist_ok=True)
+    real = os.path.join(tmp, "signer-real")
+    cs.build(cancho, libdir, signer_main_text, state, real)
+    wrapper = os.path.join(tmp, "signer")
+    open(wrapper, "w").write(f"""#!/bin/sh
+echo x >> {tmp}/count
+mode=$(cat {tmp}/mode 2>/dev/null)
+case "$mode" in
+  crash) exit 9;;
+  silent) exit 0;;
+  flood) head -c 100000 /dev/zero | tr '\\0' 'a'; exit 0;;
+  badjson) echo hello; exit 0;;
+  twolines) printf '{{"ok":true,"signature":"00"}}\\n{{"ok":true}}\\n'; exit 0;;
+  hang) sleep 60; exit 0;;
+esac
+exec {real}
+""")
+    os.chmod(wrapper, os.stat(wrapper).st_mode | stat.S_IEXEC)
+    front = os.path.join(tmp, "front")
+    build_front(cancho, front_text, port, wrapper, front)
+    return Stack(tmp, front, real, state, port)
+
+
+MUTANTS = [
+    ("is_lower_hex: the top of a-f", "fn is_lower_hex(c: int) -> [] bool {\n    return c >= 48 && c <= 57 || c >= 97 && c <= 102;", "fn is_lower_hex(c: int) -> [] bool {\n    return c >= 48 && c <= 57 || c >= 97 && c <= 103;"),
+    ("is_lower_hex: upper case", "fn is_lower_hex(c: int) -> [] bool {\n    return c >= 48 && c <= 57 || c >= 97 && c <= 102;", "fn is_lower_hex(c: int) -> [] bool {\n    return c >= 48 && c <= 57 || c >= 97 && c <= 102 || c >= 65 && c <= 70;"),
+    ("is_lower_hex: below 0", "fn is_lower_hex(c: int) -> [] bool {\n    return c >= 48 && c <= 57 || c >= 97 && c <= 102;", "fn is_lower_hex(c: int) -> [] bool {\n    return c >= 47 && c <= 57 || c >= 97 && c <= 102;"),
+    ("expect: a literal that runs past the body", "if at < 0 || len(body) - at < len(lit) {", "if at < 0 {"),
+    ("expect: the literal is compared", "if int_of(body[at + i]) != int_of(lit[i]) {", "if int_of(body[at + i]) == 1000 {"),
+    ("hex_run: odd length", "if n % 2 != 0 || n < least", "if n < least"),
+    ("hex_run: least", "|| n < least || n > most", "|| n < least - 2 || n > most"),
+    ("hex_run: most", "|| n < least || n > most", "|| n < least || n > most + 2"),
+    ("hex_run: the closing quote", "|| i >= len(body) || int_of(body[i]) != 34 {", "|| i >= len(body) {"),
+    ("parse_body: envelope bound", "at = hex_run(body, at, 2, 652);", "at = hex_run(body, at, 2, 654);"),
+    ("parse_body: envelope least", "at = hex_run(body, at, 2, 652);", "at = hex_run(body, at, 0, 652);"),
+    ("parse_body: signature length", "at = hex_run(body, at, 130, 130);", "at = hex_run(body, at, 128, 130);"),
+    ("parse_body: signature length, above", "at = hex_run(body, at, 130, 130);", "at = hex_run(body, at, 130, 132);"),
+    ("parse_body: message bound", "at = hex_run(body, at, 2, 2048);", "at = hex_run(body, at, 2, 2050);"),
+    ("parse_body: message least", "at = hex_run(body, at, 2, 2048);", "at = hex_run(body, at, 0, 2048);"),
+    ("parse_body: the end", "if at != len(body) {\n        return 0 - 1;\n    }\n    return 0;\n}\n\n// The identity", "if at < 0 {\n        return 0 - 1;\n    }\n    return 0;\n}\n\n// The identity"),
+    ("parse_body: the member name", "at = expect(body, at, \"\\\",\\\"signature\\\":\\\"\");", "at = expect(body, at, \"\\\",\\\"signatur\\\":\\\"\");"),
+    ("identity_ok: length 33", "if len(value) < 1 || len(value) > 32 {", "if len(value) < 1 || len(value) > 33 {"),
+    ("identity_ok: length 0", "if len(value) < 1 || len(value) > 32 {", "if len(value) < 0 || len(value) > 32 {"),
+    ("identity_ok: the top of a-z", "c >= 97 && c <= 122 ||", "c >= 97 && c <= 123 ||"),
+    ("identity_ok: upper case", "c >= 97 && c <= 122 ||", "c >= 65 && c <= 122 ||"),
+    ("identity_ok: a digit", "c >= 48 && c <= 57 || c == 46", "c >= 48 && c <= 58 || c == 46"),
+    ("identity_ok: a dot", "|| c == 46 || c == 95 || c == 45", "|| c == 95 || c == 45"),
+    ("identity_ok: an underscore", "|| c == 46 || c == 95 || c == 45", "|| c == 46 || c == 45"),
+    ("identity_ok: a hyphen", "|| c == 46 || c == 95 || c == 45", "|| c == 46 || c == 95"),
+    ("identity_header: more than one", "if n != 1 {\n        return 0 - 1;", "if n < 1 {\n        return 0 - 1;"),
+    ("identity_header: none", "if n != 1 {\n        return 0 - 1;", "if n > 1 {\n        return 0 - 1;"),
+    ("identity_header: the name", "\"x-auth-identity\") {\n            found = i;", "\"x-auth-identit\") {\n            found = i;"),
+    ("is_name: the length", "if len(name) != len(want) {\n        return false;", "if len(name) < len(want) {\n        return false;"),
+    ("is_name: case", "if bytes.to_lower(int_of(name[i])) != int_of(want[i]) {", "if int_of(name[i]) != int_of(want[i]) {"),
+    ("handle: the path", "if !bytes.equal(http.path(request, table), \"/sign\") {", "if bytes.equal(http.path(request, table), \"/nothing\") {"),
+    ("handle: the method", "if !bytes.equal(http.method(request, table), \"POST\") {", "if bytes.equal(http.method(request, table), \"GET\") {"),
+    ("handle: the identity is valid", "if at < 0 || !identity_ok(http.header_value(request, table, at)) {", "if at < 0 {"),
+    ("handle: body size", "if len(body) > 4096 {", "if len(body) > 4100 {"),
+    ("handle: the identity is the caller", "let caller = http.header_value(request, table, at);", "let caller = \"agent\";"),
+    ("handle: the caller is hex", "line = buffer.push(heap, line, byte_of(hex_char(int_of(caller[i]) >> 4)));", "line = buffer.push(heap, line, byte_of(hex_char(int_of(caller[i]) >> 3)));"),
+    ("handle: the caller's low digit", "line = buffer.push(heap, line, byte_of(hex_char(int_of(caller[i]) & 15)));", "line = buffer.push(heap, line, byte_of(hex_char(int_of(caller[i]) & 7)));"),
+    ("handle: the fields are in order", "line = buffer.append(heap, line, body[spans[2]..spans[3]]);", "line = buffer.append(heap, line, body[spans[4]..spans[5]]);"),
+    ("hex_char: letters", "return 87 + v;", "return 88 + v;"),
+    ("ask_signer: exit 0 is ok", "if n == 0 {\n                                status = 200;", "if n == 1 {\n                                status = 200;"),
+    ("ask_signer: exit 2 is a refusal", "} else if n == 2 {\n                                status = 422;", "} else if n == 3 {\n                                status = 422;"),
+    ("ask_signer: any other exit", "} else if n == 2 {\n                                status = 422;\n                            }", "} else {\n                                status = 422;\n                            }"),
+    ("ask_signer: one line", "let shaped = len(text) > 20 && lines == 1 &&", "let shaped = len(text) > 20 &&"),
+    ("ask_signer: a closing brace", "&& int_of(text[len(text) - 2]) == 125;", "&& int_of(text[len(text) - 2]) == 125 || true;"),
+    ("ask_signer: an ok line is ok", "if status == 200 && expect(text, 0, \"{\\\"ok\\\":true,\") < 0 {", "if status == 200 && expect(text, 0, \"{\\\"ok\\\":false,\") < 0 {"),
+    ("ask_signer: no rule is 502", "if span.1 == 0 {\n                                status = 502;", "if span.1 == 99999 {\n                                status = 502;"),
+    ("ask_signer: the output bound", "line, 4096, 10000);", "line, 4096000, 10000);"),
+    ("ask_signer: the deadline", "line, 4096, 10000);", "line, 4096, 60000);"),
+    ("unwell: signer-locked", "bytes.equal(tag, \"signer-locked\") ||", "bytes.equal(tag, \"signer-lockd\") ||"),
+    ("unwell: signer-ledger-write", "bytes.equal(tag, \"signer-ledger-write\") ||", "bytes.equal(tag, \"signer-ledger-writ\") ||"),
+    ("unwell: signer-ledger-corrupt", "bytes.equal(tag, \"signer-ledger-corrupt\") ||", "bytes.equal(tag, \"signer-ledger-corrup\") ||"),
+    ("unwell: signer-ledger-full", "bytes.equal(tag, \"signer-ledger-full\") ||", "bytes.equal(tag, \"signer-ledger-ful\") ||"),
+    ("unwell: signer-config", "bytes.equal(tag, \"signer-config\") ||", "bytes.equal(tag, \"signer-confi\") ||"),
+    ("unwell: signer-key", "bytes.equal(tag, \"signer-key\") ||", "bytes.equal(tag, \"signer-ke\") ||"),
+    ("unwell: signer-same-key", "|| bytes.equal(tag, \"signer-same-key\");", "|| bytes.equal(tag, \"signer-same-ke\");"),
+    ("rule_of: the prefix", "let head = \"{\\\"ok\\\":false,\\\"rule\\\":\\\"chain.\";", "let head = \"{\\\"ok\\\":false,\\\"rule\\\":\\\"chai.\";"),
+    ("refusal: the allow header", "keep, \"Allow: POST\\r\\n\");", "keep, \"\");"),
+    ("refusal: 404", "refusal(heap, out, 404,", "refusal(heap, out, 400,"),
+    ("refusal: 405", "refusal(heap, out, 405,", "refusal(heap, out, 404,"),
+    ("refusal: 401", "refusal(heap, out, 401,", "refusal(heap, out, 403,"),
+    ("refusal: 413", "refusal(heap, out, 413,", "refusal(heap, out, 400,"),
+]
+
+# Mutants no request can tell from the original, each with the reason.
+EQUIVALENT = {}
+
+
+def mutants(cancho):
+    text = open(os.path.join(ROOT, "tools/front/main.cho")).read()
+    work = []
+    for name, old, new in MUTANTS:
+        if text.count(old) != 1:
+            sys.exit(f"mutant {name!r}: the pattern occurs {text.count(old)} times")
+        work.append((name, text.replace(old, new)))
+
+    def one(item):
+        name, body = item
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "mutant.cho")
+            open(path, "w").write(body)
+            env = dict(os.environ, FRONT_MAIN=path)
+            r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__)], capture_output=True, text=True, env=env, timeout=3000)
+            if "build failed" in r.stdout + r.stderr:
+                return name, "did not build: " + (r.stdout + r.stderr)[-200:]
+            return name, ("killed" if r.returncode != 0 else "SURVIVED")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    survivors, broken = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=int(os.environ.get("JOBS", "4"))) as pool:
+        for name, verdict in pool.map(one, work):
+            if verdict == "SURVIVED":
+                survivors.append(name)
+                print("SURVIVED:", name, flush=True)
+            elif verdict != "killed":
+                broken.append(name)
+                print(f"INVALID: {name}: {verdict}", flush=True)
+    unexplained = [n for n in survivors if n not in EQUIVALENT]
+    print(f"mutants: {len(work) - len(survivors) - len(broken)}/{len(work)} killed, {len(survivors) - len(unexplained)} explained, {len(unexplained)} unexplained survivors, {len(broken)} invalid")
+    sys.exit(1 if unexplained or broken else 0)
+
+
+def main():
+    cancho = cancho_path()
+    if "--mutants" in sys.argv:
+        mutants(cancho)
+    with tempfile.TemporaryDirectory() as tmp:
+        front_file = os.environ.get("FRONT_MAIN", os.path.join(ROOT, "tools/front/main.cho"))
+        sk = make_stack(cancho, open(front_file).read(), open(os.path.join(ROOT, "tools/signer/main.cho")).read(), os.path.join(ROOT, "lib"), tmp, free_port())
+        try:
+            run_checks(sk, random.Random(4242))
+        finally:
+            sk.stop()
+    print(f"{COUNT[0]} checks, {len(FAILS)} failed")
+    sys.exit(1 if FAILS else 0)
+
+
+if __name__ == "__main__":
+    main()
