@@ -1,0 +1,381 @@
+edition 7;
+
+module chain.lifecycle;
+
+// The lifecycle of a signed transaction (docs/design.md section 17): a pure function of the record last kept and what the providers now say. The record is 74 bytes, canonical:
+// [0] 1  [1] state  [2..10] nonce  [10..18] sent_at  [18..26] changed_at  [26..34] consumed_at  [34..42] block  [42..74] block hash. All integers big-endian.
+
+pub fn record_len() -> [] int {
+    return 74;
+}
+
+pub fn signed() -> [] int {
+    return 1;
+}
+
+pub fn submitted() -> [] int {
+    return 2;
+}
+
+pub fn uncertain() -> [] int {
+    return 3;
+}
+
+pub fn included() -> [] int {
+    return 4;
+}
+
+pub fn reverted() -> [] int {
+    return 5;
+}
+
+pub fn final_ok() -> [] int {
+    return 6;
+}
+
+pub fn final_failed() -> [] int {
+    return 7;
+}
+
+pub fn replaced() -> [] int {
+    return 8;
+}
+
+pub fn dropped() -> [] int {
+    return 9;
+}
+
+// `observe`'s answers besides a refusal.
+pub fn nothing() -> [] int {
+    return 0;
+}
+
+pub fn submit() -> [] int {
+    return 1;
+}
+
+pub fn resubmit() -> [] int {
+    return 2;
+}
+
+pub fn refused_record() -> [] int {
+    return -320;
+}
+
+pub fn refused_observation() -> [] int {
+    return -321;
+}
+
+pub fn refused_state() -> [] int {
+    return -322;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -320 {
+        return "lifecycle-record";
+    }
+    if code == -321 {
+        return "lifecycle-observation";
+    }
+    if code == -322 {
+        return "lifecycle-state";
+    }
+    return "lifecycle-unknown";
+}
+
+pub fn state_name(s: int) -> [] &static [byte] {
+    if s == 1 {
+        return "signed";
+    }
+    if s == 2 {
+        return "submitted";
+    }
+    if s == 3 {
+        return "uncertain";
+    }
+    if s == 4 {
+        return "included";
+    }
+    if s == 5 {
+        return "reverted";
+    }
+    if s == 6 {
+        return "final";
+    }
+    if s == 7 {
+        return "failed-final";
+    }
+    if s == 8 {
+        return "replaced";
+    }
+    if s == 9 {
+        return "dropped";
+    }
+    return "unknown";
+}
+
+fn put_be8[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    var i = 0;
+    while i < 8 {
+        out[at + i] = byte_of(v >> 8 * (7 - i) & 255);
+        i = i + 1;
+    }
+    return at + 8;
+}
+
+fn be8[&c](c: &c [byte], at: int) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < 8 {
+        v = v * 256 + int_of(c[at + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn state[&r](rec: &r [byte]) -> [] int {
+    return int_of(rec[1]);
+}
+
+pub fn nonce[&r](rec: &r [byte]) -> [] int {
+    return be8(rec, 2);
+}
+
+pub fn sent_at[&r](rec: &r [byte]) -> [] int {
+    return be8(rec, 10);
+}
+
+pub fn changed_at[&r](rec: &r [byte]) -> [] int {
+    return be8(rec, 18);
+}
+
+pub fn consumed_at[&r](rec: &r [byte]) -> [] int {
+    return be8(rec, 26);
+}
+
+pub fn block[&r](rec: &r [byte]) -> [] int {
+    return be8(rec, 34);
+}
+
+// Is this state one that has left no way back?
+pub fn is_terminal(s: int) -> [] bool {
+    return s == 6 || s == 7 || s == 8;
+}
+
+// Is this state in a block?
+fn in_block(s: int) -> [] bool {
+    return s >= 4 && s <= 7;
+}
+
+fn hash_zero[&r](rec: &r [byte]) -> [] bool {
+    var i = 42;
+    while i < 74 {
+        if int_of(rec[i]) != 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// A record for a transaction with this `nonce`, signed and never sent, at time `now`. 74 bytes into `out`. 0, or -321 for a negative number or a buffer that is not 74 bytes.
+pub fn new[&o](out: &!o [byte], nonce: int, now: int) -> [] int {
+    if len(out) != 74 || nonce < 0 || now < 0 {
+        return -321;
+    }
+    var i = 0;
+    while i < 74 {
+        out[i] = byte_of(0);
+        i = i + 1;
+    }
+    out[0] = byte_of(1);
+    out[1] = byte_of(1);
+    put_be8(out, 2, nonce);
+    put_be8(out, 18, now);
+    return 0;
+}
+
+// Is `rec` a canonical record? 0, or -320: not 74 bytes; a version other than 1; a state outside 1 to 9; an integer with its top bit set (no time or number here is 2^63 or more); a block and
+// a hash on a state that is not in a block, or none on one that is; a `consumed_at` on a state that cannot have one (only `SUBMITTED`, `UNCERTAIN` and `DROPPED`).
+pub fn check[&r](rec: &r [byte]) -> [] int {
+    if len(rec) != 74 || int_of(rec[0]) != 1 {
+        return -320;
+    }
+    let s = int_of(rec[1]);
+    if s < 1 || s > 9 {
+        return -320;
+    }
+    var k = 0;
+    while k < 5 {
+        if int_of(rec[2 + 8 * k]) >= 128 {
+            return -320;
+        }
+        k = k + 1;
+    }
+    if in_block(s) {
+        if hash_zero(rec) {
+            return -320;
+        }
+    } else if be8(rec, 34) != 0 || !hash_zero(rec) {
+        return -320;
+    }
+    if be8(rec, 26) != 0 && !(s == 2 || s == 3 || s == 9) {
+        return -320;
+    }
+    return 0;
+}
+
+fn set_state[&r](rec: &!r [byte], s: int, now: int) -> [] int {
+    if int_of(rec[1]) != s {
+        rec[1] = byte_of(s);
+        put_be8(rec, 18, now);
+    }
+    return 0;
+}
+
+fn clear_block[&r](rec: &!r [byte]) -> [] int {
+    var i = 34;
+    while i < 74 {
+        rec[i] = byte_of(0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The send of the transaction `rec` holds was tried at `now`, and `ok` is whether a provider took it. From `SIGNED`, `UNCERTAIN` or `DROPPED`: `SUBMITTED` if ok, `UNCERTAIN` if not.
+// From `SUBMITTED`: ok keeps it, not ok makes it `UNCERTAIN`. In any other state it is refused (-322): a transaction in a block, or ended, is not sent again. `sent_at` is `now` either way.
+pub fn after_send[&r](rec: &!r [byte], ok: bool, now: int) -> [] int {
+    if check(rec) != 0 {
+        return -320;
+    }
+    if now < 0 {
+        return -321;
+    }
+    let s = int_of(rec[1]);
+    if s != 1 && s != 2 && s != 3 && s != 9 {
+        return -322;
+    }
+    put_be8(rec, 10, now);
+    // A send that was taken ends whatever was being waited on about the nonce.
+    put_be8(rec, 26, 0);
+    if ok {
+        set_state(rec, 2, now);
+    } else {
+        set_state(rec, 3, now);
+    }
+    return 0;
+}
+
+// One observation (docs/design.md sections 17.2 and 17.3), applied to `rec`. `agree` is whether the providers said the same; `tx` is 0 (not found), 1 (pending) or 2 (mined); for a mined
+// one `status_ok` is a receipt status of 1, `block` and `block_hash` (32 bytes) are the block and `tip` is the chain's tip, and `hash_known` says that `hash_at` (32 bytes) is the hash now
+// at height `block`; `nonce_latest` is the account's latest nonce; `now` the time; `k` the confirmations that make a block final, `drop_ms` how long after a send a transaction may be absent
+// before it is dropped and `settle_ms` how long a consumed nonce must stay consumed before the transaction is called replaced.
+// Answers 0 (nothing to do), 1 (send it: it never was) or 2 (send the same bytes again), or a refusal: the record is not canonical (-320) or an argument is out of range (-321): a `tx` outside 0 to 2,
+// a negative number, `k` under 1, a mined observation whose tip is below its block, a hash that is not 32 bytes.
+pub fn observe[&r, &b, &h](rec: &!r [byte], agree: bool, tx: int, status_ok: bool, block: int, block_hash: &b [byte], tip: int, hash_known: bool, hash_at: &h [byte], nonce_latest: int, now: int, k: int, drop_ms: int, settle_ms: int) -> [] int {
+    if check(rec) != 0 {
+        return -320;
+    }
+    if tx < 0 || tx > 2 || block < 0 || tip < 0 || nonce_latest < 0 || now < 0 || k < 1 || drop_ms < 0 || settle_ms < 0 || len(block_hash) != 32 || len(hash_at) != 32 {
+        return -321;
+    }
+    if tx == 2 && tip < block {
+        return -321;
+    }
+    if !agree {
+        return 0;
+    }
+    let s = int_of(rec[1]);
+    if is_terminal(s) {
+        return 0;
+    }
+    let n = be8(rec, 2);
+    if tx == 2 {
+        // In a block. A different block or hash than the record's is a reorganisation: recorded as the change it is.
+        var next = 4;
+        if !status_ok {
+            next = 5;
+        }
+        var same = s == next && be8(rec, 34) == block;
+        var i = 0;
+        while same && i < 32 {
+            if int_of(rec[42 + i]) != int_of(block_hash[i]) {
+                same = false;
+            }
+            i = i + 1;
+        }
+        if !same {
+            put_be8(rec, 18, now);
+            rec[1] = byte_of(next);
+            put_be8(rec, 34, block);
+            i = 0;
+            while i < 32 {
+                rec[42 + i] = block_hash[i];
+                i = i + 1;
+            }
+        }
+        put_be8(rec, 26, 0);
+        // Final: enough confirmations, and the block at that height is still this block.
+        if tip - block + 1 >= k && hash_known {
+            var steady = true;
+            i = 0;
+            while i < 32 {
+                if int_of(hash_at[i]) != int_of(block_hash[i]) {
+                    steady = false;
+                }
+                i = i + 1;
+            }
+            if steady {
+                if status_ok {
+                    set_state(rec, 6, now);
+                } else {
+                    set_state(rec, 7, now);
+                }
+            }
+        }
+        return 0;
+    }
+    if tx == 1 {
+        clear_block(rec);
+        put_be8(rec, 26, 0);
+        set_state(rec, 2, now);
+        return 0;
+    }
+    // Not found.
+    if s == 1 {
+        return 1;
+    }
+    var vanished = false;
+    if s == 4 || s == 5 {
+        // A receipt that was and is not.
+        clear_block(rec);
+        set_state(rec, 3, now);
+        vanished = true;
+    }
+    if nonce_latest > n {
+        // The nonce is past ours and the transaction is nowhere. Only a nonce that stays consumed is believed.
+        var at = be8(rec, 26);
+        if at == 0 {
+            put_be8(rec, 26, now);
+            at = now;
+        }
+        if now - at >= settle_ms && !vanished {
+            set_state(rec, 8, now);
+            put_be8(rec, 26, 0);
+        }
+        return 0;
+    }
+    put_be8(rec, 26, 0);
+    if vanished {
+        return 2;
+    }
+    let cur = int_of(rec[1]);
+    if cur == 9 {
+        return 2;
+    }
+    if now - be8(rec, 10) >= drop_ms {
+        set_state(rec, 9, now);
+        return 2;
+    }
+    return 0;
+}

@@ -1,0 +1,366 @@
+edition 11;
+
+// The front (docs/design.md section 15): `POST /sign` over HTTP, behind `cancho-gateway`, answered by starting the signer once per request.
+//
+// Authority (`cancho authority`): one port in, **one program to start** (the signer's path below), the clock, the heap, standard error. No file, no network out, no foreign code.
+// The port and the program are compile-time constants on purpose, so that the report names them; `scripts/check_front.py` builds a copy with others.
+//
+// The caller is the one `X-Auth-Identity` header, which only the gateway may set (its `auth_identity_header` removes a client's and sets its own). A front that a client can
+// reach without the gateway has no caller at all: listen where only the gateway can connect.
+
+import std.buffer;
+import std.bytes;
+import std.http;
+import std.io;
+import std.process;
+import http.server;
+
+fn signer_path() -> [] &static [byte] {
+    return "/usr/local/lib/cancho-chain/signer";
+}
+
+fn is_lower_hex(c: int) -> [] bool {
+    return c >= 48 && c <= 57 || c >= 97 && c <= 102;
+}
+
+// `lit` at `at` in `body`: the position after it, or -1.
+fn expect[&b, &l](body: &b [byte], at: int, lit: &l [byte]) -> [] int {
+    if at < 0 || len(body) - at < len(lit) {
+        return 0 - 1;
+    }
+    var i = 0;
+    while i < len(lit) {
+        if int_of(body[at + i]) != int_of(lit[i]) {
+            return 0 - 1;
+        }
+        i = i + 1;
+    }
+    return at + len(lit);
+}
+
+// The run of lower-case hex digits at `at`: its end, or -1 if its length is odd, under `least` or over `most`, or it is not followed by `"`.
+fn hex_run[&b](body: &b [byte], at: int, least: int, most: int) -> [] int {
+    if at < 0 {
+        return 0 - 1;
+    }
+    var i = at;
+    while i < len(body) && is_lower_hex(int_of(body[i])) {
+        i = i + 1;
+    }
+    let n = i - at;
+    if n % 2 != 0 || n < least || n > most || i >= len(body) || int_of(body[i]) != 34 {
+        return 0 - 1;
+    }
+    return i;
+}
+
+// The body `{"envelope":"<hex>","signature":"<hex>","message":"<hex>"}`, exactly. `spans[0..6]` get the start and end of each of the three hex runs. 0, or -1.
+fn parse_body[&b, &s](body: &b [byte], spans: &!s [int]) -> [] int {
+    var at = expect(body, 0, "{\"envelope\":\"");
+    spans[0] = at;
+    at = hex_run(body, at, 2, 652);
+    spans[1] = at;
+    at = expect(body, at, "\",\"signature\":\"");
+    spans[2] = at;
+    at = hex_run(body, at, 130, 130);
+    spans[3] = at;
+    at = expect(body, at, "\",\"message\":\"");
+    spans[4] = at;
+    at = hex_run(body, at, 2, 2048);
+    spans[5] = at;
+    at = expect(body, at, "\"}");
+    if at != len(body) {
+        return 0 - 1;
+    }
+    return 0;
+}
+
+// The identity: 1 to 32 bytes of `[a-z0-9._-]`.
+fn identity_ok[&v](value: &v [byte]) -> [] bool {
+    if len(value) < 1 || len(value) > 32 {
+        return false;
+    }
+    var i = 0;
+    while i < len(value) {
+        let c = int_of(value[i]);
+        if !(c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 46 || c == 95 || c == 45) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Is `name` the lower-case `want`, in any case?
+fn is_name[&a, &w](name: &a [byte], want: &w [byte]) -> [] bool {
+    if len(name) != len(want) {
+        return false;
+    }
+    var i = 0;
+    while i < len(name) {
+        if bytes.to_lower(int_of(name[i])) != int_of(want[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The value of the one header named `X-Auth-Identity` (any case): its index, or -1 if there is none or more than one.
+fn identity_header[&s, &t](request: &s [byte], table: &t [int]) -> [] int {
+    var found = 0 - 1;
+    var n = 0;
+    var i = 0;
+    while i < http.header_count(table) {
+        if is_name(http.header_name(request, table, i), "x-auth-identity") {
+            found = i;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if n != 1 {
+        return 0 - 1;
+    }
+    return found;
+}
+
+fn refusal[&h](heap: &!h Heap, out: buffer.Buffer, status: int, tag: &static [byte], repair: &static [byte], keep: bool, extra: &static [byte]) -> [heap] buffer.Buffer {
+    var body = buffer.append(heap, buffer.empty(heap, 160), "{\"ok\":false,\"rule\":\"chain.");
+    body = buffer.append(heap, body, tag);
+    body = buffer.append(heap, body, "\",\"repair\":\"");
+    body = buffer.append(heap, body, repair);
+    body = buffer.append(heap, body, "\"}");
+    var answer = out;
+    borrow body as &bb in {
+        answer = server.reply_as(heap, answer, status, "application/json", buffer.bytes(bb), keep, extra);
+    }
+    buffer.drop(heap, body);
+    return answer;
+}
+
+fn hex_char(v: int) -> [] int {
+    if v < 10 {
+        return 48 + v;
+    }
+    return 87 + v;
+}
+
+// Is the rule `tag` (after `chain.` in the signer's answer) one of an unwell signer's, not of a bad request?
+fn unwell[&t](tag: &t [byte]) -> [] bool {
+    return bytes.equal(tag, "signer-locked") || bytes.equal(tag, "signer-ledger-write") || bytes.equal(tag, "signer-ledger-corrupt") || bytes.equal(tag, "signer-ledger-full") || bytes.equal(tag, "signer-config") || bytes.equal(tag, "signer-key") || bytes.equal(tag, "signer-same-key");
+}
+
+// The rule tag of a refusal `{"ok":false,"rule":"chain.<tag>",...}`: the span of the tag in `answer`, or (0, 0).
+fn rule_of[&a](answer: &a [byte]) -> [] (int, int) {
+    let head = "{\"ok\":false,\"rule\":\"chain.";
+    let at = expect(answer, 0, head);
+    if at < 0 {
+        return (0, 0);
+    }
+    var i = at;
+    while i < len(answer) && int_of(answer[i]) != 34 {
+        i = i + 1;
+    }
+    if i >= len(answer) || i == at {
+        return (0, 0);
+    }
+    return (at, i);
+}
+
+// Start the signer with `line` on its standard input and answer what it printed.
+fn ask_signer[&h, &k, &x, &l](heap: &!h Heap, clock: &k Clock, exec: &x Exec("/usr/local/lib/cancho-chain/signer"), line: &l [byte], out: buffer.Buffer, keep: bool) -> [heap, clock, exec("/usr/local/lib/cancho-chain/signer"), poll] buffer.Buffer {
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            return refusal(heap, out, 502, "front-signer", "the signer could not be started", keep, "");
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            match exec_spawn(exec, signer_path(), "", "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null) {
+                Spawned::Failed(e) => {
+                    process.close(to_child, from_child);
+                    return refusal(heap, out, 502, "front-signer", "the signer could not be started", keep, "");
+                }
+                Spawned::Ok(child) => {
+                    let (answer, ran) = process.capture(heap, clock, child, to_child, from_child, line, 4096, 10000);
+                    var status = 502;
+                    match ran {
+                        process.Ran::Code(n) => {
+                            if n == 0 {
+                                status = 200;
+                            } else if n == 2 {
+                                status = 422;
+                            }
+                        }
+                        process.Ran::Signaled(s) => {
+                        }
+                        process.Ran::TimedOut => {
+                        }
+                        process.Ran::TooMuch => {
+                        }
+                        process.Ran::Failed(e) => {
+                        }
+                    }
+                    var result = out;
+                    borrow answer as &ab in {
+                        var text = buffer.bytes(ab);
+                        // One line: it ends in a newline and holds no other, and is a JSON object of the shape the signer writes.
+                        var lines = 0;
+                        var q = 0;
+                        while q < len(text) {
+                            if int_of(text[q]) == 10 {
+                                lines = lines + 1;
+                            }
+                            q = q + 1;
+                        }
+                        let shaped = len(text) > 20 && lines == 1 && int_of(text[len(text) - 1]) == 10 && int_of(text[0]) == 123 && int_of(text[len(text) - 2]) == 125;
+                        if !shaped {
+                            status = 502;
+                        }
+                        if status == 200 && expect(text, 0, "{\"ok\":true,") < 0 {
+                            status = 502;
+                        }
+                        if status == 422 {
+                            let span = rule_of(text);
+                            if span.1 == 0 {
+                                status = 502;
+                            } else if unwell(text[span.0..span.1]) {
+                                status = 503;
+                            }
+                        }
+                        if status == 502 {
+                            result = refusal(heap, result, 502, "front-signer", "the signer did not answer as it should", keep, "");
+                        } else {
+                            result = server.reply_as(heap, result, status, "application/json", text[0..len(text) - 1], keep, "");
+                        }
+                    }
+                    buffer.drop(heap, answer);
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+// One request in, one response appended to `out`.
+fn handle[&h, &k, &x, &q, &t, &b](heap: &!h Heap, clock: &k Clock, exec: &x Exec("/usr/local/lib/cancho-chain/signer"), request: &q [byte], table: &t [int], body: &b [byte], out: buffer.Buffer) -> [heap, clock, exec("/usr/local/lib/cancho-chain/signer"), poll] buffer.Buffer {
+    let keep = http.keeps_alive(table);
+    if !bytes.equal(http.path(request, table), "/sign") {
+        return refusal(heap, out, 404, "front-not-found", "the only route is POST /sign", keep, "");
+    }
+    if !bytes.equal(http.method(request, table), "POST") {
+        return refusal(heap, out, 405, "front-method", "the only method on /sign is POST", keep, "Allow: POST\r\n");
+    }
+    let at = identity_header(request, table);
+    if at < 0 || !identity_ok(http.header_value(request, table, at)) {
+        return refusal(heap, out, 401, "front-no-identity", "the request carries no single valid caller; it must come through the gateway", keep, "");
+    }
+    if len(body) > 4096 {
+        return refusal(heap, out, 413, "front-body", "the body is over 4,096 bytes", keep, "");
+    }
+    var answer = out;
+    region r {
+        let spans = alloc_slice[r](6, 0);
+        if parse_body(body, spans) != 0 {
+            answer = refusal(heap, answer, 400, "front-body", "the body must be exactly the three members envelope, signature and message, in that order, as lower-case hex strings with no whitespace", keep, "");
+        } else {
+            // The signer's line: envelope, signature, message and the caller in hex.
+            let caller = http.header_value(request, table, at);
+            var line = buffer.append(heap, buffer.empty(heap, 4096), body[spans[0]..spans[1]]);
+            line = buffer.push(heap, line, byte_of(32));
+            line = buffer.append(heap, line, body[spans[2]..spans[3]]);
+            line = buffer.push(heap, line, byte_of(32));
+            line = buffer.append(heap, line, body[spans[4]..spans[5]]);
+            line = buffer.push(heap, line, byte_of(32));
+            var i = 0;
+            while i < len(caller) {
+                line = buffer.push(heap, line, byte_of(hex_char(int_of(caller[i]) >> 4)));
+                line = buffer.push(heap, line, byte_of(hex_char(int_of(caller[i]) & 15)));
+                i = i + 1;
+            }
+            line = buffer.push(heap, line, byte_of(10));
+            borrow line as &lb in {
+                answer = ask_signer(heap, clock, exec, buffer.bytes(lb), answer, keep);
+            }
+            buffer.drop(heap, line);
+        }
+    }
+    return answer;
+}
+
+fn run[&h, &k, &l, &x](heap: &!h Heap, clock: &k Clock, listener: &!l Listener, exec: &x Exec("/usr/local/lib/cancho-chain/signer")) -> [heap, conn_accept, conn_read, conn_write, poll, clock, exec("/usr/local/lib/cancho-chain/signer")] int {
+    match poller_new() {
+        Polling::Ok(p) => {
+            var srv = server.open(heap, p, listener, 16384, 0, 9);
+            var out = buffer.empty(heap, 4096);
+            while true {
+                srv = server.wait(heap, srv, clock, listener, 1000);
+                var more = true;
+                while more {
+                    var slot = 0 - 1;
+                    borrow mut srv as &!sw in {
+                        slot = server.next(heap, sw);
+                    }
+                    if slot < 0 {
+                        more = false;
+                    } else {
+                        borrow mut out as &!ob in {
+                            buffer.clear(ob);
+                        }
+                        borrow srv as &sr in {
+                            out = handle(heap, clock, exec, server.head(sr), server.parsed(sr), server.body(sr), out);
+                        }
+                        borrow mut srv as &!sw in {
+                            borrow out as &ob in {
+                                server.respond(sw, buffer.bytes(ob));
+                            }
+                        }
+                    }
+                }
+            }
+            server.close(heap, srv);
+            buffer.drop(heap, out);
+            return 0;
+        }
+        Polling::Failed(e) => {
+            return 4;
+        }
+    }
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, out, ports, clock, signals, exec, tty } = split(world);
+    release(fs);
+    release(ffi);
+    release(args);
+    release(signals);
+    release(io);
+    release(out);
+    release(tty);
+    var status = 3;
+    let signer = narrow(exec, "/usr/local/lib/cancho-chain/signer");
+    let inbound = narrow(ports, "8742");
+    borrow inbound as &nn in {
+        match tcp_listen(nn, 8742, 1024, 0) {
+            Listening::Ok(l) => {
+                var listener = l;
+                borrow mut listener as &!lh in {
+                    listener_nonblocking(lh);
+                    borrow mut heap as &!h in {
+                        borrow clock as &c in {
+                            borrow signer as &sx in {
+                                status = run(h, c, lh, sx);
+                            }
+                        }
+                    }
+                }
+                listener_close(listener);
+            }
+            Listening::Failed(e) => {
+            }
+        }
+    }
+    release(signer);
+    release(inbound);
+    release(clock);
+    release(heap);
+    return status;
+}

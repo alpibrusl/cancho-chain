@@ -7,7 +7,7 @@ An auditable authority and execution layer for autonomous blockchain agents, in 
 An agent may *propose* a transaction. A separately enforced policy decides whether it is allowed. A signer, in its own process, signs only the exact
 bytes that were approved. Every step leaves evidence. The agent never holds a key and cannot change its own policy.
 
-**Status: research.** Seven slices are built and a development signer signs one request at a time; no network front, no RPC, nothing moves value yet. What exists, and how it is checked:
+**Status: research.** Eleven slices are built: a development signer behind a network front and `cancho-gateway`, a strict reader of what a chain provider says, the lifecycle of a signed transaction as a pure state machine, and an executor that asks two providers and sends the same bytes again when the lifecycle says so. The executor has only been run against mock nodes; it speaks plain HTTP (no TLS). Nothing has been submitted to a real chain: nothing moves value. What exists, and how it is checked:
 
 | Piece | State | Check |
 |---|---|---|
@@ -18,6 +18,10 @@ bytes that were approved. Every step leaves evidence. The agent never holds a ke
 | `chain.policy` and `chain.decide` (the policy engine: canonical policy and digest, a pure decision function, 14 stable reasons, a decision record and digest) | built | `scripts/check_policy.py`: 989 checks against a separate model and jsonschema, every combination of up to three reasons, 119 of 121 mutants killed (2 equivalent) |
 | `chain.envelope` (the authorisation envelope: a decision bound to the exact unsigned transaction and signed by an issuer key; `issue`, the signer's `verify` with 10 ordered refusals, the single-use ledger) | built | `scripts/check_envelope.py`: 1,187 checks against a separate model, libsecp256k1 and python-ecdsa; every fault alone, in every pair and in every trio; every changed bit; 85 of 92 mutants killed (7 equivalent) |
 | `signer` (`tools/signer`, `chain.signer`): a process that takes one request line, verifies the envelope, records it in a hash-chained `cancho-log` ledger (flushed before any signature exists) and signs; authority: one directory, the clock, stdio | built | `scripts/check_signer.py`: 386 checks against the envelope model, libsecp256k1, python-ecdsa, eth-account and an independent ledger reader; 14 kinds of ledger damage, none ever signs; 49 of 50 mutants killed (1 equivalent) |
+| `front` (`tools/front`): `POST /sign` behind `cancho-gateway`; the caller is the gateway's `X-Auth-Identity`; starts the signer once per request; authority: one port in, one program to start, nothing else | built | `scripts/check_front.py`: 117 checks with the real signer behind it, 61 mutants (59 killed, 2 equivalent); `scripts/check_stack.py`: 15 checks through the real gateway with three API keys |
+| `chain.rpc` (the JSON-RPC requests and a strict reader of a provider's answers: a receipt, a transaction or a block is believed only if it says what was signed; 15 stable refusals) | built | `scripts/check_rpc.py`: 635 checks with transactions signed by eth-account, every truncation and 400 damaged responses (none traps); 106 of 118 mutants killed (12 equivalent) |
+| `chain.lifecycle` (what a signed transaction is, as a pure function of the record last kept and what two providers say: nine states, a 74-byte canonical record, resubmit only the same bytes, final only on the same block, no decision on a disagreement) | built | `scripts/check_lifecycle.py`: 509 checks, 209,088 observations of the full product against a model **and ten properties as predicates**, random walks with a lying provider; 76 of 83 mutants killed (7 equivalent) |
+| `executor` (`tools/executor`, `chain.executor`: one tick per process; two providers must agree, the lifecycle decides, the same bytes are re-sent, every change is evidence in a `cancho-log` trail; authority: one directory, two loopback addresses, the clock; plain HTTP only) | built | `scripts/check_executor.py`: 176 checks against two mock nodes (faults, lies, reorganisations, chain mismatch, damaged state and evidence); 72 of 78 mutants killed (6 explained, 1 of them not proven equivalent: design §18.5) |
 | everything else in [`docs/design.md`](docs/design.md) | designed, not built | -- |
 
 ```
@@ -28,6 +32,9 @@ CHAIN=build/chain python3 -I scripts/check_keccak.py [--mutants]     # --mutants
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages python3 -I scripts/check_eth.py [--mutants]   # needs pip install eth-account coincurve
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages python3 -I scripts/check_decode.py [--mutants]
 CANCHO=the-compiler CANCHO_SCHEMA=../cancho-schema/src/schema.cho python3 -I scripts/check_intent.py [--mutants]   # needs pip install eth-account jsonschema
+CANCHO=the-compiler python3 -I scripts/check_lifecycle.py [--mutants]
+CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages CANCHO_SCHEMA=../cancho-schema/src/schema.cho CANCHO_LOG=../cancho-log/src python3 -I scripts/check_executor.py [--mutants]   # the real binary against two Python mock nodes
+CANCHO=the-compiler python3 -I scripts/check_rpc.py [--mutants]   # needs pip install eth-account eth-abi rlp eth-utils pycryptodome
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages CANCHO_SCHEMA=../cancho-schema/src/schema.cho CANCHO_LOG=../cancho-log/src python3 -I scripts/check_signer.py [--mutants]   # the real binary; needs cancho-log checked out too
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages CANCHO_SCHEMA=../cancho-schema/src/schema.cho python3 -I scripts/check_envelope.py [--mutants]   # needs pip install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils
 ```

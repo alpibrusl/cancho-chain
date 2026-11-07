@@ -1,0 +1,708 @@
+edition 7;
+
+module chain.rpc;
+
+import std.bytes;
+import std.json;
+
+// The JSON-RPC codec (docs/design.md section 16): the requests, and a strict reader of a provider's answers. Nothing here opens a socket. A provider is untrusted: an answer is
+// believed only when it says what was signed.
+
+pub fn max_response() -> [] int {
+    return 65536;
+}
+
+// A buffer for a request is at least this long.
+pub fn request_room() -> [] int {
+    return 8448;
+}
+
+// A raw transaction is at most this many bytes.
+pub fn max_raw() -> [] int {
+    return 4096;
+}
+
+pub fn refused_json() -> [] int {
+    return -300;
+}
+
+pub fn refused_shape() -> [] int {
+    return -301;
+}
+
+pub fn refused_id() -> [] int {
+    return -302;
+}
+
+pub fn refused_duplicate() -> [] int {
+    return -303;
+}
+
+pub fn refused_quantity() -> [] int {
+    return -304;
+}
+
+pub fn refused_hash() -> [] int {
+    return -305;
+}
+
+pub fn refused_address() -> [] int {
+    return -306;
+}
+
+pub fn refused_data() -> [] int {
+    return -307;
+}
+
+pub fn refused_chain() -> [] int {
+    return -308;
+}
+
+pub fn refused_receipt() -> [] int {
+    return -309;
+}
+
+pub fn refused_status() -> [] int {
+    return -310;
+}
+
+pub fn refused_tx() -> [] int {
+    return -311;
+}
+
+pub fn refused_output() -> [] int {
+    return -312;
+}
+
+pub fn refused_input() -> [] int {
+    return -313;
+}
+
+pub fn refused_block() -> [] int {
+    return -314;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -300 {
+        return "rpc-json";
+    }
+    if code == -301 {
+        return "rpc-shape";
+    }
+    if code == -302 {
+        return "rpc-id";
+    }
+    if code == -303 {
+        return "rpc-duplicate";
+    }
+    if code == -304 {
+        return "rpc-quantity";
+    }
+    if code == -305 {
+        return "rpc-hash";
+    }
+    if code == -306 {
+        return "rpc-address";
+    }
+    if code == -307 {
+        return "rpc-data";
+    }
+    if code == -308 {
+        return "rpc-chain";
+    }
+    if code == -309 {
+        return "rpc-receipt";
+    }
+    if code == -310 {
+        return "rpc-status";
+    }
+    if code == -311 {
+        return "rpc-tx";
+    }
+    if code == -312 {
+        return "rpc-output";
+    }
+    if code == -313 {
+        return "rpc-input";
+    }
+    if code == -314 {
+        return "rpc-block";
+    }
+    return "rpc-unknown";
+}
+
+// ---------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------
+
+fn put_text[&o, &t](out: &!o [byte], at: int, text: &t [byte]) -> [] int {
+    var i = 0;
+    while i < len(text) {
+        out[at + i] = text[i];
+        i = i + 1;
+    }
+    return at + len(text);
+}
+
+fn hex_digit(v: int) -> [] int {
+    if v < 10 {
+        return 48 + v;
+    }
+    return 87 + v;
+}
+
+// `src` as `0x` and lower-case hex.
+fn put_hex[&o, &s](out: &!o [byte], at: int, src: &s [byte]) -> [] int {
+    out[at] = byte_of(48);
+    out[at + 1] = byte_of(120);
+    var i = 0;
+    while i < len(src) {
+        out[at + 2 + 2 * i] = byte_of(hex_digit(int_of(src[i]) >> 4));
+        out[at + 3 + 2 * i] = byte_of(hex_digit(int_of(src[i]) & 15));
+        i = i + 1;
+    }
+    return at + 2 + 2 * len(src);
+}
+
+fn put_decimal[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    var n = 1;
+    var t = v;
+    while t >= 10 {
+        t = t / 10;
+        n = n + 1;
+    }
+    var u = v;
+    var i = n - 1;
+    while i >= 0 {
+        out[at + i] = byte_of(48 + u % 10);
+        u = u / 10;
+        i = i - 1;
+    }
+    return at + n;
+}
+
+// `v` (0 or more) as a quantity: `0x`, lower-case hex, no leading zero.
+fn put_quantity[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    var n = 1;
+    var t = v;
+    while t >= 16 {
+        t = t / 16;
+        n = n + 1;
+    }
+    out[at] = byte_of(48);
+    out[at + 1] = byte_of(120);
+    var u = v;
+    var i = n - 1;
+    while i >= 0 {
+        out[at + 2 + i] = byte_of(hex_digit(u % 16));
+        u = u / 16;
+        i = i - 1;
+    }
+    return at + 2 + n;
+}
+
+// `{"jsonrpc":"2.0","id":<id>,"method":"<method>","params":[` into `out`; answers where the parameters go.
+fn head[&o, &m](out: &!o [byte], id: int, method: &m [byte]) -> [] int {
+    var at = put_text(out, 0, "{\"jsonrpc\":\"2.0\",\"id\":");
+    at = put_decimal(out, at, id);
+    at = put_text(out, at, ",\"method\":\"");
+    at = put_text(out, at, method);
+    return put_text(out, at, "\",\"params\":[");
+}
+
+fn tail[&o](out: &!o [byte], at: int) -> [] int {
+    return put_text(out, at, "]}");
+}
+
+fn ready[&o](out: &!o [byte], id: int) -> [] bool {
+    return len(out) >= 8448 && id >= 0 && id < 9007199254740992;
+}
+
+// `eth_chainId`: the request's length, or -312 for a short buffer or an `id` outside [0, 2^53).
+pub fn req_chain_id[&o](id: int, out: &!o [byte]) -> [] int {
+    if !ready(out, id) {
+        return -312;
+    }
+    return tail(out, head(out, id, "eth_chainId"));
+}
+
+pub fn req_block_number[&o](id: int, out: &!o [byte]) -> [] int {
+    if !ready(out, id) {
+        return -312;
+    }
+    return tail(out, head(out, id, "eth_blockNumber"));
+}
+
+// `eth_getTransactionCount` of `addr` (20 bytes), at `"pending"` if `pending`, else `"latest"`.
+pub fn req_nonce[&a, &o](id: int, addr: &a [byte], pending: bool, out: &!o [byte]) -> [] int {
+    if !ready(out, id) {
+        return -312;
+    }
+    if len(addr) != 20 {
+        return -313;
+    }
+    var at = head(out, id, "eth_getTransactionCount");
+    out[at] = byte_of(34);
+    at = put_hex(out, at + 1, addr);
+    out[at] = byte_of(34);
+    if pending {
+        at = put_text(out, at + 1, ",\"pending\"");
+    } else {
+        at = put_text(out, at + 1, ",\"latest\"");
+    }
+    return tail(out, at);
+}
+
+// `eth_sendRawTransaction` of `raw` (1 to 4,096 bytes).
+pub fn req_send_raw[&r, &o](id: int, raw: &r [byte], out: &!o [byte]) -> [] int {
+    if !ready(out, id) {
+        return -312;
+    }
+    if len(raw) < 1 || len(raw) > 4096 {
+        return -313;
+    }
+    var at = head(out, id, "eth_sendRawTransaction");
+    out[at] = byte_of(34);
+    at = put_hex(out, at + 1, raw);
+    out[at] = byte_of(34);
+    return tail(out, at + 1);
+}
+
+fn hash_request[&h, &o, &m](id: int, method: &m [byte], hash: &h [byte], out: &!o [byte]) -> [] int {
+    if !ready(out, id) {
+        return -312;
+    }
+    if len(hash) != 32 {
+        return -313;
+    }
+    var at = head(out, id, method);
+    out[at] = byte_of(34);
+    at = put_hex(out, at + 1, hash);
+    out[at] = byte_of(34);
+    return tail(out, at + 1);
+}
+
+pub fn req_receipt[&h, &o](id: int, hash: &h [byte], out: &!o [byte]) -> [] int {
+    return hash_request(id, "eth_getTransactionReceipt", hash, out);
+}
+
+pub fn req_tx[&h, &o](id: int, hash: &h [byte], out: &!o [byte]) -> [] int {
+    return hash_request(id, "eth_getTransactionByHash", hash, out);
+}
+
+// `eth_getBlockByNumber` of block `number` (0 or more), without the transactions.
+pub fn req_block[&o](id: int, number: int, out: &!o [byte]) -> [] int {
+    if !ready(out, id) {
+        return -312;
+    }
+    if number < 0 {
+        return -313;
+    }
+    var at = head(out, id, "eth_getBlockByNumber");
+    out[at] = byte_of(34);
+    at = put_quantity(out, at + 1, number);
+    out[at] = byte_of(34);
+    return tail(out, put_text(out, at + 1, ",false"));
+}
+
+// ---------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------
+
+// The value of a hex digit of either case, or -1.
+fn hex_value(c: int) -> [] int {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
+    return -1;
+}
+
+fn is_lower(c: int) -> [] bool {
+    return c >= 48 && c <= 57 || c >= 97 && c <= 102;
+}
+
+// Do the members of the object at node `obj` have distinct names, all written plainly? Names are compared as written; a name with an escape is refused, so that two spellings
+// cannot be one name.
+fn distinct[&s, &t](src: &s [byte], tape: &t [int], obj: int) -> [] bool {
+    let n = json.count(tape, obj);
+    var j = obj + 1;
+    var left = n;
+    while left > 0 {
+        if !json.string_plain(tape, j) {
+            return false;
+        }
+        var k = json.skip(tape, j + 1);
+        var rest = left - 1;
+        while rest > 0 {
+            if json.string_equals(src, tape, k, json.string_view(src, tape, j)) {
+                return false;
+            }
+            k = json.skip(tape, k + 1);
+            rest = rest - 1;
+        }
+        j = json.skip(tape, j + 1);
+        left = left - 1;
+    }
+    return true;
+}
+
+// The answer to a request with `id`: `tape` has `json.tape_len(src)` words; `info[0]` is set. Answers 0 (a `result`; `info[0]` is its node), 1 (an `error`; `info[0]` is its code, and the message
+// is never read) or a refusal: not JSON, or over 65,536 bytes (-300); not a JSON-RPC 2.0 response with exactly one of `result` and `error` (-301); another `id` (-302); a repeated or escaped name (-303).
+pub fn response[&s, &t, &i](src: &s [byte], tape: &!t [int], id: int, info: &!i [int]) -> [] int {
+    if len(info) < 1 || len(tape) < json.tape_len(src) {
+        return -313;
+    }
+    info[0] = 0;
+    if len(src) > 65536 {
+        return -300;
+    }
+    if json.parse(src, tape) < 0 {
+        return -300;
+    }
+    if !json.is_object(tape, 0) {
+        return -301;
+    }
+    if !distinct(src, tape, 0) {
+        return -303;
+    }
+    let version = json.get(src, tape, 0, "jsonrpc");
+    if version < 0 || !json.string_plain(tape, version) || !json.string_equals(src, tape, version, "2.0") {
+        return -301;
+    }
+    let ident = json.get(src, tape, 0, "id");
+    if ident < 0 || !json.is_int(tape, ident) {
+        return -301;
+    }
+    if !json.fits_int(src, tape, ident) || json.to_int(src, tape, ident) != id {
+        return -302;
+    }
+    let result = json.get(src, tape, 0, "result");
+    let error = json.get(src, tape, 0, "error");
+    if result >= 0 && error >= 0 || result < 0 && error < 0 {
+        return -301;
+    }
+    if result >= 0 {
+        info[0] = result;
+        return 0;
+    }
+    if !json.is_object(tape, error) {
+        return -301;
+    }
+    let code = json.get(src, tape, error, "code");
+    if code < 0 || !json.is_int(tape, code) || !json.fits_int(src, tape, code) {
+        return -301;
+    }
+    info[0] = json.to_int(src, tape, code);
+    return 1;
+}
+
+// The text of the string at node `i`, without its quotes: empty (and `ok` false) for anything but a string written without escapes.
+fn text_of[&s, &t](src: &s [byte], tape: &t [int], i: int) -> [] &s [byte] {
+    if i < 0 || !json.string_plain(tape, i) {
+        return src[0..0];
+    }
+    return json.string_view(src, tape, i);
+}
+
+fn has_0x[&x](text: &x [byte]) -> [] bool {
+    return len(text) >= 2 && int_of(text[0]) == 48 && int_of(text[1]) == 120;
+}
+
+// The quantity at node `i`: its value, or -304. `0x0`, or `0x` and 1 to 15 lower-case hex digits that do not start with 0.
+pub fn quantity[&s, &t](src: &s [byte], tape: &t [int], i: int) -> [] int {
+    let text = text_of(src, tape, i);
+    if !has_0x(text) || len(text) < 3 || len(text) > 17 {
+        return -304;
+    }
+    if int_of(text[2]) == 48 && len(text) > 3 {
+        return -304;
+    }
+    var v = 0;
+    var k = 2;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if !is_lower(c) {
+            return -304;
+        }
+        v = v * 16 + hex_value(c);
+        k = k + 1;
+    }
+    return v;
+}
+
+// `0x` and `2 * len(out)` hex digits into `out`, lower case only if `lower`. 0, or -1.
+fn decode_into[&x, &o](text: &x [byte], out: &!o [byte], lower: bool) -> [] int {
+    if !has_0x(text) || len(text) != 2 + 2 * len(out) {
+        return -1;
+    }
+    var i = 0;
+    while i < len(out) {
+        let hi = int_of(text[2 + 2 * i]);
+        let lo = int_of(text[3 + 2 * i]);
+        if hex_value(hi) < 0 || hex_value(lo) < 0 || lower && (!is_lower(hi) || !is_lower(lo)) {
+            return -1;
+        }
+        out[i] = byte_of(hex_value(hi) * 16 + hex_value(lo));
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The 32-byte hash at node `i` into `out`. 0, or -305.
+pub fn hash32[&s, &t, &o](src: &s [byte], tape: &t [int], i: int, out: &!o [byte]) -> [] int {
+    if len(out) != 32 || decode_into(text_of(src, tape, i), out, true) != 0 {
+        return -305;
+    }
+    return 0;
+}
+
+// The 20-byte address at node `i` into `out`, of either case. 0, or -306.
+pub fn address[&s, &t, &o](src: &s [byte], tape: &t [int], i: int, out: &!o [byte]) -> [] int {
+    if len(out) != 20 || decode_into(text_of(src, tape, i), out, false) != 0 {
+        return -306;
+    }
+    return 0;
+}
+
+// Is the data at node `i` the bytes `want`? 1, 0, or -307 if it is not `0x` and an even number of lower-case hex digits.
+pub fn data_is[&s, &t, &w](src: &s [byte], tape: &t [int], i: int, want: &w [byte]) -> [] int {
+    let text = text_of(src, tape, i);
+    if !has_0x(text) || (len(text) - 2) % 2 != 0 {
+        return -307;
+    }
+    var k = 2;
+    while k < len(text) {
+        if !is_lower(int_of(text[k])) {
+            return -307;
+        }
+        k = k + 1;
+    }
+    if len(text) != 2 + 2 * len(want) {
+        return 0;
+    }
+    var i2 = 0;
+    while i2 < len(want) {
+        if hex_value(int_of(text[2 + 2 * i2])) * 16 + hex_value(int_of(text[3 + 2 * i2])) != int_of(want[i2]) {
+            return 0;
+        }
+        i2 = i2 + 1;
+    }
+    return 1;
+}
+
+// The chain id at node `i` (an `eth_chainId` result) against the configured `chain_id`. 0, -304 or -308.
+pub fn chain_id_is[&s, &t](src: &s [byte], tape: &t [int], i: int, chain_id: int) -> [] int {
+    let v = quantity(src, tape, i);
+    if v < 0 {
+        return v;
+    }
+    if v != chain_id {
+        return -308;
+    }
+    return 0;
+}
+
+// Is the address at node `i` the 20 bytes `want`? 1, 0, or -306.
+fn address_is[&s, &t, &w](src: &s [byte], tape: &t [int], i: int, want: &w [byte]) -> [] int {
+    var got = 0;
+    region r {
+        let a = alloc_slice[r](20, byte_of(0));
+        if address(src, tape, i, a) != 0 {
+            got = -306;
+        } else if bytes.equal(a, want) {
+            got = 1;
+        }
+    }
+    return got;
+}
+
+fn hash_is[&s, &t, &w](src: &s [byte], tape: &t [int], i: int, want: &w [byte]) -> [] int {
+    var got = 0;
+    region r {
+        let a = alloc_slice[r](32, byte_of(0));
+        if hash32(src, tape, i, a) != 0 {
+            got = -305;
+        } else if bytes.equal(a, want) {
+            got = 1;
+        }
+    }
+    return got;
+}
+
+// A receipt (`eth_getTransactionReceipt`'s result at node `node`) against the transaction that was signed: `hash` (32 bytes), the wallet (20) and the token contract (20).
+// Answers 0 (null: not found), 1 (found, `status` 0x1) or 2 (found, `status` 0x0), with `info[0]` the block number and `info[1]` the gas used and `block_hash` (32 bytes) the block's;
+// or a refusal: another hash, sender or contract, or a shape that is not a receipt (-309), a status that is not 0x0 or 0x1 or is missing (-310), a repeated name (-303), a
+// field that is not well formed (-304, -305, -306).
+pub fn receipt[&s, &t, &h, &w, &k, &i, &b](src: &s [byte], tape: &t [int], node: int, hash: &h [byte], wallet: &w [byte], token: &k [byte], info: &!i [int], block_hash: &!b [byte]) -> [] int {
+    if len(info) < 2 || len(block_hash) != 32 || len(hash) != 32 || len(wallet) != 20 || len(token) != 20 {
+        return -313;
+    }
+    if node < 0 {
+        return -309;
+    }
+    if json.is_null(tape, node) {
+        return 0;
+    }
+    if !json.is_object(tape, node) {
+        return -309;
+    }
+    if !distinct(src, tape, node) {
+        return -303;
+    }
+    let th = json.get(src, tape, node, "transactionHash");
+    let from = json.get(src, tape, node, "from");
+    let to = json.get(src, tape, node, "to");
+    let status = json.get(src, tape, node, "status");
+    // No `to` is a contract creation, which is not ours.
+    if th < 0 || from < 0 || to < 0 || json.is_null(tape, to) {
+        return -309;
+    }
+    if status < 0 {
+        return -310;
+    }
+    let same_hash = hash_is(src, tape, th, hash);
+    if same_hash < 0 {
+        return same_hash;
+    }
+    let same_from = address_is(src, tape, from, wallet);
+    if same_from < 0 {
+        return same_from;
+    }
+    let same_to = address_is(src, tape, to, token);
+    if same_to < 0 {
+        return same_to;
+    }
+    if same_hash != 1 || same_from != 1 || same_to != 1 {
+        return -309;
+    }
+    let s = quantity(src, tape, status);
+    if s != 0 && s != 1 {
+        return -310;
+    }
+    let number = quantity(src, tape, json.get(src, tape, node, "blockNumber"));
+    if number < 0 {
+        return number;
+    }
+    let gas = quantity(src, tape, json.get(src, tape, node, "gasUsed"));
+    if gas < 0 {
+        return gas;
+    }
+    if hash32(src, tape, json.get(src, tape, node, "blockHash"), block_hash) != 0 {
+        return -305;
+    }
+    info[0] = number;
+    info[1] = gas;
+    if s == 1 {
+        return 1;
+    }
+    return 2;
+}
+
+// A transaction (`eth_getTransactionByHash`'s result at node `node`) against what was signed: the hash, the wallet, the token contract, the nonce, the calldata, and a value of zero.
+// Answers 0 (null: not found), 1 (found, pending: `blockNumber` is null) or 2 (found and mined, `info[0]` the block number), or a refusal: any field that is not what was signed or a
+// shape that is not a transaction (-311), a repeated name (-303), a field that is not well formed (-304, -305, -306, -307).
+pub fn tx_check[&s, &t, &h, &w, &k, &c, &i](src: &s [byte], tape: &t [int], node: int, hash: &h [byte], wallet: &w [byte], token: &k [byte], nonce: int, calldata: &c [byte], info: &!i [int]) -> [] int {
+    if len(info) < 1 || len(hash) != 32 || len(wallet) != 20 || len(token) != 20 || nonce < 0 {
+        return -313;
+    }
+    if node < 0 {
+        return -311;
+    }
+    if json.is_null(tape, node) {
+        return 0;
+    }
+    if !json.is_object(tape, node) {
+        return -311;
+    }
+    if !distinct(src, tape, node) {
+        return -303;
+    }
+    let th = json.get(src, tape, node, "hash");
+    let from = json.get(src, tape, node, "from");
+    let to = json.get(src, tape, node, "to");
+    let nn = json.get(src, tape, node, "nonce");
+    let input = json.get(src, tape, node, "input");
+    let value = json.get(src, tape, node, "value");
+    let block = json.get(src, tape, node, "blockNumber");
+    if th < 0 || from < 0 || to < 0 || nn < 0 || input < 0 || value < 0 || block < 0 {
+        return -311;
+    }
+    let same_hash = hash_is(src, tape, th, hash);
+    if same_hash < 0 {
+        return same_hash;
+    }
+    let same_from = address_is(src, tape, from, wallet);
+    if same_from < 0 {
+        return same_from;
+    }
+    let same_to = address_is(src, tape, to, token);
+    if same_to < 0 {
+        return same_to;
+    }
+    let n = quantity(src, tape, nn);
+    if n < 0 {
+        return n;
+    }
+    let same_input = data_is(src, tape, input, calldata);
+    if same_input < 0 {
+        return same_input;
+    }
+    let v = quantity(src, tape, value);
+    if v < 0 {
+        return v;
+    }
+    if same_hash != 1 || same_from != 1 || same_to != 1 || n != nonce || same_input != 1 || v != 0 {
+        return -311;
+    }
+    if json.is_null(tape, block) {
+        return 1;
+    }
+    let number = quantity(src, tape, block);
+    if number < 0 {
+        return number;
+    }
+    info[0] = number;
+    return 2;
+}
+
+// A block (`eth_getBlockByNumber`'s result at node `node`) asked for by `number`: 0 for null (not found), 1 with its hash in `out` (32 bytes), or -314 for a block with another
+// number or a shape that is not a block, -303, -304, -305.
+pub fn block_check[&s, &t, &o](src: &s [byte], tape: &t [int], node: int, number: int, out: &!o [byte]) -> [] int {
+    if len(out) != 32 || number < 0 {
+        return -313;
+    }
+    if node < 0 {
+        return -314;
+    }
+    if json.is_null(tape, node) {
+        return 0;
+    }
+    if !json.is_object(tape, node) {
+        return -314;
+    }
+    if !distinct(src, tape, node) {
+        return -303;
+    }
+    let n = json.get(src, tape, node, "number");
+    let h = json.get(src, tape, node, "hash");
+    if n < 0 || h < 0 {
+        return -314;
+    }
+    let got = quantity(src, tape, n);
+    if got < 0 {
+        return got;
+    }
+    if got != number {
+        return -314;
+    }
+    if hash32(src, tape, h, out) != 0 {
+        return -305;
+    }
+    return 1;
+}
