@@ -17,6 +17,7 @@ import check_signer as cs
 PKGS = cs.PKGS
 FRONT_PATH = "/usr/local/lib/cancho-chain/signer"
 FRONT_PORT = "8742"
+FRONT_DIR = "/var/lib/cancho-front"   # the witness's directory; a copy of the front is built with another
 FAILS, COUNT = cs.FAILS, cs.COUNT
 check = cs.check
 
@@ -25,10 +26,10 @@ def front_sources(libdir):
     return [os.path.join(PKGS, "http-server", "server.cho")]
 
 
-def build_front(cancho, text, port, signer_path, out):
+def build_front(cancho, text, port, signer_path, fdir, out):
     with tempfile.TemporaryDirectory() as t:
         m = os.path.join(t, "main.cho")
-        open(m, "w").write(text.replace(FRONT_PATH, signer_path).replace(FRONT_PORT, str(port)))
+        open(m, "w").write(text.replace(FRONT_PATH, signer_path).replace(FRONT_PORT, str(port)).replace(FRONT_DIR, fdir))
         r = subprocess.run([cancho, "build", "--std", m, *front_sources(None), "-o", out], capture_output=True, text=True)
         if r.returncode != 0:
             raise SystemExit("front build failed:\n" + r.stderr[:1500])
@@ -45,12 +46,13 @@ def free_port():
 class Stack:
     """The front on a port, the wrapper that counts the signer's starts, and the signer's state directory."""
 
-    def __init__(self, tmp, front_exe, signer_exe, state, port):
-        self.tmp, self.port = tmp, port
+    def __init__(self, tmp, front_exe, signer_exe, state, port, fdir):
+        self.tmp, self.port, self.fdir = tmp, port, fdir
         self.count = os.path.join(tmp, "count")
         self.mode = os.path.join(tmp, "mode")
         self.wrapper = os.path.join(tmp, "signer")
         self.state = cs.State(state, signer_exe)
+        self.state.extra = [fdir]
         self.proc = subprocess.Popen([front_exe], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         for _ in range(100):
             try:
@@ -60,6 +62,13 @@ class Stack:
                 time.sleep(0.05)
         else:
             raise SystemExit("the front did not start")
+
+    def witness(self):
+        p = os.path.join(self.fdir, "witness")
+        return open(p, "rb").read() if os.path.isfile(p) else None
+
+    def lastline(self):
+        return open(os.path.join(self.tmp, "lastline")).read().split()
 
     def starts(self):
         return open(self.count).read().count("x") if os.path.exists(self.count) else 0
@@ -252,6 +261,8 @@ def run_checks(sk, rng):
         status, _, out = sk.post(good)
         check(f"a signer that {name}: 502 front-signer", (status, json.loads(out).get("rule")), (502, "chain.front-signer"))
     for tag, want in (("signer-locked", 503), ("signer-ledger-write", 503), ("signer-ledger-corrupt", 503), ("signer-ledger-full", 503), ("signer-config", 503), ("signer-key", 503), ("signer-same-key", 503),
+                      ("signer-anchor-corrupt", 503), ("signer-anchor-missing", 503), ("signer-anchor-short", 503), ("signer-anchor-mismatch", 503), ("signer-anchor-behind", 503), ("signer-anchor-write", 503),
+                      ("signer-witness-missing", 503), ("signer-witness-short", 503), ("signer-witness-mismatch", 503), ("signer-witness-behind", 503),
                       ("envelope-expired", 422), ("signer-request", 422), ("envelope-replayed", 422)):
         sk.set_mode("rule=" + tag)
         status, _, out = sk.post(good)
@@ -269,6 +280,92 @@ def run_checks(sk, rng):
     sk.set_mode("ok")
     status, _, out = sk.post(good)
     check("and the front serves the next request", status in (200, 422), True)
+    # (6b) the witness (docs/design.md section 20): the signer's anchor, kept here and handed back
+    def envelope_k(k):
+        d = cs.with_nonce(c, c.tx.nonce)
+        d.id = bytes([0x50 + k]) * 32
+        d.env = ce.layout(d)
+        return d
+
+    ks = [envelope_k(k) for k in range(5)]
+    state.reset(c)
+    check("no witness yet: no file", sk.witness(), None)
+    prev = None
+    for k in range(3):
+        status, _, out = sk.post(sign_body(ks[k]))
+        j = json.loads(out)
+        check(f"witness {k}: 200", status, 200)
+        check(f"witness {k}: the request line carries {'none' if prev is None else 'the last answer'}", sk.lastline()[4:], ["-"] if prev is None else prev.split())
+        w = f"{j['anchor']['count']} {j['anchor']['head']}\n".encode()
+        check(f"witness {k}: the file is the answer's anchor, `<count> <head>` and a newline", sk.witness(), w)
+        prev = w.decode().strip()
+    w3 = sk.witness()
+    status, _, out = sk.post(sign_body(ks[1]))
+    check("a retry (the same entry) leaves the witness as it is", (status, json.loads(out).get("entry"), sk.witness()), (200, "same", w3))
+    status, _, out = sk.post(sign_body(ks[3]), identity="someone-else")
+    check("a refusal (422) leaves the witness as it is", (status, sk.witness()), (422, w3))
+    # the witness cannot be written: the signature is not given, and the retry gives the same one
+    os.symlink("/dev/full", os.path.join(sk.fdir, "witness.new"))
+    status, _, out = sk.post(sign_body(ks[3]))
+    check("a witness that cannot be written (/dev/full): 503 front-witness-write and no signature", (status, json.loads(out).get("rule"), b'"signature":' in out), (503, "chain.front-witness-write", False))
+    check("... the witness is as it was and the ledger has the entry", (sk.witness(), len(cs.read_events(state.ledger()))), (w3, 4))
+    os.unlink(os.path.join(sk.fdir, "witness.new"))
+    status, _, out = sk.post(sign_body(ks[3]))
+    j = json.loads(out)
+    check("... the retry is the same entry, with the model's signature, and the witness is written", (status, j.get("entry"), bytes.fromhex(j.get("signature", "")), sk.witness()), (200, "same", ce.sign(ce.kec(ks[3].tx.unsigned()), c.wallet_key), f"{j['anchor']['count']} {j['anchor']['head']}\n".encode()))
+    # two answers lost in a row: the third request is refused by the signer, not signed
+    os.symlink("/dev/full", os.path.join(sk.fdir, "witness.new"))
+    status, _, out = sk.post(sign_body(ks[4]))
+    check("a first lost answer: 503 front-witness-write", (status, json.loads(out).get("rule")), (503, "chain.front-witness-write"))
+    d5 = envelope_k(5)
+    status, _, out = sk.post(sign_body(d5))
+    check("a second lost answer: 503 front-witness-write (the signer may be one entry ahead of the witness)", (status, json.loads(out).get("rule")), (503, "chain.front-witness-write"))
+    d6 = envelope_k(6)
+    status, _, out = sk.post(sign_body(d6))
+    check("a third request: 503 signer-witness-behind, nothing signed", (status, json.loads(out).get("rule"), b'"signature":' in out), (503, "chain.signer-witness-behind", False))
+    os.unlink(os.path.join(sk.fdir, "witness.new"))
+    # a witness file that is not one line of lower-case hex and spaces: 503 front-witness and the signer is never started
+    n0 = sk.starts()
+    wfile = os.path.join(sk.fdir, "witness")
+    for name, data in (("empty", b""), ("one byte", b"1"), ("upper case", b"1 " + b"A" * 64 + b"\n"), ("binary", bytes(range(1, 40)) + b"\n"), ("two lines", b"1 " + b"a" * 64 + b"\n1 " + b"a" * 64 + b"\n"),
+                       ("no newline", b"1 " + b"a" * 64), ("over 72 bytes", b"1 " + b"a" * 80 + b"\n"), ("a tab", b"1\t" + b"a" * 64 + b"\n"), ("a carriage return", b"1 " + b"a" * 64 + b"\r\n"),
+                       ("a g among the digits", b"1 " + b"g" * 64 + b"\n"), ("a backquote", b"1 " + b"`" * 64 + b"\n"), ("a slash", b"1 " + b"/" * 64 + b"\n"), ("a colon", b"1 " + b":" * 64 + b"\n"),
+                       ("an at sign", b"1 " + b"@" * 64 + b"\n"), ("a trailing newline too many", b"1 " + b"a" * 64 + b"\n\n")):
+        open(wfile, "wb").write(data)
+        status, _, out = sk.post(sign_body(ks[0]))
+        check(f"a witness file that is {name}: 503 front-witness", (status, json.loads(out).get("rule")), (503, "chain.front-witness"))
+    os.unlink(wfile)
+    os.mkdir(wfile)
+    status, _, out = sk.post(sign_body(ks[0]))
+    check("a witness that is a directory: 503 front-witness", (status, json.loads(out).get("rule")), (503, "chain.front-witness"))
+    os.rmdir(wfile)
+    check("a damaged witness: the signer is never started", sk.starts() - n0, 0)
+    # no witness file with a ledger of more than one entry: the signer refuses (the front sends none)
+    status, _, out = sk.post(sign_body(ks[0]))
+    check("no witness file and a ledger of several entries: 503 signer-witness-missing", (status, json.loads(out).get("rule"), sk.lastline()[4:]), (503, "chain.signer-witness-missing", ["-"]))
+    # a restore of the signer's directory: refused through the front
+    state.reset(c)
+    sk.post(sign_body(ks[0]))
+    sk.post(sign_body(ks[1]))
+    snap = (open(state.ledger(), "rb").read(), open(state.anchor(), "rb").read())
+    sk.post(sign_body(ks[2]))
+    sk.post(sign_body(ks[3]))
+    w4 = sk.witness()
+    open(state.ledger(), "wb").write(snap[0])
+    open(state.anchor(), "wb").write(snap[1])
+    status, _, out = sk.post(sign_body(ks[0]))
+    check("a restore of the signer's directory to two entries: 503 signer-witness-short, nothing signed", (status, json.loads(out).get("rule"), b'"signature":' in out, sk.witness()), (503, "chain.signer-witness-short", False, w4))
+    # what the front accepts as the signer's 200: it must carry a well-formed anchor
+    state.reset(c)
+    for mode, name in (("noanchor", "no anchor"), ("upperhead", "an anchor with an upper-case head"), ("sixdigits", "an anchor with a six-digit count"), ("emptycount", "an anchor with an empty count"), ("countjunk", "an anchor with a letter after the count")):
+        sk.set_mode(mode)
+        status, _, out = sk.post(good)
+        check(f"a signer whose 200 has {name}: 502 front-signer and no witness", (status, json.loads(out).get("rule"), sk.witness()), (502, "chain.front-signer", None))
+    sk.set_mode("fake")
+    status, _, out = sk.post(good)
+    check("a signer's 200 with an anchor of seven: the witness is exactly that", (status, sk.witness()), (200, b"7 " + b"b" * 64 + b"\n"))
+    sk.set_mode("ok")
+    state.reset(c)
     # (7) one connection, two requests; two connections at once
     state.reset(c)
     s = socket.create_connection(("127.0.0.1", sk.port), timeout=30)
@@ -291,8 +388,8 @@ def run_checks(sk, rng):
     # (8) the authority of the front
     r = subprocess.run([cancho_path(), "authority", "--std", os.path.join(ROOT, "tools/front/main.cho"), *front_sources(None)], capture_output=True, text=True)
     perf = r.stdout.split("performs")[1].split("never touches")[0].split()
-    check("authority: performs exactly these", perf, ["child_signal", "clock", "conn_accept", "conn_read", "conn_write", f'exec("{FRONT_PATH}")', "heap", f'net_in("{FRONT_PORT}")', "pipe_read", "pipe_write", "poll"])
-    check("authority: never touches the console, the filesystem, the command line, signals or foreign code", all(w in r.stdout.split("never touches")[1] for w in ("the console", "the filesystem", "the command line", "signals", "foreign code")), True)
+    check("authority: performs exactly these (one directory)", sorted(perf), sorted(["child_signal", "clock", "conn_accept", "conn_read", "conn_write", f'exec("{FRONT_PATH}")', f'fs_read("{FRONT_DIR}")', f'fs_write("{FRONT_DIR}")', "file_read", "file_write", "heap", f'net_in("{FRONT_PORT}")', "pipe_read", "pipe_write", "poll"]))
+    check("authority: never touches the console, the command line, signals or foreign code", all(w in r.stdout.split("never touches")[1] for w in ("the console", "the command line", "signals", "foreign code")), True)
     check("authority: it is bounded (no UNBOUNDED line)", "UNBOUNDED" not in r.stdout, True)
 
 
@@ -303,6 +400,8 @@ def cancho_path():
 def make_stack(cancho, front_text, signer_main_text, libdir, tmp, port):
     state = os.path.join(tmp, "state")
     os.makedirs(state, exist_ok=True)
+    fdir = os.path.join(tmp, "front-state")
+    os.makedirs(fdir, exist_ok=True)
     real = os.path.join(tmp, "signer-real")
     cs.build(cancho, libdir, signer_main_text, state, real)
     wrapper = os.path.join(tmp, "signer")
@@ -320,13 +419,21 @@ case "$mode" in
   bigline) printf '{{"ok":true,"x":"'; head -c 5000 /dev/zero | tr '\\0' 'a'; printf '"}}\\n'; exit 0;;
   twolines) printf '{{"ok":true,"signature":"00"}}\\n{{"ok":true}}\\n'; exit 0;;
   hang) sleep 60; exit 0;;
+  noanchor) printf '{{"ok":true,"signature":"00","entry":"fresh"}}\n'; exit 0;;
+  upperhead) printf '{{"ok":true,"signature":"00","entry":"fresh","anchor":{{"count":1,"head":"%s"}}}}\n' "$(printf 'A%.0s' $(seq 64))"; exit 0;;
+  sixdigits) printf '{{"ok":true,"signature":"00","entry":"fresh","anchor":{{"count":123456,"head":"%s"}}}}\n' "$(printf 'a%.0s' $(seq 64))"; exit 0;;
+  emptycount) printf '{{"ok":true,"signature":"00","entry":"fresh","anchor":{{"count":,"head":"%s"}}}}\n' "$(printf 'a%.0s' $(seq 64))"; exit 0;;
+  countjunk) printf '{{"ok":true,"signature":"00","entry":"fresh","anchor":{{"count":1x,"head":"%s"}}}}\n' "$(printf 'a%.0s' $(seq 64))"; exit 0;;
+  fake) printf '{{"ok":true,"signature":"00","entry":"fresh","anchor":{{"count":7,"head":"%s"}}}}\n' "$(printf 'b%.0s' $(seq 64))"; exit 0;;
 esac
-exec {real}
+line=$(cat)
+printf '%s\n' "$line" > {tmp}/lastline
+printf '%s\n' "$line" | {real}
 """)
     os.chmod(wrapper, os.stat(wrapper).st_mode | stat.S_IEXEC)
     front = os.path.join(tmp, "front")
-    build_front(cancho, front_text, port, wrapper, front)
-    return Stack(tmp, front, real, state, port)
+    build_front(cancho, front_text, port, wrapper, fdir, front)
+    return Stack(tmp, front, real, state, port, fdir)
 
 
 MUTANTS = [
@@ -384,13 +491,48 @@ MUTANTS = [
     ("unwell: signer-ledger-full", "bytes.equal(tag, \"signer-ledger-full\") ||", "bytes.equal(tag, \"signer-ledger-ful\") ||"),
     ("unwell: signer-config", "bytes.equal(tag, \"signer-config\") ||", "bytes.equal(tag, \"signer-confi\") ||"),
     ("unwell: signer-key", "bytes.equal(tag, \"signer-key\") ||", "bytes.equal(tag, \"signer-ke\") ||"),
-    ("unwell: signer-same-key", "|| bytes.equal(tag, \"signer-same-key\");", "|| bytes.equal(tag, \"signer-same-ke\");"),
+    ("unwell: signer-same-key", "bytes.equal(tag, \"signer-same-key\") ||", "bytes.equal(tag, \"signer-same-ke\") ||"),
     ("rule_of: the prefix", "let head = \"{\\\"ok\\\":false,\\\"rule\\\":\\\"chain.\";", "let head = \"{\\\"ok\\\":false,\\\"rule\\\":\\\"chai.\";"),
     ("refusal: the allow header", "keep, \"Allow: POST\\r\\n\");", "keep, \"\");"),
     ("refusal: 404", "refusal(heap, out, 404,", "refusal(heap, out, 400,"),
     ("refusal: 405", "refusal(heap, out, 405,", "refusal(heap, out, 404,"),
     ("refusal: 401", "refusal(heap, out, 401,", "refusal(heap, out, 403,"),
     ("refusal: 413", "refusal(heap, out, 413,", "refusal(heap, out, 400,"),
+    ("unwell: signer-anchor-corrupt", "bytes.equal(tag, \"signer-anchor-corrupt\")", "bytes.equal(tag, \"signer-anchor-corruptx\")"),
+    ("unwell: signer-anchor-missing", "bytes.equal(tag, \"signer-anchor-missing\")", "bytes.equal(tag, \"signer-anchor-missingx\")"),
+    ("unwell: signer-anchor-short", "bytes.equal(tag, \"signer-anchor-short\")", "bytes.equal(tag, \"signer-anchor-shortx\")"),
+    ("unwell: signer-anchor-mismatch", "bytes.equal(tag, \"signer-anchor-mismatch\")", "bytes.equal(tag, \"signer-anchor-mismatchx\")"),
+    ("unwell: signer-anchor-behind", "bytes.equal(tag, \"signer-anchor-behind\")", "bytes.equal(tag, \"signer-anchor-behindx\")"),
+    ("unwell: signer-anchor-write", "bytes.equal(tag, \"signer-anchor-write\")", "bytes.equal(tag, \"signer-anchor-writex\")"),
+    ("unwell: signer-witness-missing", "bytes.equal(tag, \"signer-witness-missing\")", "bytes.equal(tag, \"signer-witness-missingx\")"),
+    ("unwell: signer-witness-short", "bytes.equal(tag, \"signer-witness-short\")", "bytes.equal(tag, \"signer-witness-shortx\")"),
+    ("unwell: signer-witness-mismatch", "bytes.equal(tag, \"signer-witness-mismatch\")", "bytes.equal(tag, \"signer-witness-mismatchx\")"),
+    ("unwell: signer-witness-behind", "bytes.equal(tag, \"signer-witness-behind\")", "bytes.equal(tag, \"signer-witness-behindx\")"),
+    ("witness: no file is none", "Opened::Failed(e) => {\n            got = 0 - 1;", "Opened::Failed(e) => {\n            got = 0 - 2;"),
+    ("witness: a file of any size", "if size >= 3 && size <= len(out) {", "if size >= 3 && size <= len(out) + 100 {"),
+    ("witness: an empty file", "if size >= 3 && size <= len(out) {", "if size >= 0 && size <= len(out) {"),
+    ("witness: the digits", "c >= 48 && c <= 57 || c >= 97 && c <= 102 || c == 32", "c >= 47 && c <= 57 || c >= 97 && c <= 102 || c == 32"),
+    ("witness: the top of the digits", "c >= 48 && c <= 57 || c >= 97 && c <= 102 || c == 32", "c >= 48 && c <= 58 || c >= 97 && c <= 102 || c == 32"),
+    ("witness: the letters", "c >= 48 && c <= 57 || c >= 97 && c <= 102 || c == 32", "c >= 48 && c <= 57 || c >= 96 && c <= 102 || c == 32"),
+    ("witness: the top of the letters", "c >= 48 && c <= 57 || c >= 97 && c <= 102 || c == 32", "c >= 48 && c <= 57 || c >= 97 && c <= 103 || c == 32"),
+    ("witness: a space", "c >= 48 && c <= 57 || c >= 97 && c <= 102 || c == 32", "c >= 48 && c <= 57 || c >= 97 && c <= 102 || c == 33"),
+    ("witness: the newline", "if ok && int_of(out[size - 1]) == 10 {", "if ok {"),
+    ("witness_of: a short answer", "if len(out) < 72 || n < 100 ||", "if len(out) < 72 || n < 10 ||"),
+    ("witness_of: the head's label", "if expect(answer, n - 68 - 9,", "if expect(answer, n - 68 - 8,"),
+    ("witness_of: the closing", "|| expect(answer, n - 4,", "|| expect(answer, n - 3,"),
+    ("witness_of: the count's digits", "if digits < 1 || digits > 5 ||", "if digits < 1 || digits > 6 ||"),
+    ("witness_of: an empty count", "if digits < 1 || digits > 5 ||", "if digits < 0 || digits > 5 ||"),
+    ("witness_of: nothing after the count", "|| p != n - 77 {", "|| p > n - 77 {"),
+    ("witness_of: the head's digits", "if !is_lower_hex(int_of(answer[n - 68 + k])) {", "if !is_lower_hex(int_of(answer[n - 68])) {"),
+    ("witness_of: the head is copied", "out[digits + 1 + k] = answer[n - 68 + k];", "out[digits + 1 + k] = answer[n - 68];"),
+    ("witness_of: the separator", "out[digits] = byte_of(32);", "out[digits] = byte_of(9);"),
+    ("witness_of: the newline", "out[digits + 65] = byte_of(10);", "out[digits + 65] = byte_of(13);"),
+    ("keep_witness: the write is checked", "!= len(text) {\n        return 0 - 1;", "!= 99999 {\n        return 0 - 1;"),
+    ("keep_witness: the rename's target", "\"/var/lib/cancho-front/witness.new\", \"/var/lib/cancho-front/witness\")", "\"/var/lib/cancho-front/witness.new\", \"/var/lib/cancho-front/witness.new\")"),
+    ("handle: a damaged witness is refused", "if wn == 0 - 2 {", "if wn == 0 - 3 {"),
+    ("handle: a missing witness is a dash", "if wn < 0 {\n                line = buffer.push(heap, line, byte_of(45));", "if wn < 0 - 5 {\n                line = buffer.push(heap, line, byte_of(45));"),
+    ("ask_signer: a lost witness is refused", "witness_failed = true;", "witness_failed = false;"),
+    ("ask_signer: an answer with no anchor", "if wn < 0 {\n                                    status = 502;", "if wn < 0 - 9 {\n                                    status = 502;"),
 ]
 
 # Mutants no request can tell from the original, each with the reason.

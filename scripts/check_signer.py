@@ -60,6 +60,8 @@ class State:
         self.dir, self.exe = path, exe
         self.adir = path + "-anchor"
         os.makedirs(self.adir, exist_ok=True)
+        self.extra = []   # other directories a harness keeps with this one (the front's), cleared with it
+        self.wit = None   # what a front that keeps the last answered anchor would send: "<count> <head>", or None for "-" (design section 20)
 
     def anchor(self):
         return os.path.join(self.adir, "anchor")
@@ -73,9 +75,11 @@ class State:
         n = len(ev) if count is None else count
         h = read_events.ids[n - 1] if head is None else head
         open(self.anchor(), "wb").write(f"{n} ".encode() + h + b"\n")
+        self.wit = f"{n} {h.decode()}"
 
     def reset(self, c=None, conf=True, key=True):
-        for d in (self.dir, self.adir):
+        self.wit = None
+        for d in (self.dir, self.adir, *self.extra):
             for f in os.listdir(d):
                 p = os.path.join(d, f)
                 if os.path.islink(p) or os.path.isfile(p):
@@ -91,17 +95,20 @@ class State:
     def ledger(self):
         return os.path.join(self.dir, "ledger.seg")
 
-    def run(self, c, env=None, sig=None, msg=None, caller=None, line=None, pre=None):
+    def run(self, c, env=None, sig=None, msg=None, caller=None, line=None, pre=None, witness=None):
         e = c.env if env is None else env
         s = sig if sig is not None else ce.sign(ce.env_digest(e), c.issuer_key)
         m = c.tx.unsigned() if msg is None else msg
-        text = line if line is not None else f"{e.hex()} {s.hex()} {m.hex()} {(c.caller if caller is None else caller).hex()}"
+        w = witness if witness is not None else (self.wit or "-")
+        text = line if line is not None else f"{e.hex()} {s.hex()} {m.hex()} {(c.caller if caller is None else caller).hex()} {w}"
         p = subprocess.run([self.exe], input=(text + "\n").encode(), capture_output=True, timeout=120)
         out = p.stdout.decode().strip()
         try:
             j = json.loads(out)
         except ValueError:
             j = None
+        if witness is None and line is None and j and j.get("ok") and "anchor" in j:
+            self.wit = f"{j['anchor']['count']} {j['anchor']['head']}"
         return p.returncode, j, out
 
 
@@ -401,11 +408,11 @@ def run_checks(st, trailtool, cancho, rng, slow):
         ids = read_events.ids
         return (len(ids), ids[-1].decode()) if ids else (0, "")
 
-    def refused_unchanged(name, tag):
+    def refused_unchanged(name, tag, witness=None, env=None):
         """A request that must be refused with `tag`, with the ledger and the anchor exactly as they were."""
         led = open(st.ledger(), "rb").read() if os.path.exists(st.ledger()) else b""
         anc = st.anchor_text()
-        expect_refusal(name, st.run(envs[0]), tag)
+        expect_refusal(name, st.run(envs[0] if env is None else env, witness=witness), tag)
         check(f"{name}: the ledger is untouched (nothing is cut)", open(st.ledger(), "rb").read() if os.path.exists(st.ledger()) else b"", led)
         check(f"{name}: the anchor is untouched", st.anchor_text(), anc)
 
@@ -485,6 +492,7 @@ def run_checks(st, trailtool, cancho, rng, slow):
             damaged = good[:offs[2] + b] + bytes([good[offs[2] + b] ^ bit]) + good[offs[2] + b + 1:]
             open(st.ledger(), "wb").write(damaged)
             open(st.anchor(), "w").write(f"2 {h2}\n")
+            st.wit = f"2 {h2}"
             rc, j, out = st.run(envs[2])
             if rc == 0:
                 # the record only looked torn: it is cut, it was never signed, so the entry is fresh and now covered
@@ -543,6 +551,70 @@ def run_checks(st, trailtool, cancho, rng, slow):
     damaged = good[:offs[1] + 60] + bytes([good[offs[1] + 60] ^ 1]) + good[offs[1] + 61:]
     open(st.ledger(), "wb").write(damaged)
     expect_refusal("damage in the middle, with an anchor", st.run(envs[0]), "signer-ledger-corrupt", st, damaged)
+    # (7c) the front's witness (docs/design.md section 20)
+    def wit_of(n):
+        read_events(st.ledger())
+        return f"{n} {read_events.ids[n - 1].decode()}"
+
+    def four(n):
+        st.reset(c)
+        for d in envs[:n]:
+            assert st.run(d)[0] == 0
+        return n
+
+    # equal, and one behind (the front crashed between the signature and its write): the same entry, signed; two behind: refused
+    four(3)
+    w3, w2, w1 = wit_of(3), wit_of(2), wit_of(1)
+    rc, j, out = st.run(envs[2], witness=w2)
+    check("a witness one behind the ledger: signed, and the answer's anchor is the ledger's", (rc, (j or {}).get("entry"), (j or {}).get("anchor", {}).get("count")), (0, "same", 3))
+    refused_unchanged("a witness two behind the ledger", "signer-witness-behind", witness=w1)
+    # a witness ahead of the ledger, and one naming another entry
+    refused_unchanged("a witness ahead of the ledger", "signer-witness-short", witness=f"4 {'0' * 64}")
+    refused_unchanged("a witness of 65,536 over a ledger of three", "signer-witness-short", witness=f"65536 {'0' * 64}")
+    refused_unchanged("a witness that names another entry", "signer-witness-mismatch", witness=f"3 {'0' * 64}")
+    refused_unchanged("a witness with the head of another entry", "signer-witness-mismatch", witness=f"2 {w3.split()[1]}")
+    refused_unchanged("a witness with the right head and the wrong count", "signer-witness-mismatch", witness=f"2 {w1.split()[1]}")
+    # no witness: allowed for at most one entry
+    for n, ok_ in ((0, True), (1, True), (2, False), (3, False)):
+        four(n)
+        if ok_:
+            rc, j, out = st.run(envs[0], witness="-")
+            check(f"no witness and a ledger of {n}: signed", (rc, (j or {}).get("ok")), (0, True))
+        else:
+            refused_unchanged(f"no witness and a ledger of {n}", "signer-witness-missing", witness="-")
+    # a restore: the ledger and the local anchor put back to an earlier state, together; the local anchor cannot see it, the witness does
+    four(2)
+    snap = (open(st.ledger(), "rb").read(), open(st.anchor(), "rb").read())
+    for d in envs[2:]:
+        st.run(d)
+    w4 = st.wit
+    open(st.ledger(), "wb").write(snap[0])
+    open(st.anchor(), "wb").write(snap[1])
+    refused_unchanged("a restore of the signer's directory to two entries, with the front's witness at four", "signer-witness-short", witness=w4)
+    rc, j, out = st.run(envs[0], witness=wit_of(2))
+    check("... the same restore with a witness that was restored too is accepted (the witness is only as independent as its directory)", (rc, (j or {}).get("entry")), (0, "same"))
+    # the order of the checks: a ledger that the local anchor refuses is refused with the local anchor's tag whatever the witness says
+    four(3)
+    os.unlink(st.anchor())
+    refused_unchanged("no local anchor and a good witness", "signer-anchor-missing", witness=w3)
+    # a ledger that is not clean is refused as before, whatever the witness says
+    four(3)
+    damaged = good[:offs[1] + 60] + bytes([good[offs[1] + 60] ^ 1]) + good[offs[1] + 61:]
+    open(st.ledger(), "wb").write(damaged)
+    expect_refusal("damage in the middle, with a witness", st.run(envs[0]), "signer-ledger-corrupt", st, damaged)
+    # the request line: four fields, a witness that is not one, six or seven fields
+    four(1)
+    e0 = envs[0]
+    base = f"{e0.env.hex()} {ce.sign(ce.env_digest(e0.env), e0.issuer_key).hex()} {e0.tx.unsigned().hex()} {e0.caller.hex()}"
+    h1 = wit_of(1).split()[1]   # this ledger's own: event ids hold the time, so another run's are not
+    for name, tail in (("no witness field", None), ("an empty witness", ""), ("a witness of two dashes", "--"), ("a dash and a space", "- "), ("a dash and a head", f"- {h1}"), ("a count and no head", "1"),
+                       ("a count with a leading zero", f"01 {h1}"), ("a count of zero", f"0 {h1}"), ("a head in upper case", f"1 {h1.upper()}"), ("a head of 63 digits", f"1 {h1[:-1]}"),
+                       ("a head of 65 digits", f"1 {h1}0"), ("a witness with a trailing space", f"1 {h1} "), ("a witness with two spaces", f"1  {h1}"), ("a witness with another field after it", f"1 {h1} 00"),
+                       ("a count over the limit", f"65537 {h1}"), ("a count that is not a number", f"x {h1}"), ("a tab for the space", f"1\t{h1}")):
+        line = base if tail is None else f"{base} {tail}"
+        expect_refusal(f"the request with {name}", st.run(c, line=line), "signer-request")
+    rc, j, out = st.run(c, line=f"{base} 1 {h1}")
+    check("a request with a good witness on the line is served", (rc, (j or {}).get("ok"), (j or {}).get("rule")), (0, True, None))
     # (8) no signature when the ledger cannot be written, and no second signer on one ledger
     st.reset(c)
     os.symlink("/dev/full", st.ledger())
@@ -570,7 +642,7 @@ def run_checks(st, trailtool, cancho, rng, slow):
     st.reset(c)
     rc, j, out = st.run(c)
     check("the key is nowhere on the output", c.wallet_key.hex() not in out and c.issuer_key.hex() not in out, True)
-    p = subprocess.run([st.exe, "--now", "5", "/tmp"], input=(f"{c.env.hex()} {ce.sign(ce.env_digest(c.env), c.issuer_key).hex()} {c.tx.unsigned().hex()} {c.caller.hex()}\n").encode(), capture_output=True)
+    p = subprocess.run([st.exe, "--now", "5", "/tmp"], input=(f"{c.env.hex()} {ce.sign(ce.env_digest(c.env), c.issuer_key).hex()} {c.tx.unsigned().hex()} {c.caller.hex()} -\n").encode(), capture_output=True)
     check("arguments are ignored: the answer is the same", p.returncode, 0)
     # (9) the authority: the one directory, the clock, standard input and output, and nothing else
     r = subprocess.run([cancho, "authority", "--std", os.path.join(ROOT, "tools/signer/main.cho"), *sources(os.path.join(ROOT, "lib"))], capture_output=True, text=True)
@@ -612,10 +684,6 @@ MUTANTS = [
     ("main: the first event names a parent", "main", "if log.records(lg) > 0 {\n                plen = 64;", "if true {\n                plen = 64;"),
     ("main: the parent is cut short", "main", "plen = 64;", "plen = 63;"),
     ("main: a line may be one byte over", "main", "if n >= len(out) {\n            return -275;", "if n > len(out) {\n            return -275;"),
-    ("main: five fields", "main", "if n >= 4 || j - i == 0", "if n >= 5 || j - i == 0"),
-    ("main: an empty field", "main", "if n >= 4 || j - i == 0 ||", "if n >= 4 ||"),
-    ("main: a trailing space", "main", "if n != 4 || int_of(text[len(text) - 1]) == 32 {", "if n != 4 {"),
-    ("main: fewer than four fields", "main", "if n != 4 || int_of(text[len(text) - 1]) == 32 {", "if n > 4 || int_of(text[len(text) - 1]) == 32 {"),
     ("main: the file may be longer than its buffer", "main", "if size <= len(out) {", "if size <= len(out) + 1000000 {"),
     ("main: the ledger is read from the wrong pair", "main", "signer.parse_payload(window[p3.2..p3.2 + p3.3]", "signer.parse_payload(window[p2.2..p2.2 + p2.3]"),
     ("main: the ledger is read to the wrong place", "main", "ledger[k * 64..k * 64 + 32], ledger[k * 64 + 32..k * 64 + 64]", "ledger[k * 64 + 32..k * 64 + 64], ledger[k * 64..k * 64 + 32]"),
@@ -678,6 +746,30 @@ MUTANTS = [
     ("signer: the anchor's count digits", "signer", "out[at] = byte_of(48 + v % 10);", "out[at] = byte_of(49 + v % 10);"),
     ("signer: the anchor's tag", "signer", "return \"signer-anchor-short\";", "return \"signer-anchor-cut\";"),
     ("signer: another anchor tag", "signer", "return \"signer-anchor-write\";", "return \"signer-anchor-disk\";"),
+    # the witness (section 20)
+    ("main: a fifth hex field", "main", "    while n < 4 {\n        if i >= len(text) {", "    while n < 5 {\n        if i >= len(text) {"),
+    ("main: an empty field", "main", "if j - i == 0 || (j - i) % 2 != 0 {", "if (j - i) % 2 != 0 {"),
+    ("main: an odd field", "main", "if j - i == 0 || (j - i) % 2 != 0 {", "if j - i == 0 {"),
+    ("main: fewer than four fields", "main", "    while n < 4 {\n        if i >= len(text) {\n            return -275;\n        }", "    while n < 4 {\n        if i >= len(text) + 1000 {\n            return -275;\n        }"),
+    ("main: the witness is not looked at", "main", "if meta[8] < 0 {\n                                                    if v.2 > 1 {", "if true {\n                                                    if v.2 > 1 {"),
+    ("main: no witness is always accepted", "main", "arefuse = -286;", "arefuse = 0;"),
+    ("main: no witness with one entry is refused", "main", "if meta[8] < 0 {\n                                                    if v.2 > 1 {", "if meta[8] < 0 {\n                                                    if v.2 > 0 {"),
+    ("main: a witness ahead of the ledger is accepted", "main", "if wv.4 == trail.anchor_short() {", "if wv.4 == 99 {"),
+    ("main: a witness for another entry is accepted", "main", "} else if wv.4 == trail.anchor_mismatch() {", "} else if wv.4 == 99 {"),
+    ("main: a ledger far ahead of the witness is accepted", "main", "} else if v.2 - meta[8] > 1 {", "} else if v.2 - meta[8] > 1000000 {"),
+    ("main: a ledger one ahead of the witness is refused", "main", "} else if v.2 - meta[8] > 1 {", "} else if v.2 - meta[8] > 0 {"),
+    ("main: the witness's count is not given to verify", "main", "head2, meta[8], arena[meta[9]..meta[9] + 64]);", "head2, 0, arena[meta[9]..meta[9] + 64]);"),
+    ("main: the witness's head is read from the wrong place", "main", "head2, meta[8], arena[meta[9]..meta[9] + 64]);", "head2, meta[8], arena[meta[9] + 1..meta[9] + 65]);"),
+    ("main: a dash and more is no witness", "main", "if len(rest) == 1 && int_of(rest[0]) == 45 {", "if int_of(rest[0]) == 45 {"),
+    ("main: a request without a witness field", "main", "    if i >= len(text) {\n        return -275;\n    }\n    let rest", "    if i > len(text) + 1000 {\n        return -275;\n    }\n    let rest"),
+    ("main: the witness's count is kept", "main", "meta[8] = count;", "meta[8] = count + 1;"),
+    ("main: the witness's head offset is kept", "main", "meta[9] = at;", "meta[9] = 0;"),
+    ("main: a bad witness is taken for one", "main", "if count > 0 {\n            meta[8] = count;", "if count > -999 {\n            meta[8] = count;"),
+    ("main: a dash is another number", "main", "int_of(rest[0]) == 45", "int_of(rest[0]) == 46"),
+    ("signer: the witness-missing tag", "signer", "return \"signer-witness-missing\";", "return \"signer-witness-none\";"),
+    ("signer: the witness-short tag", "signer", "return \"signer-witness-short\";", "return \"signer-witness-cut\";"),
+    ("signer: the witness-mismatch tag", "signer", "return \"signer-witness-mismatch\";", "return \"signer-witness-other\";"),
+    ("signer: the witness-behind tag", "signer", "return \"signer-witness-behind\";", "return \"signer-witness-old\";"),
 ]
 
 # Mutants no request can tell from the original, each with the reason.
