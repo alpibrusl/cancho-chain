@@ -505,6 +505,7 @@ Its directory is a **compile-time constant** (`/var/lib/cancho-signer`), so `can
 | `wallet.key` | the wallet key, 64 hex digits (a development key: nothing here claims production key management, §6) |
 | `signer.conf` | `issuer=<40 hex digits>` and `chain=<decimal>`: the issuer's address and the one chain it signs for |
 | `ledger.seg` | the ledger: a `cancho-log` segment in **trail mode** (cancho-log `docs/trail.md`), one event `envelope.consumed` per envelope, hash-chained |
+| `/var/lib/cancho-anchor/anchor` | **(slice 12, §19)** the ledger's `(count, head)`, in a second directory: the signer signs only what the anchor covers |
 
 ### 14.2 A request
 
@@ -520,7 +521,7 @@ The time is the signer's own clock; there is no field for it, and no flag that o
 4. **Fresh: append `envelope.consumed` to the ledger and flush, then sign.** If either fails, **no signature is produced** (`signer-ledger-write`): a crash between the flush and the answer loses a signature and never lets a second one out. *Same*: sign again; RFC 6979 gives the same bytes, so the retry is the same transaction.
 5. **Sign** the transaction digest (the envelope's, which `verify` has shown is `keccak256(message)`) with the wallet key, no added randomness: the answer is `r || s || recid`, low s.
 
-The answer is one JSON line: `{"ok":true,"signature":"<130 hex digits>","entry":"fresh"|"same"}`, or `{"ok":false,"rule":"chain.<tag>","repair":"..."}` and exit status 2. No key, digest, envelope or message is ever logged or printed on a refusal; the rule tag is the same one `chain.envelope` gives (§13), plus the signer's own.
+The answer is one JSON line: `{"ok":true,"signature":"<130 hex digits>","entry":"fresh"|"same","anchor":{"count":<n>,"head":"<64 hex>"}}` (the anchor is §19's), or `{"ok":false,"rule":"chain.<tag>","repair":"..."}` and exit status 2. No key, digest, envelope or message is ever logged or printed on a refusal; the rule tag is the same one `chain.envelope` gives (§13), plus the signer's own.
 
 ### 14.4 The payload of a ledger event, and why trail mode
 
@@ -528,7 +529,7 @@ The answer is one JSON line: `{"ok":true,"signature":"<130 hex digits>","entry":
 
 ### 14.5 What it does not do
 
-It cannot tell a ledger whose **last** record has a damaged length field from a torn tail (both end inside a record), and cuts it: that entry is lost and its envelope would be signed again if presented, once. Closing that needs an anchor `(count, head)` kept where the signer's owner cannot reach it, which `trail.verify` already accepts and this slice does not wire. It does not listen on a socket, draw randomness, rate-limit, keep the history the policy engine reads (that is the evidence store's, later), take the issuer's address from anywhere but its configuration, sign anything but an ERC-20 `transfer` that `txcheck` accepts, or protect the key from a person with the directory (a file readable by root is readable by root: a hardware key is out of scope). A compromised front can ask for signatures it has envelopes for, and no others; a compromised issuer key can authorise anything within the signer's chain and wallet (§13.4).
+Before slice 12 it could not tell a ledger whose **last** record has a damaged length field from a torn tail (both end inside a record), and cut it: that entry was lost and its envelope could be signed again, once. **Closed in slice 12 (§19):** a record the anchor covers is refused, not cut; one beyond it was never signed, so cutting it is safe. It does not listen on a socket, draw randomness, rate-limit, keep the history the policy engine reads (that is the evidence store's, later), take the issuer's address from anywhere but its configuration, sign anything but an ERC-20 `transfer` that `txcheck` accepts, or protect the key from a person with the directory (a file readable by root is readable by root: a hardware key is out of scope). A compromised front can ask for signatures it has envelopes for, and no others; a compromised issuer key can authorise anything within the signer's chain and wallet (§13.4).
 
 ### 14.6 How it is checked
 
@@ -639,7 +640,7 @@ An `error` is its code and nothing else (the message is a provider's free text a
 
 **The checks found a real fault in the executor, now fixed** (corrected in place): when both providers were behind the block they named (tip below the block), `lifecycle.observe` refused with `-321` even though no decision was being made, so a lagging pair of providers stopped the executor with `chain.executor-state` instead of "no decision". The executor now passes the record no block it cannot be in. The same checks also showed that a corrupt `state` file was read as absent; it is now refused (`executor-state`) unless the file is missing.
 
-**Still not done:** TLS (a provider is reached through a loopback forwarder), chunked answers, verifying the signature, wiring the signer's anchor `(count, head)`, constant-time secp256k1 (alpibrusl/cancho#712), an independent review.
+**Still not done:** TLS (a provider is reached through a loopback forwarder), chunked answers, verifying the signature, an external copy of the signer's anchor kept by the front or the gateway (§19.2: the signer only emits it), constant-time secp256k1 (alpibrusl/cancho#712), an independent review.
 
 **Not in this slice, said now.** A network connection (nothing here opens a socket), a second provider for critical reads (§5 asks for one: the executor will take two answers and require them to agree before a transaction is called final), and the lifecycle's states and transitions.
 
@@ -756,6 +757,52 @@ Kind `tx.state`, payload `{"envelope":"<id hex>","tx":"<hash hex>","state":"<nam
 `scripts/check_executor.py`: the real executor against **two mock nodes** (Python HTTP servers speaking JSON-RPC from a model of a chain: blocks, a mempool, an account nonce, with a transaction built and signed by `eth-account`) that can be made to forget, reorganise, lie, answer with another chain id, hang, answer in chunks or with garbage, or be down. Ticks are driven by the script. Scenarios: an honest chain to `FINAL` (the evidence has each change, the hash chain verifies with `trailtool`); a reverted transaction to `FAILED_FINAL`; a transaction the mempool forgets (`DROPPED`, resent, final); a reorganisation (back to `SUBMITTED`, then final in the new block); a nonce taken by another transaction (`REPLACED` only after `settle_ms`); one provider lying at each step (nothing changes, nothing is sent twice, and the state is never `FINAL` unless the truth says so); one provider down or hanging; a provider on another chain; a job that is not what the envelope authorised (refused before any request); a killed tick (state and evidence consistent, the same transaction); the authority of the binary; `--mutants`. Results are added below when measured.
 
 **Not in this slice, said now.** TLS, a chunked answer, more than two providers, scheduling (the caller's), verifying the signature, a fee bump or replacement (the lifecycle has no such action by design: §17.3).
+
+## 19. The signer's anchor (slice 12)
+
+**Status: built (§19.5).** §14.5 said what the signer could not do: it cannot tell a ledger whose last record has a damaged length field from a torn tail, and it cuts it, so one consumed entry is lost and its envelope can be signed again. More generally a cut tail, or a ledger rewritten consistently, verifies: a hash chain proves nothing about what is *missing from its end* unless someone holds `(count, head)` from outside it (cancho-log `docs/trail.md`). `trail.verify` already takes that anchor; this slice wires it.
+
+### 19.1 The rule, and why it is enough
+
+**An envelope is signed only if its ledger entry is covered by the anchor.** The signer keeps the anchor `(count, head)`, the number of entries and the id of the last one, in a file of its own, and moves it **after the ledger flush and before the signature**:
+
+1. verify the ledger whole, read-only, **against the anchor** (`trail.verify` with the anchor);
+2. a fresh envelope: append and flush the entry; **then write the new anchor** (a temporary file and a rename); **then sign**.
+
+Consequences, each of which the checks make fail if it is false:
+
+- No signature ever exists for an entry beyond the anchor. So a torn or damaged *last* record that is beyond the anchor was never signed: **cutting it is safe**, which is exactly the case §14.5 could not decide. A damaged record *within* the anchor (fewer events than the anchor counts) is refused, not cut: `signer-anchor-short`.
+- A tail cut below the anchor is refused (`signer-anchor-short`); a ledger rewritten with another entry at the anchor's count is refused (`signer-anchor-mismatch`).
+- A crash after the flush and before the anchor write leaves the ledger one entry ahead of the anchor. The next start finds the entry beyond the anchor, **writes the anchor to cover it before any signature**, including for the same envelope presented again (*same* signs again only once it is covered).
+- A crash after the anchor write and before the answer loses a signature and never lets a second one out, as before.
+
+### 19.2 The file, and what the signer is trusted with
+
+`/var/lib/cancho-anchor/anchor` (a second compile-time directory, so `cancho authority` names exactly two paths): `<count in decimal> <head, 64 lowercase hex>\n`, read by position and refused if anything else (`signer-anchor-corrupt`: a leading zero, a missing newline, upper case, a second line, a count over the ledger's limit). **[choice]** No anchor file with a ledger of two or more entries is `signer-anchor-missing`, not "no anchor": deleting the file must not switch the protection off. A new deployment (empty ledger, no anchor) starts normally and writes the first anchor with the first entry; no anchor and **one** entry is what a crash at the very first entry leaves (the anchor is "zero entries" and the rule below allows one ahead), so it is covered and goes on. That makes deleting the anchor of a one-entry ledger and cutting that entry undetectable: a window of one entry, closed by the second. A ledger that already exists is adopted by the operator writing the file from `trailtool verify` (its `events` and `head`).
+**[choice]** The entries beyond the anchor may be **at most one**; more is `signer-anchor-behind` (the signer writes the anchor with every entry, so a larger lag means the anchor was restored from an older copy, or the ledger was extended by someone else). A consistent rollback of both files cannot be told from a clean history: no anchor can.
+
+**What this does not give, said now.** The anchor protects only if the party that can damage the ledger cannot also rewrite the anchor. The signer's process can write both; a person with the signer's user can too. The protection is real **when the anchor directory is another user's, another volume, an append-only mount, or is copied out**: the signer's answer therefore also carries the new anchor, `"anchor":{"count":N,"head":"<hex>"}`, so the front, the gateway or an auditor can keep a copy the signer cannot reach. How the copy is kept and compared is the deployment's, and **until it is, this closes accidental damage and ledger-only tampering, not an attacker who owns the whole host.** The executor's evidence trail has the same gap and is not changed here (its state is the lifecycle's and it signs nothing).
+
+### 19.3 New refusals
+
+`signer-anchor-corrupt`, `signer-anchor-missing`, `signer-anchor-short`, `signer-anchor-mismatch`, `signer-anchor-behind`, `signer-anchor-write` (the anchor could not be written: **no signature**, the entry stays and the next start covers it). Each has a stable tag, a repair, and no input reaches a panic.
+
+### 19.4 How it is checked
+
+`scripts/check_signer.py` grows, against the independent ledger reader and `trailtool`: the anchor after each fresh request is `(count, head)` as the reader computes it; every refusal above; a ledger cut at each record boundary below the anchor; a last record damaged in each byte of its length field (which §14.5 cut and now is refused when covered and cut when not); a flush-then-fail run (anchor directory unwritable: no signature, ledger one ahead, the next start covers it, the same signature is returned); the anchor restored from an older copy; the file with each kind of damage; the answer's anchor equals the file's; `cancho authority` names exactly the two directories. New `--mutants`. Measured results are added below.
+
+### 19.5 Results (measured)
+
+`check_signer.py`: **618 checks, 0 failed** (386 before this slice), and `--mutants`: **85 mutants, 83 killed, 2 equivalent, each explained** (one older: a torn length bound that no input can miss; one new: a six-digit count is over `max_entries`, which the next check refuses with the same tag). `check_front.py` (117) and `check_stack.py` (15, through the real gateway) still pass with the signer built for two directories; the whole gate (`scripts/gate.sh`) passes.
+
+What the checks measured, and what they changed:
+
+- The anchor in the file and in the answer equals `(count, head)` as the independent ledger reader computes them after every request, and `trailtool verify <dir> <count> <head>` confirms it (`anchor 1`).
+- Refused with the ledger and the anchor **byte for byte untouched**: no anchor with two or more entries, 19 kinds of damaged anchor file (leading zero, zero, over the limit, no newline, a second line, upper case, short and long heads, a colon in the count, a directory, 5,000 bytes, and others), a ledger cut at each record boundary below the anchor, a ledger rewritten consistently (the same chain with another third entry; another whole ledger of the same length), a ledger two or three entries ahead of its anchor, and an anchor with no ledger.
+- **A fault the first run showed, now fixed:** a failed anchor write at the very first entry left a ledger of one entry and no anchor, which the rule above refused as `signer-anchor-missing`, so one crash would have stopped a new deployment until a person wrote the file. "No anchor" is now "zero entries": one entry ahead is allowed, so it is covered and goes on; two or more is still refused. The cost, said in §19.2: deleting the anchor of a one-entry ledger and cutting that entry goes undetected, a window the second entry closes.
+- A ledger one ahead of the anchor (a crash between the flush and the anchor write) is covered at the next start, before any signature, and the signature is the clean run's (RFC 6979). An anchor that cannot be written (`/dev/full`) gives no signature and leaves the entry on the ledger; the next run covers it and signs.
+- **The damaged-length case of §14.5, measured:** of 12 single-bit damages to the length field of the last record (four bytes, three bits), **one** looked torn (a length grown past the end of the file); the others were already refused as corrupt. The one that looked torn is refused when the anchor covers it and **cut when it does not**, the entry then fresh and signed once.
+- Not tested, said plainly: the order flush, anchor, signature is not distinguished from anchor-then-flush by any kill point (a process is not killed between two lines here); what the tests show is its observable result (no signature when the anchor cannot be written; a covering anchor after a crash). Durability across a power loss depends on `fs_write` and the file system (it does not call `fsync`); across a process kill the order holds.
 
 ## 12. Open questions for the maintainer
 

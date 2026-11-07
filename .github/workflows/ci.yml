@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: chain
+
+      # The compiler these sources were written for: the commit pinned in cancho.toml, read from there so there is one place to change it.
+      - name: Read the compiler pin
+        id: pin
+        working-directory: chain
+        run: echo "rev=$(sed -n 's/^cancho = "\([0-9a-f]*\)".*/\1/p' cancho.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Check out cancho (the compiler, and the secp256k1 package)
+        uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/cancho
+          ref: ${{ steps.pin.outputs.rev }}
+          path: cancho
+
+      # The secp256k1 package (cancho#710) is newer than the pinned compiler: its sources are taken from the commit that added it. The compiler that builds them is still the pin.
+      - name: Check out cancho's packages
+        uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/cancho
+          ref: 73723de69829e424213789936e3d3c10527a5688
+          path: cancho-packages
+
+      - name: Check out cancho-schema
+        uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/cancho-schema
+          path: cancho-schema
+
+      - name: Check out cancho-log
+        uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/cancho-log
+          path: cancho-log
+
+      - name: Cache the compiler
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: cancho/target/release/cancho
+          key: cancho-${{ steps.pin.outputs.rev }}-ubuntu-24.04
+
+      - name: Build cancho
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: cancho
+        run: cargo build --release -p cancho
+
+      # In a virtual environment: the checks run `python3 -I`, which ignores the user site where a plain `pip install` goes.
+      - name: Python oracles
+        run: |
+          python3 -m venv "$HOME/venv"
+          "$HOME/venv/bin/pip" install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils jsonschema
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Gate
+        working-directory: chain
+        run: |
+          CANCHO=$GITHUB_WORKSPACE/cancho/target/release/cancho \
+          CANCHO_PACKAGES=$GITHUB_WORKSPACE/cancho-packages/packages \
+          CANCHO_SCHEMA=$GITHUB_WORKSPACE/cancho-schema/src/schema.cho \
+          CANCHO_LOG=$GITHUB_WORKSPACE/cancho-log/src \
+          scripts/gate.sh

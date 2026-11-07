@@ -57,6 +57,31 @@ pub fn refused_clock() -> [] int {
     return -279;
 }
 
+// The anchor's refusals (docs/design.md section 19).
+pub fn refused_anchor_corrupt() -> [] int {
+    return -280;
+}
+
+pub fn refused_anchor_missing() -> [] int {
+    return -281;
+}
+
+pub fn refused_anchor_short() -> [] int {
+    return -282;
+}
+
+pub fn refused_anchor_mismatch() -> [] int {
+    return -283;
+}
+
+pub fn refused_anchor_behind() -> [] int {
+    return -284;
+}
+
+pub fn refused_anchor_write() -> [] int {
+    return -285;
+}
+
 // The rule tag of a refusal, without the `chain.` prefix: the envelope's own (-240 to -261) or the signer's.
 pub fn refusal_tag(code: int) -> [] &static [byte] {
     if code <= -240 && code >= -261 {
@@ -92,6 +117,24 @@ pub fn refusal_tag(code: int) -> [] &static [byte] {
     if code == -279 {
         return "signer-clock";
     }
+    if code == -280 {
+        return "signer-anchor-corrupt";
+    }
+    if code == -281 {
+        return "signer-anchor-missing";
+    }
+    if code == -282 {
+        return "signer-anchor-short";
+    }
+    if code == -283 {
+        return "signer-anchor-mismatch";
+    }
+    if code == -284 {
+        return "signer-anchor-behind";
+    }
+    if code == -285 {
+        return "signer-anchor-write";
+    }
     return "signer-unknown";
 }
 
@@ -126,6 +169,24 @@ pub fn repair(code: int) -> [] &static [byte] {
     }
     if code == -279 {
         return "the clock could not be read";
+    }
+    if code == -280 {
+        return "the anchor file is not exactly <count> <64 hex digits> and a newline; a person must look at it";
+    }
+    if code == -281 {
+        return "the ledger has entries and there is no anchor; restore it, or write it from the ledger's count and head once a person has checked the ledger";
+    }
+    if code == -282 {
+        return "the ledger has fewer entries than the anchor counted, or the anchor is from another ledger: entries were cut; nothing is signed until a person has looked";
+    }
+    if code == -283 {
+        return "the ledger's entry at the anchor's count is not the anchor's: the ledger was rewritten; nothing is signed until a person has looked";
+    }
+    if code == -284 {
+        return "the ledger is more than one entry ahead of the anchor: the anchor was restored from an older copy; a person must look";
+    }
+    if code == -285 {
+        return "the anchor could not be written, so nothing was signed; check the anchor directory and retry";
     }
     if code == -250 {
         return "the envelope is not a whole version-1 envelope";
@@ -295,4 +356,82 @@ pub fn parse_key[&t, &o](text: &t [byte], key: &!o [byte]) -> [] int {
         return -277;
     }
     return 0;
+}
+
+// The anchor's file (docs/design.md section 19.2): `<count> <head>` and a newline, the count in decimal with no leading zero (1 to `max_entries`), the head 64 lower-case hex digits.
+pub fn anchor_max_len() -> [] int {
+    return 71;
+}
+
+// Reads it back: the count is answered and the head's 64 digits go to `head`; -280 if the text is anything else.
+pub fn parse_anchor[&t, &h](text: &t [byte], head: &!h [byte]) -> [] int {
+    if len(head) != 64 || len(text) < 67 || len(text) > 71 {
+        return -280;
+    }
+    var sp = 0;
+    while sp < len(text) && int_of(text[sp]) != 32 {
+        sp = sp + 1;
+    }
+    if sp < 1 || sp > 5 || len(text) != sp + 66 {
+        return -280;
+    }
+    if int_of(text[sp + 65]) != 10 {
+        return -280;
+    }
+    if sp > 1 && int_of(text[0]) == 48 {
+        return -280;
+    }
+    var count = 0;
+    var k = 0;
+    while k < sp {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return -280;
+        }
+        count = count * 10 + (c - 48);
+        k = k + 1;
+    }
+    if count < 1 || count > max_entries() {
+        return -280;
+    }
+    k = 0;
+    while k < 64 {
+        if !is_lower_hex(int_of(text[sp + 1 + k])) {
+            return -280;
+        }
+        head[k] = text[sp + 1 + k];
+        k = k + 1;
+    }
+    return count;
+}
+
+// Writes `count` and `head` (64 hex digits) as the file's text into `out` (at least 71 bytes); answers the length, or -280.
+pub fn format_anchor[&h, &o](count: int, head: &h [byte], out: &!o [byte]) -> [] int {
+    if count < 1 || count > max_entries() || len(head) != 64 || len(out) < 71 {
+        return -280;
+    }
+    var digits = 1;
+    var t = count;
+    while t >= 10 {
+        t = t / 10;
+        digits = digits + 1;
+    }
+    var at = digits - 1;
+    var v = count;
+    while at >= 0 {
+        out[at] = byte_of(48 + v % 10);
+        v = v / 10;
+        at = at - 1;
+    }
+    out[digits] = byte_of(32);
+    var k = 0;
+    while k < 64 {
+        if !is_lower_hex(int_of(head[k])) {
+            return -280;
+        }
+        out[digits + 1 + k] = head[k];
+        k = k + 1;
+    }
+    out[digits + 65] = byte_of(10);
+    return digits + 66;
 }

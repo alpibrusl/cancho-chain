@@ -85,6 +85,93 @@ fn read_small[&c, &p, &o](fs: &c Fs("/var/lib/cancho-signer"), path: &p [byte], 
     return got;
 }
 
+// The anchor (docs/design.md section 19.2): its count, with its head's 64 digits in `head`; -1 if it cannot be opened (missing), -280 if it is there and is not exactly what `format_anchor` writes.
+fn read_anchor[&c, &o, &h](fs: &c Fs("/var/lib/cancho-anchor"), buf: &!o [byte], head: &!h [byte]) -> [fs_read("/var/lib/cancho-anchor"), file_read] int {
+    var got = -1;
+    match open_read(fs, "/var/lib/cancho-anchor/anchor") {
+        Opened::Failed(e) => {
+            got = -1;
+        }
+        Opened::Ok(opened) => {
+            got = -280;
+            var f = opened;
+            borrow mut f as &!fh in {
+                match file_size(fh) {
+                    Done::Failed(e) => {
+                        got = -280;
+                    }
+                    Done::Ok(size) => {
+                        if size > 0 && size <= len(buf) {
+                            var have = 0;
+                            var ok = true;
+                            while have < size && ok {
+                                match file_pread(fh, have, buf[have..size]) {
+                                    Read::Got(n) => {
+                                        have = have + n;
+                                    }
+                                    Read::End => {
+                                        ok = false;
+                                    }
+                                    Read::Failed(e) => {
+                                        ok = false;
+                                    }
+                                }
+                            }
+                            if ok {
+                                got = signer.parse_anchor(buf[0..size], head);
+                            }
+                        }
+                    }
+                }
+            }
+            file_close(f);
+        }
+    }
+    return got;
+}
+
+// The anchor `(count, head)` into `anchor.new` and then renamed over `anchor`. 0, or -285.
+fn write_anchor[&c, &h](fs: &c Fs("/var/lib/cancho-anchor"), count: int, head: &h [byte]) -> [fs_write("/var/lib/cancho-anchor")] int {
+    var out = -285;
+    region w {
+        let text = alloc_slice[w](72, byte_of(0));
+        let n = signer.format_anchor(count, head, text);
+        if n > 0 && fs_write(fs, "/var/lib/cancho-anchor/anchor.new", text[0..n]) == n {
+            match fs_rename(fs, "/var/lib/cancho-anchor/anchor.new", "/var/lib/cancho-anchor/anchor") {
+                Done::Ok(z) => {
+                    out = 0;
+                }
+                Done::Failed(e) => {
+                    out = -285;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// A count in decimal.
+fn say_count[&i](io: &!i Io, n: int) -> [io_write] int {
+    region d {
+        let buf = alloc_slice[d](8, byte_of(0));
+        var digits = 1;
+        var t = n;
+        while t >= 10 {
+            t = t / 10;
+            digits = digits + 1;
+        }
+        var at = digits - 1;
+        var v = n;
+        while at >= 0 {
+            buf[at] = byte_of(48 + v % 10);
+            v = v / 10;
+            at = at - 1;
+        }
+        io.write_all(io, buf[0..digits]);
+    }
+    return 0;
+}
+
 // The request line from standard input into `out`; answers its length (no newline), or -275 if it is empty or longer than `out`.
 fn read_line[&i, &o](io: &!i Io, out: &!o [byte]) -> [io_read] int {
     var n = 0;
@@ -164,7 +251,7 @@ fn read_ledger[&l, &w, &g](lg: &!l log.Log, window: &!w [byte], ledger: &!g [byt
     return k;
 }
 
-fn serve[&c, &k, &i, &q, &t, &d](fs: &c Fs("/var/lib/cancho-signer"), clock: &k Clock, io: &!i Io, hp: &!q Heap, st: &!t [int], work: &!d [int]) -> [fs_read("/var/lib/cancho-signer"), fs_write("/var/lib/cancho-signer"), file_read, file_write, clock, heap, io_read, io_write] int {
+fn serve[&c, &ac, &k, &i, &q, &t, &d](fs: &c Fs("/var/lib/cancho-signer"), anc: &ac Fs("/var/lib/cancho-anchor"), clock: &k Clock, io: &!i Io, hp: &!q Heap, st: &!t [int], work: &!d [int]) -> [fs_read("/var/lib/cancho-signer"), fs_write("/var/lib/cancho-signer"), fs_read("/var/lib/cancho-anchor"), fs_write("/var/lib/cancho-anchor"), file_read, file_write, clock, heap, io_read, io_write] int {
     var status = 2;
     region a {
         let line = alloc_slice[a](4096, byte_of(0));
@@ -211,7 +298,7 @@ fn serve[&c, &k, &i, &q, &t, &d](fs: &c Fs("/var/lib/cancho-signer"), clock: &k 
                 if code != 0 {
                     status = refuse(io, code);
                 } else {
-                    status = with_ledger(fs, clock, io, hp, arena, meta, issuer, wallet, chain, key, st, work, detail);
+                    status = with_ledger(fs, anc, clock, io, hp, arena, meta, issuer, wallet, chain, key, st, work, detail);
                 }
             }
         }
@@ -234,11 +321,15 @@ fn bytes_equal[&x, &y](x: &x [byte], y: &y [byte]) -> [] bool {
 }
 
 // Opens the ledger, locks it, recovers and verifies it, and hands the request on.
-fn with_ledger[&c, &k, &i, &q, &a, &m, &s, &w, &y, &t, &d, &x](fs: &c Fs("/var/lib/cancho-signer"), clock: &k Clock, io: &!i Io, hp: &!q Heap, arena: &a [byte], meta: &m [int], issuer: &s [byte], wallet: &w [byte], chain: int, key: &y [byte], st: &!t [int], work: &!d [int], detail: &!x [int]) -> [fs_read("/var/lib/cancho-signer"), fs_write("/var/lib/cancho-signer"), file_read, file_write, clock, heap, io_write] int {
+fn with_ledger[&c, &ac, &k, &i, &q, &a, &m, &s, &w, &y, &t, &d, &x](fs: &c Fs("/var/lib/cancho-signer"), anc: &ac Fs("/var/lib/cancho-anchor"), clock: &k Clock, io: &!i Io, hp: &!q Heap, arena: &a [byte], meta: &m [int], issuer: &s [byte], wallet: &w [byte], chain: int, key: &y [byte], st: &!t [int], work: &!d [int], detail: &!x [int]) -> [fs_read("/var/lib/cancho-signer"), fs_write("/var/lib/cancho-signer"), fs_read("/var/lib/cancho-anchor"), fs_write("/var/lib/cancho-anchor"), file_read, file_write, clock, heap, io_write] int {
     var status = 2;
     region r {
         let window = alloc_slice[r](max_log_len() + 4096, byte_of(0));
         let head = alloc_slice[r](64, byte_of(0));
+        let abuf = alloc_slice[r](72, byte_of(0));
+        let ahead = alloc_slice[r](64, byte_of(0));
+        var ac = -1;
+        var arefuse = 0;
         let path = "/var/lib/cancho-signer/ledger.seg";
         match open_append(fs, path) {
             Opened::Failed(e) => {
@@ -265,16 +356,41 @@ fn with_ledger[&c, &k, &i, &q, &a, &m, &s, &w, &y, &t, &d, &x](fs: &c Fs("/var/l
                                 }
                             }
                             if locked {
+                                ac = read_anchor(anc, abuf, ahead);
                                 // A read-only walk first. `recover` would cut a ledger at the first thing that is not a whole record, and for damage in the middle of the file that would
                                 // throw away entries that were consumed: so only a torn tail, shorter than one record, is ever cut (docs/design.md section 14.3).
                                 match file_size(h) {
                                     Done::Ok(size) => {
-                                        v = trail.verify(h, size, window, max_log_len(), head, 0, "");
+                                        var an = 0;
+                                        if ac >= 1 {
+                                            an = ac;
+                                        }
+                                        v = trail.verify(h, size, window, max_log_len(), head, an, ahead);
                                         let tail = size - v.1;
                                         if v.0 == trail.clean() || v.0 == trail.torn() && tail < max_log_len() + 4 {
-                                            rec = log.recover(h, window, max_log_len());
-                                            if rec.2 != v.2 {
+                                            // The anchor first, and before anything is cut: what it covers is never cut (docs/design.md section 19.1).
+                                            if ac == -280 {
+                                                arefuse = -280;
+                                            } else if ac < 0 {
+                                                // No anchor is "zero entries": the ledger may be one ahead, as after a crash at the very first entry, and no more.
+                                                if v.2 > 1 {
+                                                    arefuse = -281;
+                                                }
+                                            } else if v.4 == trail.anchor_short() {
+                                                arefuse = -282;
+                                            } else if v.4 == trail.anchor_mismatch() {
+                                                arefuse = -283;
+                                            } else if v.2 - ac > 1 {
+                                                arefuse = -284;
+                                            }
+                                            if arefuse != 0 {
                                                 v = (9, 0, 0, 0, 0);
+                                                rec = (1, 0, 0, 0 - 1, 0 - 1);
+                                            } else {
+                                                rec = log.recover(h, window, max_log_len());
+                                                if rec.2 != v.2 {
+                                                    v = (9, 0, 0, 0, 0);
+                                                }
                                             }
                                         } else {
                                             v = (9, 0, 0, 0, 0);
@@ -290,6 +406,9 @@ fn with_ledger[&c, &k, &i, &q, &a, &m, &s, &w, &y, &t, &d, &x](fs: &c Fs("/var/l
                         }
                         if !locked {
                             status = refuse(io, -270);
+                            file_close(w0);
+                        } else if arefuse != 0 {
+                            status = refuse(io, arefuse);
                             file_close(w0);
                         } else if rec.0 != 0 || v.0 == 9 {
                             status = refuse(io, -272);
@@ -313,7 +432,7 @@ fn with_ledger[&c, &k, &i, &q, &a, &m, &s, &w, &y, &t, &d, &x](fs: &c Fs("/var/l
                                             if entries < 0 {
                                                 status = refuse(io, -272);
                                             } else {
-                                                status = decide(l, clock, io, arena, meta, issuer, wallet, chain, key, st, work, detail, contents(lb)[0..entries * 64], head);
+                                                status = decide(l, anc, ac, clock, io, arena, meta, issuer, wallet, chain, key, st, work, detail, contents(lb)[0..entries * 64], head);
                                             }
                                         }
                                     }
@@ -332,7 +451,7 @@ fn with_ledger[&c, &k, &i, &q, &a, &m, &s, &w, &y, &t, &d, &x](fs: &c Fs("/var/l
 }
 
 // The request against the ledger: verify, check single use, record, then sign.
-fn decide[&l, &k, &i, &a, &m, &s, &w, &y, &t, &d, &x, &g, &h](lg: &!l log.Log, clock: &k Clock, io: &!i Io, arena: &a [byte], meta: &m [int], issuer: &s [byte], wallet: &w [byte], chain: int, key: &y [byte], st: &!t [int], work: &!d [int], detail: &!x [int], ledger: &g [byte], head: &!h [byte]) -> [file_write, clock, io_write] int {
+fn decide[&l, &ac, &k, &i, &a, &m, &s, &w, &y, &t, &d, &x, &g, &h](lg: &!l log.Log, anc: &ac Fs("/var/lib/cancho-anchor"), acount: int, clock: &k Clock, io: &!i Io, arena: &a [byte], meta: &m [int], issuer: &s [byte], wallet: &w [byte], chain: int, key: &y [byte], st: &!t [int], work: &!d [int], detail: &!x [int], ledger: &g [byte], head: &!h [byte]) -> [file_write, fs_write("/var/lib/cancho-anchor"), clock, io_write] int {
     let env = arena[meta[0]..meta[0] + meta[4]];
     let sig = arena[meta[1]..meta[1] + meta[5]];
     let msg = arena[meta[2]..meta[2] + meta[6]];
@@ -376,6 +495,16 @@ fn decide[&l, &k, &i, &a, &m, &s, &w, &y, &t, &d, &x, &g, &h](lg: &!l log.Log, c
             return refuse(io, -274);
         }
     }
+    // The anchor covers the entry before any signature exists: after the append, or, for an entry that is already there, once (design section 19.1).
+    var total = len(ledger) / 64;
+    if seen == 0 {
+        total = total + 1;
+    }
+    if total != acount {
+        if write_anchor(anc, total, head) != 0 {
+            return refuse(io, -285);
+        }
+    }
     var out = 0;
     region s2 {
         let sg = alloc_slice[s2](65, byte_of(0));
@@ -388,10 +517,14 @@ fn decide[&l, &k, &i, &a, &m, &s, &w, &y, &t, &d, &x, &g, &h](lg: &!l log.Log, c
             say(io, "{\"ok\":true,\"signature\":\"");
             io.write_all(io, hexed);
             if seen == 0 {
-                say(io, "\",\"entry\":\"fresh\"}");
+                say(io, "\",\"entry\":\"fresh\",\"anchor\":{\"count\":");
             } else {
-                say(io, "\",\"entry\":\"same\"}");
+                say(io, "\",\"entry\":\"same\",\"anchor\":{\"count\":");
             }
+            say_count(io, total);
+            say(io, ",\"head\":\"");
+            io.write_all(io, head[0..64]);
+            say(io, "\"}}");
             io.newline(io);
             out = 0;
         }
@@ -409,16 +542,18 @@ fn main(world: World) -> [] int {
     var status = 2;
     var out = io;
     var pool = heap;
-    let dir = narrow(fs, "/var/lib/cancho-signer");
+    let (dir, adir) = narrow(fs, "/var/lib/cancho-signer", "/var/lib/cancho-anchor");
     borrow mut pool as &!hp in {
         let st = box_slice(hp, keccak.state_len(), 0);
         let work = box_slice(hp, secp256k1.work_len(), 0);
         borrow mut st as &!s1 in {
             borrow mut work as &!w1 in {
                 borrow dir as &c in {
-                    borrow clock as &k in {
-                        borrow mut out as &!o in {
-                            status = serve(c, k, o, hp, contents(s1), contents(w1));
+                    borrow adir as &ac in {
+                        borrow clock as &k in {
+                            borrow mut out as &!o in {
+                                status = serve(c, ac, k, o, hp, contents(s1), contents(w1));
+                            }
                         }
                     }
                 }
@@ -429,6 +564,7 @@ fn main(world: World) -> [] int {
     }
     release(pool);
     release(dir);
+    release(adir);
     release(clock);
     release(out);
     return status;
