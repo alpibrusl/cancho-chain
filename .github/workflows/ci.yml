@@ -26,12 +26,12 @@ jobs:
           ref: ${{ steps.pin.outputs.rev }}
           path: cancho
 
-      # The secp256k1 package (cancho#710) is newer than the pinned compiler: its sources are taken from the commit that added it. The compiler that builds them is still the pin.
+      # The secp256k1 package (cancho#710, and cancho#725 which made its statics buildable by the pinned compiler's front end) is newer than the pinned compiler: its sources are taken from a later commit. The compiler that builds them is still the pin.
       - name: Check out cancho's packages
         uses: actions/checkout@v4
         with:
           repository: alpibrusl/cancho
-          ref: 73723de69829e424213789936e3d3c10527a5688
+          ref: b0a0d192be0d910048665c0e664c5d523502d2f4
           path: cancho-packages
 
       - name: Check out cancho-schema

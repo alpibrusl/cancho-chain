@@ -24,7 +24,7 @@ bytes that were approved. Every step leaves evidence. The agent never holds a ke
 | `executor` (`tools/executor`, `chain.executor`: one tick per process; two providers must agree, the lifecycle decides, the same bytes are re-sent, every change is evidence in a `cancho-log` trail; authority: one directory, two loopback addresses, the clock; plain HTTP only) | built | `scripts/check_executor.py`: 176 checks against two mock nodes (faults, lies, reorganisations, chain mismatch, damaged state and evidence); 72 of 78 mutants killed (6 explained, 1 of them not proven equivalent: design §18.5) |
 | everything else in [`docs/design.md`](docs/design.md) | designed, not built | -- |
 
-`scripts/gate.sh` runs the formatting, the file budget and every check below (without `--mutants`); CI runs it with the compiler pinned in `cancho.toml` built by cargo. That compiler's Rust evaluator cannot run cancho's `secp256k1` package's statics, so `check_signer.py` prints `SKIPPED` for the signer's `cancho authority` claim there; run it with a self-hosted compiler (`scripts/build-standalone.sh` in cancho) for that claim.
+`scripts/gate.sh` runs the formatting, the file budget and every check below (without `--mutants`); CI runs it with the compiler pinned in `cancho.toml` built by cargo. The signer's `cancho authority` claim is checked there too (cancho#725 made the `secp256k1` package's statics buildable by that compiler's front end; a compiler that cannot is reported as `SKIPPED`, not hidden).
 
 ```
 cancho test --std tests/keccak.cho lib/keccak/keccak.cho
