@@ -233,6 +233,10 @@ def run(exe, cases):
         ("no block number", dict(blockNumber=...), "E311"),
         ("a block number of 0x", dict(blockNumber="0x"), "E304"),
         ("a hash in upper case", dict(hash="0x" + f.hash.hex().upper()), "E305"),
+        ("a sender of 39 digits", dict(**{"from": "0x" + f.wallet.hex()[:-1]}), "E306"),
+        ("a contract of 41 digits", dict(to="0x" + f.token.hex() + "0"), "E306"),
+        ("a nonce with a leading zero", dict(nonce="0x01"), "E304"),
+        ("a nonce that is a number", dict(nonce=1), "E304"),
     ]
     for name, over, want in cases_x:
         check("tx: " + name, U("x", 7, resp(f.txobj(True, **over)), *exp_x), want)
@@ -481,6 +485,7 @@ MUTANTS = [
 
 # Mutants no input can tell from the original, each with the reason.
 EQUIVALENT = {
+    "response: the id fits": "`to_int` of an integer that does not fit answers a value that is not any id this codec sends (an id is below 2^53): the comparison refuses it as -302 either way",
     "ready: the room": "the driver's buffer is exactly 9,000 bytes, so a length between 8,000 and 8,447 cannot be given (the check is for callers that pass their own)",
     "response: no version": "`json.string_plain` of a missing member (node -1) is false, so the next test refuses it as well: the same -301",
     "response: no id": "`json.is_int` of a missing member (node -1) is false, so the next test refuses it as well: the same -301",
