@@ -7,7 +7,7 @@ An auditable authority and execution layer for autonomous blockchain agents, in 
 An agent may *propose* a transaction. A separately enforced policy decides whether it is allowed. A signer, in its own process, signs only the exact
 bytes that were approved. Every step leaves evidence. The agent never holds a key and cannot change its own policy.
 
-**Status: research.** Seven slices are built and a development signer signs one request at a time; no network front, no RPC, nothing moves value yet. What exists, and how it is checked:
+**Status: research.** Eight slices are built: a development signer behind a network front and `cancho-gateway`, one request at a time. No RPC and no transaction is ever submitted: nothing moves value yet. What exists, and how it is checked:
 
 | Piece | State | Check |
 |---|---|---|
@@ -18,6 +18,7 @@ bytes that were approved. Every step leaves evidence. The agent never holds a ke
 | `chain.policy` and `chain.decide` (the policy engine: canonical policy and digest, a pure decision function, 14 stable reasons, a decision record and digest) | built | `scripts/check_policy.py`: 989 checks against a separate model and jsonschema, every combination of up to three reasons, 119 of 121 mutants killed (2 equivalent) |
 | `chain.envelope` (the authorisation envelope: a decision bound to the exact unsigned transaction and signed by an issuer key; `issue`, the signer's `verify` with 10 ordered refusals, the single-use ledger) | built | `scripts/check_envelope.py`: 1,187 checks against a separate model, libsecp256k1 and python-ecdsa; every fault alone, in every pair and in every trio; every changed bit; 85 of 92 mutants killed (7 equivalent) |
 | `signer` (`tools/signer`, `chain.signer`): a process that takes one request line, verifies the envelope, records it in a hash-chained `cancho-log` ledger (flushed before any signature exists) and signs; authority: one directory, the clock, stdio | built | `scripts/check_signer.py`: 386 checks against the envelope model, libsecp256k1, python-ecdsa, eth-account and an independent ledger reader; 14 kinds of ledger damage, none ever signs; 49 of 50 mutants killed (1 equivalent) |
+| `front` (`tools/front`): `POST /sign` behind `cancho-gateway`; the caller is the gateway's `X-Auth-Identity`; starts the signer once per request; authority: one port in, one program to start, nothing else | built | `scripts/check_front.py`: 117 checks with the real signer behind it, 61 mutants (59 killed, 2 equivalent); `scripts/check_stack.py`: 15 checks through the real gateway with three API keys |
 | everything else in [`docs/design.md`](docs/design.md) | designed, not built | -- |
 
 ```
