@@ -1,0 +1,823 @@
+edition 11;
+
+// The executor (docs/design.md section 18): one tick per process. It asks two providers what they see, decides with the lifecycle what to do, sends the same bytes again when that is what
+// the lifecycle says, and leaves evidence of every change. Authority (`cancho authority`): one directory, two outbound addresses (the providers), the clock, the heap, standard output.
+// The directory and the two addresses are compile-time constants, so that the report names them; `scripts/check_executor.py` builds a copy with others.
+
+import chain.erc20;
+import chain.executor;
+import chain.hex;
+import chain.keccak;
+import chain.lifecycle;
+import chain.rpc;
+import chain.txcheck;
+import crc;
+import log;
+import record;
+import segment;
+import std.buffer;
+import std.bytes;
+import std.conns;
+import std.io;
+import trail;
+
+fn max_log_len() -> [] int {
+    return 4096;
+}
+
+fn say[&i](io: &!i Io, text: &static [byte]) -> [io_write] int {
+    io.write_all(io, text);
+    return 0;
+}
+
+fn refuse[&i](io: &!i Io, code: int) -> [io_write] int {
+    say(io, "{\"ok\":false,\"rule\":\"chain.");
+    io.write_all(io, executor.refusal_tag(code));
+    say(io, "\",\"repair\":\"");
+    io.write_all(io, executor.repair(code));
+    say(io, "\"}");
+    io.newline(io);
+    return 2;
+}
+
+// The whole of the file `path` (at most `len(out)` bytes) into `out`: its length, -1 if it cannot be opened (it is not there), or -2 if it is there and cannot be read whole.
+fn read_small[&c, &p, &o](fs: &c Fs("/var/lib/cancho-executor"), path: &p [byte], out: &!o [byte]) -> [fs_read("/var/lib/cancho-executor"), file_read] int {
+    var got = -1;
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+            got = -1;
+        }
+        Opened::Ok(opened) => {
+            got = -2;
+            var f = opened;
+            borrow mut f as &!h in {
+                match file_size(h) {
+                    Done::Failed(e) => {
+                        got = -2;
+                    }
+                    Done::Ok(size) => {
+                        if size <= len(out) {
+                            var have = 0;
+                            var ok = true;
+                            while have < size && ok {
+                                match file_pread(h, have, out[have..size]) {
+                                    Read::Got(n) => {
+                                        have = have + n;
+                                    }
+                                    Read::End => {
+                                        ok = false;
+                                    }
+                                    Read::Failed(e) => {
+                                        ok = false;
+                                    }
+                                }
+                            }
+                            if ok {
+                                got = size;
+                            }
+                        }
+                    }
+                }
+            }
+            file_close(f);
+        }
+    }
+    return got;
+}
+
+// The text of a hex file (one line, an optional newline) decoded into `out`: its byte length, -1 if the file is not there, or -2 if it is there and is not hex that fits.
+fn read_hex_file[&c, &p, &o, &b](fs: &c Fs("/var/lib/cancho-executor"), path: &p [byte], text: &!b [byte], out: &!o [byte]) -> [fs_read("/var/lib/cancho-executor"), file_read] int {
+    let n = read_small(fs, path, text);
+    if n < 0 {
+        return n;
+    }
+    var end = n;
+    if end > 0 && int_of(text[end - 1]) == 10 {
+        end = end - 1;
+    }
+    if end == 0 || end % 2 != 0 || end / 2 > len(out) {
+        return -2;
+    }
+    if hex.decode(text[0..end], out[0..end / 2]) < 0 {
+        return -2;
+    }
+    return end / 2;
+}
+
+// ---------------------------------------------------------------------
+// The providers: plain HTTP/1.1 with a Content-Length, over a socket, with a deadline
+// ---------------------------------------------------------------------
+
+fn dial_a[&o](out: &o Out("127.0.0.1:18545")) -> [net_out("127.0.0.1:18545")] Dialed {
+    return tcp_connect(out, "127.0.0.1", 18545);
+}
+
+fn dial_b[&o](out: &o Out("127.0.0.1:18546")) -> [net_out("127.0.0.1:18546")] Dialed {
+    return tcp_connect(out, "127.0.0.1", 18546);
+}
+
+fn put_text[&o, &t](out: &!o [byte], at: int, text: &t [byte]) -> [] int {
+    var i = 0;
+    while i < len(text) {
+        out[at + i] = text[i];
+        i = i + 1;
+    }
+    return at + len(text);
+}
+
+fn put_decimal[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    var n = 1;
+    var t = v;
+    while t >= 10 {
+        t = t / 10;
+        n = n + 1;
+    }
+    var u = v;
+    var i = n - 1;
+    while i >= 0 {
+        out[at + i] = byte_of(48 + u % 10);
+        u = u / 10;
+        i = i - 1;
+    }
+    return at + n;
+}
+
+fn lower(c: int) -> [] int {
+    if c >= 65 && c <= 90 {
+        return c + 32;
+    }
+    return c;
+}
+
+// Does the header line at `at` in `text` start with the lower-case `name` (any case in the text)?
+fn header_is[&t, &n](text: &t [byte], at: int, name: &n [byte]) -> [] bool {
+    if len(text) - at < len(name) {
+        return false;
+    }
+    var i = 0;
+    while i < len(name) {
+        if lower(int_of(text[at + i])) != int_of(name[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// An HTTP response in `text`: the body's start and length into `info[0..2]`. 0, or -342 (not a 200 with a whole head), -343 (chunked, or any transfer coding), -341 (the body is shorter than its Content-Length).
+fn parse_http[&t, &i](text: &t [byte], info: &!i [int]) -> [] int {
+    if len(text) < 16 || !header_is(text, 0, "http/1.") || int_of(text[8]) != 32 || int_of(text[9]) != 50 || int_of(text[10]) != 48 || int_of(text[11]) != 48 {
+        return -342;
+    }
+    var head_end = -1;
+    var i2 = 0;
+    while i2 + 3 < len(text) && head_end < 0 {
+        if int_of(text[i2]) == 13 && int_of(text[i2 + 1]) == 10 && int_of(text[i2 + 2]) == 13 && int_of(text[i2 + 3]) == 10 {
+            head_end = i2 + 4;
+        }
+        i2 = i2 + 1;
+    }
+    if head_end < 0 {
+        return -342;
+    }
+    var length = -1;
+    var at = 0;
+    while at < head_end {
+        var eol = at;
+        while eol < head_end && int_of(text[eol]) != 10 {
+            eol = eol + 1;
+        }
+        if header_is(text, at, "transfer-encoding:") {
+            return -343;
+        }
+        if header_is(text, at, "content-length:") {
+            var v = 0;
+            var j = at + 15;
+            while j < eol && (int_of(text[j]) == 32 || int_of(text[j]) == 9) {
+                j = j + 1;
+            }
+            var digits = 0;
+            while j < eol && int_of(text[j]) >= 48 && int_of(text[j]) <= 57 && digits < 9 {
+                v = v * 10 + (int_of(text[j]) - 48);
+                digits = digits + 1;
+                j = j + 1;
+            }
+            if digits == 0 {
+                return -342;
+            }
+            length = v;
+        }
+        at = eol + 1;
+    }
+    if length < 0 {
+        length = len(text) - head_end;
+    }
+    if len(text) - head_end < length {
+        return -341;
+    }
+    info[0] = head_end;
+    info[1] = length;
+    return 0;
+}
+
+// Write `request` to the connection `conn` and read the whole answer into `resp`, with 3,000 ms for all of it. The body's span goes to `info[0..2]`. 0, or -341 (transport), -342 (a bad answer), -343 (chunked),
+// -344 (an answer that is too long or too slow).
+fn exchange[&h, &k, &q, &r, &i](heap: &!h Heap, clock: &k Clock, conn: Conn, request: &q [byte], resp: &!r [byte], info: &!i [int]) -> [heap, poll, clock] int {
+    var status = 0;
+    var table = conns.empty(heap, 1);
+    let (put_table, slot) = conns.put(heap, table, conn);
+    table = put_table;
+    match poller_new() {
+        Polling::Failed(e) => {
+            status = -341;
+        }
+        Polling::Ok(p) => {
+            var poller = p;
+            let deadline = clock_ms(clock) + 3000;
+            region a {
+                let events = alloc_slice[a](4, 0);
+                borrow mut table as &!tb in {
+                    conns.nonblocking(tb, slot);
+                    borrow mut poller as &!pw in {
+                        conns.watch(tb, pw, slot, 1, 2);
+                        var at = 0;
+                        while at < len(request) && status == 0 {
+                            match conns.write(tb, slot, request[at..len(request)]) {
+                                Sent::Wrote(n) => {
+                                    at = at + n;
+                                }
+                                Sent::Again => {
+                                    let left = deadline - clock_ms(clock);
+                                    if left <= 0 {
+                                        status = -344;
+                                    } else if poller_wait(pw, events, left) <= 0 {
+                                        status = -344;
+                                    }
+                                }
+                                Sent::Failed(e) => {
+                                    status = -341;
+                                }
+                            }
+                        }
+                        conns.rewatch(tb, pw, slot, 1, 1);
+                        var got = 0;
+                        var done = false;
+                        while !done && status == 0 {
+                            match conns.read(tb, slot, resp[got..len(resp)]) {
+                                Received::Data(n) => {
+                                    got = got + n;
+                                    if got >= len(resp) {
+                                        status = -344;
+                                    }
+                                }
+                                Received::End => {
+                                    done = true;
+                                }
+                                Received::Again => {
+                                    let left = deadline - clock_ms(clock);
+                                    if left <= 0 {
+                                        status = -344;
+                                    } else if poller_wait(pw, events, left) <= 0 {
+                                        status = -344;
+                                    }
+                                }
+                                Received::Failed(e) => {
+                                    status = -341;
+                                }
+                            }
+                        }
+                        if status == 0 {
+                            status = parse_http(resp[0..got], info);
+                        }
+                    }
+                }
+            }
+            poller_close(poller);
+        }
+    }
+    borrow mut table as &!tb in {
+        conns.close(tb, slot);
+    }
+    conns.drop(heap, table);
+    return status;
+}
+
+// Ask provider `which` (0 or 1) with the JSON `body`: the answer's body is in `resp[info[0]..info[0] + info[1]]`. 0 or the refusal of `exchange`, or -341 if the provider cannot be dialled.
+fn ask[&h, &k, &oa, &ob, &b, &w, &r, &i](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), body: &b [byte], wire: &!w [byte], resp: &!r [byte], info: &!i [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock] int {
+    var at = put_text(wire, 0, "POST / HTTP/1.1\r\nHost: provider\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
+    at = put_decimal(wire, at, len(body));
+    at = put_text(wire, at, "\r\n\r\n");
+    at = put_text(wire, at, body);
+    var status = -341;
+    if which == 0 {
+        match dial_a(a) {
+            Dialed::Ok(c) => {
+                status = exchange(heap, clock, c, wire[0..at], resp, info);
+            }
+            Dialed::Failed(e) => {
+                status = -341;
+            }
+        }
+    } else {
+        match dial_b(b) {
+            Dialed::Ok(c) => {
+                status = exchange(heap, clock, c, wire[0..at], resp, info);
+            }
+            Dialed::Failed(e) => {
+                status = -341;
+            }
+        }
+    }
+    return status;
+}
+
+// The state a tick works with, in one record so that the functions below do not carry twenty arguments: `ints` and `bytes` hold the facts of each provider (§18.2 step 5), `tape`, `resp`, `wire` and `req` are the buffers.
+//   ints, provider p at 8 * p: [0] usable  [1] kind (0 not found, 1 pending, 2 mined)  [2] status_ok  [3] block  [4] latest nonce  [5] tip  [6] chain id wrong  [7] unused
+//   bytes, provider p at 64 * p: [0..32] the block hash  [32..64] the hash now at that height
+fn call_one[&h, &k, &oa, &ob, &t, &q, &w, &r, &i, &j](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), id: int, request_len: int, req: &q [byte], wire: &!w [byte], resp: &!r [byte], hi: &!i [int], tape: &!t [int], ri: &!j [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock] int {
+    let status = ask(heap, clock, which, a, b, req[0..request_len], wire, resp, hi);
+    if status < 0 {
+        return -1;
+    }
+    let kind = rpc.response(resp[hi[0]..hi[0] + hi[1]], tape, id, ri);
+    if kind != 0 {
+        return -1;
+    }
+    return ri[0];
+}
+
+fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), chain: int, nonce: int, wallet: &wa [byte], token: &tk [byte], calldata: &cd [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte], ints: &!f [int], bytes_: &!x [byte]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock] int {
+    let off = 8 * which;
+    let boff = 64 * which;
+    ints[off] = 0;
+    ints[off + 6] = 0;
+    var done = 0;
+    region g {
+        let hi = alloc_slice[g](2, 0);
+        let ri = alloc_slice[g](4, 0);
+        // 1. the chain id: a provider for another chain is not unusable, it is refused.
+        var n = rpc.req_chain_id(1, req);
+        var node = call_one(heap, clock, which, a, b, 1, n, req, wire, resp, hi, tape, ri);
+        if node < 0 {
+            done = 1;
+        } else {
+            let c = rpc.chain_id_is(resp[hi[0]..hi[0] + hi[1]], tape, node, chain);
+            if c == -308 {
+                ints[off + 6] = 1;
+                done = 1;
+            } else if c < 0 {
+                done = 1;
+            }
+        }
+        // 2. the account's latest nonce, 3. the tip.
+        if done == 0 {
+            n = rpc.req_nonce(2, wallet, false, req);
+            node = call_one(heap, clock, which, a, b, 2, n, req, wire, resp, hi, tape, ri);
+            let v = rpc.quantity(resp[hi[0]..hi[0] + hi[1]], tape, node);
+            if node < 0 || v < 0 {
+                done = 1;
+            } else {
+                ints[off + 4] = v;
+            }
+        }
+        if done == 0 {
+            n = rpc.req_block_number(3, req);
+            node = call_one(heap, clock, which, a, b, 3, n, req, wire, resp, hi, tape, ri);
+            let v = rpc.quantity(resp[hi[0]..hi[0] + hi[1]], tape, node);
+            if node < 0 || v < 0 {
+                done = 1;
+            } else {
+                ints[off + 5] = v;
+            }
+        }
+        // 4. the transaction, 5. its receipt.
+        var tx_kind = 0;
+        var tx_block = 0;
+        if done == 0 {
+            n = rpc.req_tx(4, tx_hash, req);
+            node = call_one(heap, clock, which, a, b, 4, n, req, wire, resp, hi, tape, ri);
+            if node < 0 {
+                done = 1;
+            } else {
+                tx_kind = rpc.tx_check(resp[hi[0]..hi[0] + hi[1]], tape, node, tx_hash, wallet, token, nonce, calldata, ri);
+                tx_block = ri[0];
+                if tx_kind < 0 {
+                    done = 1;
+                }
+            }
+        }
+        var rc = 0;
+        var block = 0;
+        if done == 0 {
+            n = rpc.req_receipt(5, tx_hash, req);
+            node = call_one(heap, clock, which, a, b, 5, n, req, wire, resp, hi, tape, ri);
+            if node < 0 {
+                done = 1;
+            } else {
+                rc = rpc.receipt(resp[hi[0]..hi[0] + hi[1]], tape, node, tx_hash, wallet, token, ri, bytes_[boff..boff + 32]);
+                block = ri[0];
+                if rc < 0 {
+                    done = 1;
+                }
+            }
+        }
+        // The two must say the same thing: a receipt with no transaction mined, or a mined transaction with no receipt or another block, is a provider contradicting itself.
+        if done == 0 {
+            if rc != 0 && (tx_kind != 2 || tx_block != block) || rc == 0 && tx_kind == 2 {
+                done = 1;
+            }
+        }
+        // 6. If it is mined, the hash now at its height.
+        if done == 0 && rc != 0 {
+            n = rpc.req_block(6, block, req);
+            node = call_one(heap, clock, which, a, b, 6, n, req, wire, resp, hi, tape, ri);
+            if node < 0 || rpc.block_check(resp[hi[0]..hi[0] + hi[1]], tape, node, block, bytes_[boff + 32..boff + 64]) != 1 {
+                done = 1;
+            }
+        }
+        if done == 0 {
+            ints[off] = 1;
+            if rc != 0 {
+                ints[off + 1] = 2;
+                ints[off + 3] = block;
+                if rc == 1 {
+                    ints[off + 2] = 1;
+                } else {
+                    ints[off + 2] = 0;
+                }
+            } else {
+                ints[off + 1] = tx_kind;
+                ints[off + 2] = 0;
+                ints[off + 3] = 0;
+            }
+        }
+    }
+    return 0;
+}
+
+// Do the two providers say the same? Both usable; the same on the transaction (not found, pending, or mined with the same status, block, block hash and hash at that height) and on the nonce.
+fn agree[&f, &x](ints: &f [int], bytes_: &x [byte]) -> [] bool {
+    if ints[0] != 1 || ints[8] != 1 {
+        return false;
+    }
+    if ints[1] != ints[9] || ints[4] != ints[12] {
+        return false;
+    }
+    if ints[1] == 2 {
+        if ints[2] != ints[10] || ints[3] != ints[11] {
+            return false;
+        }
+        var i = 0;
+        while i < 32 {
+            if int_of(bytes_[i]) != int_of(bytes_[64 + i]) || int_of(bytes_[32 + i]) != int_of(bytes_[96 + i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+    }
+    return true;
+}
+
+// `raw` sent to provider `which`: did it take the transaction (its `result` is this transaction's hash)?
+fn send_to[&h, &k, &oa, &ob, &t, &w, &r, &q, &y, &th](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), raw: &y [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock] bool {
+    var took = false;
+    region g {
+        let hi = alloc_slice[g](2, 0);
+        let ri = alloc_slice[g](4, 0);
+        let got = alloc_slice[g](32, byte_of(0));
+        let n = rpc.req_send_raw(7, raw, req);
+        if n > 0 {
+            let node = call_one(heap, clock, which, a, b, 7, n, req, wire, resp, hi, tape, ri);
+            if node >= 0 && rpc.hash32(resp[hi[0]..hi[0] + hi[1]], tape, node, got) == 0 && bytes.equal(got, tx_hash) {
+                took = true;
+            }
+        }
+    }
+    return took;
+}
+
+fn be8[&c](c: &c [byte], at: int) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < 8 {
+        v = v * 256 + int_of(c[at + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+// The tick, once the evidence log is open and verified: the job is checked, the providers asked, the lifecycle applied, what must be sent is sent, the evidence written and the state kept.
+fn core[&c, &k, &i, &q, &oa, &ob, &l, &hd, &t, &r, &w, &rq, &f, &x, &s, &g, &e, &y, &th, &cd](fs: &c Fs("/var/lib/cancho-executor"), clock: &k Clock, io: &!i Io, heap: &!q Heap, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), lg: &!l log.Log, head: &!hd [byte], tape: &!t [int], resp: &!r [byte], wire: &!w [byte], req: &!rq [byte], ints: &!f [int], bytes_: &!x [byte], config: &g [int], env: &e [byte], raw: &y [byte], tx_hash: &th [byte], calldata: &cd [byte], st: &!s [int]) -> [fs_read("/var/lib/cancho-executor"), fs_write("/var/lib/cancho-executor"), file_read, file_write, heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, io_write] int {
+    var status = 2;
+    region g2 {
+        let rec = alloc_slice[g2](74, byte_of(0));
+        let prev = alloc_slice[g2](74, byte_of(0));
+        let text = alloc_slice[g2](200, byte_of(0));
+        let ms = clock_unix_ms(clock);
+        if ms < 0 {
+            return refuse(io, -338);
+        }
+        let nonce = be8(env, 197);
+        // The state: the file, or a new record.
+        let n = read_hex_file(fs, "/var/lib/cancho-executor/state", text, rec);
+        if n == 74 {
+            if lifecycle.check(rec) != 0 || lifecycle.nonce(rec) != nonce {
+                return refuse(io, -336);
+            }
+            var j = 0;
+            while j < 74 {
+                prev[j] = rec[j];
+                j = j + 1;
+            }
+        } else if n != -1 {
+            return refuse(io, -336);
+        } else {
+            lifecycle.new(rec, nonce, ms);
+        }
+        // Ask both providers.
+        query(heap, clock, 0, a, b, config[0], nonce, env[105..125], env[125..145], calldata, tx_hash, tape, wire, resp, req, ints, bytes_);
+        query(heap, clock, 1, a, b, config[0], nonce, env[105..125], env[125..145], calldata, tx_hash, tape, wire, resp, req, ints, bytes_);
+        if ints[6] == 1 || ints[14] == 1 {
+            return refuse(io, -335);
+        }
+        var same = agree(ints, bytes_);
+        var tip = ints[5];
+        if ints[13] < tip {
+            tip = ints[13];
+        }
+        let kind = ints[1];
+        if same && kind == 2 && tip < ints[3] {
+            same = false;
+        }
+        var action = 0;
+        let hat = alloc_slice[g2](32, byte_of(0));
+        var j2 = 0;
+        while j2 < 32 {
+            hat[j2] = bytes_[32 + j2];
+            j2 = j2 + 1;
+        }
+        let bh = bytes_[0..32];
+        let o = lifecycle.observe(rec, same, kind, ints[2] == 1, ints[3], bh, tip, kind == 2, hat, ints[4], ms, config[1], config[2], config[3]);
+        if o < 0 {
+            return refuse(io, -336);
+        }
+        action = o;
+        var sent = false;
+        if action == 1 || action == 2 {
+            let took_a = send_to(heap, clock, 0, a, b, raw, tx_hash, tape, wire, resp, req);
+            let took_b = send_to(heap, clock, 1, a, b, raw, tx_hash, tape, wire, resp, req);
+            sent = took_a || took_b;
+            lifecycle.after_send(rec, sent, ms);
+        }
+        // Evidence, if the state or the block changed; then the state.
+        var changed = int_of(rec[1]) != int_of(prev[1]);
+        var m = 34;
+        while m < 74 {
+            if int_of(rec[m]) != int_of(prev[m]) {
+                changed = true;
+            }
+            m = m + 1;
+        }
+        var failure = 0;
+        if changed {
+            let body = alloc_slice[g2](220, byte_of(0));
+            let scratch = alloc_slice[g2](1024, byte_of(0));
+            let parent = alloc_slice[g2](64, byte_of(0));
+            let blen = executor.payload(env[1..33], tx_hash, lifecycle.state(rec), lifecycle.block(rec), body);
+            var plen = 0;
+            if log.records(lg) > 0 {
+                plen = 64;
+                var q2 = 0;
+                while q2 < 64 {
+                    parent[q2] = head[q2];
+                    q2 = q2 + 1;
+                }
+            }
+            let r2 = trail.append(lg, head, scratch, "tx.state", parent[0..plen], body[0..blen], ms, max_log_len());
+            if blen < 0 || r2.0 != 0 || log.flush(lg) != 0 {
+                failure = -332;
+            }
+        }
+        if failure != 0 {
+            return refuse(io, failure);
+        }
+        let line = alloc_slice[g2](149, byte_of(0));
+        hex.encode(rec, line[0..148]);
+        line[148] = byte_of(10);
+        if fs_write(fs, "/var/lib/cancho-executor/state.new", line) != 149 {
+            return refuse(io, -337);
+        }
+        match fs_rename(fs, "/var/lib/cancho-executor/state.new", "/var/lib/cancho-executor/state") {
+            Done::Ok(z) => {
+                status = 0;
+            }
+            Done::Failed(e2) => {
+                return refuse(io, -337);
+            }
+        }
+        say(io, "{\"ok\":true,\"state\":\"");
+        io.write_all(io, lifecycle.state_name(lifecycle.state(rec)));
+        if action == 0 {
+            say(io, "\",\"action\":\"nothing\",\"sent\":");
+        } else if action == 1 {
+            say(io, "\",\"action\":\"submit\",\"sent\":");
+        } else {
+            say(io, "\",\"action\":\"resubmit\",\"sent\":");
+        }
+        if sent {
+            say(io, "true,\"agree\":");
+        } else {
+            say(io, "false,\"agree\":");
+        }
+        if same {
+            say(io, "true}");
+        } else {
+            say(io, "false}");
+        }
+        io.newline(io);
+    }
+    return status;
+}
+
+// Opens the evidence log, locks it, verifies it whole and read-only, recovers a torn tail (the signer's rule, docs/design.md section 14.3), and runs `core`.
+fn with_evidence[&c, &k, &i, &q, &oa, &ob, &t, &r, &w, &rq, &f, &x, &s, &g, &e, &y, &th, &cd](fs: &c Fs("/var/lib/cancho-executor"), clock: &k Clock, io: &!i Io, heap: &!q Heap, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), tape: &!t [int], resp: &!r [byte], wire: &!w [byte], req: &!rq [byte], ints: &!f [int], bytes_: &!x [byte], config: &g [int], env: &e [byte], raw: &y [byte], tx_hash: &th [byte], calldata: &cd [byte], st: &!s [int]) -> [fs_read("/var/lib/cancho-executor"), fs_write("/var/lib/cancho-executor"), file_read, file_write, heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, io_write] int {
+    var status = 2;
+    region r {
+        let window = alloc_slice[r](max_log_len() + 4096, byte_of(0));
+        let head = alloc_slice[r](64, byte_of(0));
+        let path = "/var/lib/cancho-executor/evidence.seg";
+        match open_append(fs, path) {
+            Opened::Failed(e2) => {
+                status = refuse(io, -332);
+            }
+            Opened::Ok(w0) => {
+                match open_rw(fs, path) {
+                    Opened::Failed(e2) => {
+                        status = refuse(io, -332);
+                        file_close(w0);
+                    }
+                    Opened::Ok(rw0) => {
+                        var rw = rw0;
+                        var rec = (0, 0, 0, 0 - 1, 0 - 1);
+                        var v = (0, 0, 0, 0, 0);
+                        var locked = false;
+                        borrow mut rw as &!h in {
+                            match file_lock(h) {
+                                Done::Ok(n) => {
+                                    locked = true;
+                                }
+                                Done::Failed(e2) => {
+                                    locked = false;
+                                }
+                            }
+                            if locked {
+                                match file_size(h) {
+                                    Done::Ok(size) => {
+                                        v = trail.verify(h, size, window, max_log_len(), head, 0, "");
+                                        let tail = size - v.1;
+                                        if v.0 == trail.clean() || v.0 == trail.torn() && tail < max_log_len() + 4 {
+                                            rec = log.recover(h, window, max_log_len());
+                                            if rec.2 != v.2 {
+                                                v = (9, 0, 0, 0, 0);
+                                            }
+                                        } else {
+                                            v = (9, 0, 0, 0, 0);
+                                            rec = (1, 0, 0, 0 - 1, 0 - 1);
+                                        }
+                                    }
+                                    Done::Failed(e2) => {
+                                        rec = (1, 0, 0, 0 - 1, 0 - 1);
+                                        v = (9, 0, 0, 0, 0);
+                                    }
+                                }
+                            }
+                        }
+                        if !locked {
+                            status = refuse(io, -330);
+                            file_close(w0);
+                        } else if rec.0 != 0 || v.0 == 9 {
+                            status = refuse(io, -331);
+                            file_close(w0);
+                        } else {
+                            match open_read(fs, path) {
+                                Opened::Failed(e2) => {
+                                    status = refuse(io, -332);
+                                    file_close(w0);
+                                }
+                                Opened::Ok(rd) => {
+                                    var lg = log.attach(w0, rd, rec.1, rec.2, rec.3, rec.4, max_log_len());
+                                    borrow mut lg as &!l in {
+                                        status = core(fs, clock, io, heap, a, b, l, head, tape, resp, wire, req, ints, bytes_, config, env, raw, tx_hash, calldata, st);
+                                    }
+                                    log.close(lg);
+                                }
+                            }
+                        }
+                        file_close(rw);
+                    }
+                }
+            }
+        }
+    }
+    return status;
+}
+
+// Reads the job (the configuration, the envelope and the signed transaction), checks that what is to be sent is what was authorised, and goes on.
+fn with_job[&c, &k, &i, &q, &oa, &ob, &t, &r, &w, &rq, &f, &x, &s](fs: &c Fs("/var/lib/cancho-executor"), clock: &k Clock, io: &!i Io, heap: &!q Heap, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), tape: &!t [int], resp: &!r [byte], wire: &!w [byte], req: &!rq [byte], ints: &!f [int], bytes_: &!x [byte], st: &!s [int]) -> [fs_read("/var/lib/cancho-executor"), fs_write("/var/lib/cancho-executor"), file_read, file_write, heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, io_write] int {
+    var status = 2;
+    region r {
+        let config = alloc_slice[r](4, 0);
+        let conf_text = alloc_slice[r](256, byte_of(0));
+        let env_text = alloc_slice[r](700, byte_of(0));
+        let env = alloc_slice[r](330, byte_of(0));
+        let raw_text = alloc_slice[r](8300, byte_of(0));
+        let raw = alloc_slice[r](4100, byte_of(0));
+        let tx_hash = alloc_slice[r](32, byte_of(0));
+        let calldata = alloc_slice[r](68, byte_of(0));
+        let cn = read_small(fs, "/var/lib/cancho-executor/config", conf_text);
+        if cn <= 0 || executor.parse_config(conf_text[0..cn], config) != 0 {
+            return refuse(io, -333);
+        }
+        let en = read_hex_file(fs, "/var/lib/cancho-executor/envelope", env_text, env);
+        var ok = en >= 263 && en <= 326 && int_of(env[0]) == 1;
+        if ok {
+            let calln = int_of(env[261]);
+            ok = calln >= 1 && calln <= 64 && en == 262 + calln && be8(env, 97) == config[0];
+        }
+        let rn = read_hex_file(fs, "/var/lib/cancho-executor/raw", raw_text, raw);
+        if !ok || rn < 1 {
+            return refuse(io, -334);
+        }
+        if txcheck.validate_signed(raw[0..rn], be8(env, 97), be8(env, 197), env[125..145], env[145..165], env[165..197], env[205..237], be8(env, 237)) != 0 {
+            return refuse(io, -334);
+        }
+        if keccak.hash256(st, raw[0..rn], tx_hash) != 0 || erc20.transfer_calldata(env[145..165], env[165..197], calldata) < 0 {
+            return refuse(io, -334);
+        }
+        status = with_evidence(fs, clock, io, heap, a, b, tape, resp, wire, req, ints, bytes_, config, env[0..en], raw[0..rn], tx_hash, calldata, st);
+    }
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, out, ports, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(args);
+    release(ports);
+    release(signals);
+    release(exec);
+    release(tty);
+    var status = 2;
+    var console = io;
+    var pool = heap;
+    let dir = narrow(fs, "/var/lib/cancho-executor");
+    let (pa, pb) = narrow(out, "127.0.0.1:18545", "127.0.0.1:18546");
+    borrow mut pool as &!hp in {
+        let tape = box_slice(hp, 3 * 70000, 0);
+        let resp = box_slice(hp, 80000, byte_of(0));
+        let wire = box_slice(hp, 10000, byte_of(0));
+        let req = box_slice(hp, 9000, byte_of(0));
+        let ints = box_slice(hp, 16, 0);
+        let bytes_ = box_slice(hp, 128, byte_of(0));
+        let st = box_slice(hp, keccak.state_len(), 0);
+        borrow mut tape as &!t1 in {
+            borrow mut resp as &!r1 in {
+                borrow mut wire as &!w1 in {
+                    borrow mut req as &!q1 in {
+                        borrow mut ints as &!f1 in {
+                            borrow mut bytes_ as &!x1 in {
+                                borrow mut st as &!s1 in {
+                                    borrow dir as &c1 in {
+                                        borrow clock as &k1 in {
+                                            borrow pa as &a1 in {
+                                                borrow pb as &b1 in {
+                                                    borrow mut console as &!i1 in {
+                                                        status = with_job(c1, k1, i1, hp, a1, b1, contents(t1), contents(r1), contents(w1), contents(q1), contents(f1), contents(x1), contents(s1));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        unbox_slice(hp, tape);
+        unbox_slice(hp, resp);
+        unbox_slice(hp, wire);
+        unbox_slice(hp, req);
+        unbox_slice(hp, ints);
+        unbox_slice(hp, bytes_);
+        unbox_slice(hp, st);
+    }
+    release(pool);
+    release(dir);
+    release(pa);
+    release(pb);
+    release(clock);
+    release(console);
+    return status;
+}
