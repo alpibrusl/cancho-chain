@@ -1,0 +1,466 @@
+edition 7;
+
+module chain.envelope;
+
+import chain.address;
+import chain.decide;
+import chain.hex;
+import chain.keccak;
+import chain.txcheck;
+import secp256k1;
+import std.bytes;
+
+// The authorisation envelope (docs/design.md section 13): a decision bound to the exact unsigned transaction and signed by an issuer key that is not the wallet's.
+// `issue` is the policy side; `verify` is the signer's side and trusts nothing in the envelope until the issuer's signature is checked; the ledger answers single use.
+//
+// Layout, version 1 (big-endian), 262 bytes and the caller: [0] 1   [1..33] envelope id   [33..65] decision digest   [65..97] transaction digest   [97..105] chain id
+// [105..125] wallet address   [125..145] token   [145..165] recipient   [165..197] amount   [197..205] nonce   [205..237] fee cap   [237..245] gas cap
+// [245..253] issued_at   [253..261] expires_at   [261] n (1 to 64), then the caller (n bytes).
+// The signature is over `keccak256("cancho-chain/envelope/v1" || layout)`, 65 bytes `r || s || recid`, low s.
+
+pub fn max_len() -> [] int {
+    return 326;
+}
+
+pub fn refused_decision() -> [] int {
+    return -240;
+}
+
+pub fn refused_not_allowed() -> [] int {
+    return -241;
+}
+
+pub fn refused_window() -> [] int {
+    return -242;
+}
+
+pub fn refused_amount() -> [] int {
+    return -243;
+}
+
+pub fn refused_transaction() -> [] int {
+    return -244;
+}
+
+pub fn refused_input() -> [] int {
+    return -245;
+}
+
+pub fn refused_output() -> [] int {
+    return -246;
+}
+
+pub fn refused_sign() -> [] int {
+    return -247;
+}
+
+pub fn refused_same_key() -> [] int {
+    return -248;
+}
+
+pub fn refused_format() -> [] int {
+    return -250;
+}
+
+pub fn refused_signature() -> [] int {
+    return -251;
+}
+
+pub fn refused_issuer() -> [] int {
+    return -252;
+}
+
+pub fn refused_chain() -> [] int {
+    return -253;
+}
+
+pub fn refused_wallet() -> [] int {
+    return -254;
+}
+
+pub fn refused_caller() -> [] int {
+    return -255;
+}
+
+pub fn refused_not_yet() -> [] int {
+    return -256;
+}
+
+pub fn refused_expired() -> [] int {
+    return -257;
+}
+
+pub fn refused_digest() -> [] int {
+    return -258;
+}
+
+pub fn refused_tx_invalid() -> [] int {
+    return -259;
+}
+
+pub fn refused_ledger() -> [] int {
+    return -260;
+}
+
+pub fn refused_replayed() -> [] int {
+    return -261;
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == -240 {
+        return "envelope-decision";
+    }
+    if code == -241 {
+        return "envelope-not-allowed";
+    }
+    if code == -242 {
+        return "envelope-window";
+    }
+    if code == -243 {
+        return "envelope-amount";
+    }
+    if code == -244 {
+        return "envelope-transaction";
+    }
+    if code == -245 {
+        return "envelope-input";
+    }
+    if code == -246 {
+        return "envelope-output";
+    }
+    if code == -247 {
+        return "envelope-sign";
+    }
+    if code == -248 {
+        return "envelope-same-key";
+    }
+    if code == -250 {
+        return "envelope-format";
+    }
+    if code == -251 {
+        return "envelope-signature";
+    }
+    if code == -252 {
+        return "envelope-issuer";
+    }
+    if code == -253 {
+        return "envelope-chain";
+    }
+    if code == -254 {
+        return "envelope-wallet";
+    }
+    if code == -255 {
+        return "envelope-caller";
+    }
+    if code == -256 {
+        return "envelope-not-yet-valid";
+    }
+    if code == -257 {
+        return "envelope-expired";
+    }
+    if code == -258 {
+        return "envelope-digest";
+    }
+    if code == -259 {
+        return "envelope-transaction-invalid";
+    }
+    if code == -260 {
+        return "envelope-ledger";
+    }
+    if code == -261 {
+        return "envelope-replayed";
+    }
+    return "envelope-unknown";
+}
+
+static domain: [byte] {
+    let t = alloc_slice[static](24, byte_of(0));
+    let s = "cancho-chain/envelope/v1";
+    var i = 0;
+    while i < 24 {
+        t[i] = s[i];
+        i = i + 1;
+    }
+    return t;
+}
+
+// n / 2 for secp256k1's group order n: a signature's s above it is not low.
+static half_n: [byte] {
+    let t = alloc_slice[static](32, byte_of(0));
+    hex.decode("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0", t);
+    return t;
+}
+
+fn put_be8[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    var i = 0;
+    while i < 8 {
+        out[at + i] = byte_of(v >> 8 * (7 - i) & 255);
+        i = i + 1;
+    }
+    return at + 8;
+}
+
+fn be8[&c](c: &c [byte], at: int) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < 8 {
+        v = v * 256 + int_of(c[at + i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+// `src` (at most 32 bytes, big-endian) left-padded with zeros into `out[at..at + 32]`.
+fn put_padded[&o, &s](out: &!o [byte], at: int, src: &s [byte]) -> [] int {
+    var i = 0;
+    while i < 32 {
+        out[at + i] = byte_of(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(src) {
+        out[at + 32 - len(src) + i] = src[i];
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn copy_to[&o, &s](out: &!o [byte], at: int, src: &s [byte]) -> [] int {
+    var i = 0;
+    while i < len(src) {
+        out[at + i] = src[i];
+        i = i + 1;
+    }
+    return at + len(src);
+}
+
+// -1, 0 or 1: the 32-byte big-endian number `a` against `b`.
+fn cmp32[&a, &b](a: &a [byte], b: &b [byte]) -> [] int {
+    var i = 0;
+    while i < 32 {
+        let x = int_of(a[i]);
+        let y = int_of(b[i]);
+        if x != y {
+            if x < y {
+                return -1;
+            }
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The envelope digest, `keccak256("cancho-chain/envelope/v1" || envelope)`, into `out` (32 bytes). `st` is `keccak.state_len()` words.
+pub fn digest[&s, &e, &o](st: &!s [int], env: &e [byte], out: &!o [byte]) -> [] int {
+    if len(env) < 263 || len(env) > 326 || len(out) != 32 {
+        return -246;
+    }
+    var code = 0;
+    region r {
+        let m = alloc_slice[r](24 + len(env), byte_of(0));
+        copy_to(m, 0, domain);
+        copy_to(m, 24, env);
+        code = keccak.hash256(st, m, out);
+    }
+    return code;
+}
+
+// Issue an envelope for the decision `decision` (the record `decide` answered) and the unsigned message `message`, against the expectation (chain id, nonce, token, recipient,
+// amount of at most 32 bytes, fee cap of at most 32 bytes, gas cap) and the wallet `wallet` (20 bytes) that is to sign it. `id` is 32 bytes the issuer drew fresh; `now` is the issuer's clock;
+// `issuer_key` is the 32-byte issuer key. The envelope is written to `env` (at least `max_len()` bytes) and the signature to `sig` (65 bytes). Answers the envelope's length, or a refusal:
+// the decision is not a whole record (-240), is not an `allow` (-241), `now` is outside its window (-242), its amount is not the expectation's (-243), the message is not what the
+// expectation says (-244), a bad length (-245), `env` too short (-246), the signature failed (-247), the issuer key is the wallet's (-248).
+pub fn issue[&s, &w, &d, &m, &t, &r, &n, &f, &a, &i, &k, &e, &g](st: &!s [int], work: &!w [int], decision: &d [byte], message: &m [byte], chain_id: int, nonce: int, token: &t [byte], recipient: &r [byte], amount: &n [byte], fee_cap: &f [byte], gas_cap: int, wallet: &a [byte], id: &i [byte], now: int, issuer_key: &k [byte], env: &!e [byte], sig: &!g [byte]) -> [] int {
+    if len(decision) < 118 || len(decision) > 181 || len(message) < 1 || len(token) != 20 || len(recipient) != 20 || len(amount) > 32 || len(fee_cap) > 32 || len(wallet) != 20 || len(id) != 32 || len(issuer_key) != 32 || len(sig) != 65 || chain_id < 0 || nonce < 0 || gas_cap < 0 || now < 0 {
+        return -245;
+    }
+    if len(env) < 326 {
+        return -246;
+    }
+    // The decision: version 1, its length is the caller's, an allow, and now is inside [decided_at, expires_at).
+    let calln = int_of(decision[116]);
+    if int_of(decision[0]) != 1 || calln < 1 || calln > 64 || len(decision) != 117 + calln {
+        return -240;
+    }
+    if int_of(decision[1]) != 1 {
+        return -241;
+    }
+    if now < be8(decision, 68) || now >= be8(decision, 76) {
+        return -242;
+    }
+    var code = 0;
+    region g {
+        let want = alloc_slice[g](32, byte_of(0));
+        put_padded(want, 0, amount);
+        if cmp32(decision[84..116], want) != 0 {
+            code = -243;
+        }
+        if code == 0 && txcheck.validate_unsigned(message, chain_id, nonce, token, recipient, amount, fee_cap, gas_cap) != 0 {
+            code = -244;
+        }
+        if code == 0 {
+            // The two keys must differ: an issuer that is the wallet could sign for itself.
+            let pk = alloc_slice[g](65, byte_of(0));
+            let who = alloc_slice[g](20, byte_of(0));
+            code = secp256k1.public_key(issuer_key, pk, work);
+            if code != 0 {
+                code = -247;
+            } else {
+                code = address.from_public_key(st, pk, who);
+                if code != 0 {
+                    code = -247;
+                } else if bytes.equal(who, wallet) {
+                    code = -248;
+                }
+            }
+        }
+        if code == 0 {
+            let ddigest = alloc_slice[g](32, byte_of(0));
+            let tdigest = alloc_slice[g](32, byte_of(0));
+            let edigest = alloc_slice[g](32, byte_of(0));
+            code = decide.digest(st, decision, ddigest);
+            if code == 0 {
+                code = keccak.hash256(st, message, tdigest);
+            }
+            if code != 0 {
+                code = -247;
+            } else {
+                env[0] = byte_of(1);
+                copy_to(env, 1, id);
+                copy_to(env, 33, ddigest);
+                copy_to(env, 65, tdigest);
+                put_be8(env, 97, chain_id);
+                copy_to(env, 105, wallet);
+                copy_to(env, 125, token);
+                copy_to(env, 145, recipient);
+                put_padded(env, 165, amount);
+                put_be8(env, 197, nonce);
+                put_padded(env, 205, fee_cap);
+                put_be8(env, 237, gas_cap);
+                put_be8(env, 245, now);
+                put_be8(env, 253, be8(decision, 76));
+                env[261] = byte_of(calln);
+                copy_to(env, 262, decision[117..117 + calln]);
+                code = digest(st, env[0..262 + calln], edigest);
+                if code == 0 {
+                    code = secp256k1.sign(edigest, issuer_key, id[0..0], sig, work);
+                    if code != 0 {
+                        code = -247;
+                    }
+                }
+            }
+        }
+    }
+    if code != 0 {
+        return code;
+    }
+    return 262 + calln;
+}
+
+// The signer's check of an envelope, against its own configuration: the issuer's address (20 bytes), chain id, the wallet's address (20 bytes), the authenticated `caller` of this request
+// (1 to 64 bytes) and its clock `now`, and against the unsigned `message` it is asked to sign. Answers 0, or the first of: the layout (-250), the signature (-251: malformed, or s is not low),
+// the issuer (-252), the chain (-253), the wallet (-254), the caller (-255), not yet valid (-256), expired (-257), the message's digest (-258), the message against the envelope's expectation (-259,
+// and `detail[0]` is `txcheck`'s code); a bad length in the configuration is -245. Nothing in the envelope is read as true before the issuer's signature has been checked.
+pub fn verify[&s, &w, &e, &g, &m, &a, &b, &c, &d](st: &!s [int], work: &!w [int], env: &e [byte], sig: &g [byte], message: &m [byte], issuer: &a [byte], chain_id: int, wallet: &b [byte], caller: &c [byte], now: int, detail: &!d [int]) -> [] int {
+    if len(issuer) != 20 || len(wallet) != 20 || len(caller) < 1 || len(caller) > 64 || len(detail) < 1 || len(message) < 1 || chain_id < 0 || now < 0 || len(sig) != 65 {
+        return -245;
+    }
+    detail[0] = 0;
+    if len(env) < 263 || len(env) > 326 || int_of(env[0]) != 1 {
+        return -250;
+    }
+    let n = int_of(env[261]);
+    if n < 1 || n > 64 || len(env) != 262 + n {
+        return -250;
+    }
+    var code = 0;
+    region g {
+        let edigest = alloc_slice[g](32, byte_of(0));
+        let pk = alloc_slice[g](65, byte_of(0));
+        let who = alloc_slice[g](20, byte_of(0));
+        code = digest(st, env, edigest);
+        if code != 0 {
+            code = -250;
+        } else if cmp32(sig[32..64], half_n) > 0 {
+            code = -251;
+        } else {
+            code = secp256k1.recover(edigest, sig, pk, work);
+            if code != 0 {
+                code = -251;
+            } else {
+                code = address.from_public_key(st, pk, who);
+                if code != 0 {
+                    code = -251;
+                } else if !bytes.equal(who, issuer) {
+                    code = -252;
+                }
+            }
+        }
+        if code == 0 {
+            if be8(env, 97) != chain_id {
+                code = -253;
+            } else if !bytes.equal(env[105..125], wallet) {
+                code = -254;
+            } else if !bytes.equal(env[262..262 + n], caller) {
+                code = -255;
+            } else if now < be8(env, 245) {
+                code = -256;
+            } else if now >= be8(env, 253) {
+                code = -257;
+            }
+        }
+        if code == 0 {
+            let tdigest = alloc_slice[g](32, byte_of(0));
+            code = keccak.hash256(st, message, tdigest);
+            if code != 0 {
+                code = -258;
+            } else if !bytes.equal(tdigest, env[65..97]) {
+                code = -258;
+            } else {
+                let tx = txcheck.validate_unsigned(message, be8(env, 97), be8(env, 197), env[125..145], env[145..165], env[165..197], env[205..237], be8(env, 237));
+                if tx != 0 {
+                    detail[0] = tx;
+                    code = -259;
+                }
+            }
+        }
+    }
+    return code;
+}
+
+// Single use (docs/design.md section 13.3). The ledger is the signer's list of `envelope id (32) || transaction digest (32)`, 64 bytes an entry, in any order. Answers 0 when `id` is not in it
+// (fresh: write the entry, flush, then sign); 1 when it is, with this same digest (the same transaction again: sign it again, and the signature is the same bytes); -261 when it is with a different
+// digest (the id was used for another transaction: refuse); -260 for a ledger whose length is not a multiple of 64 or ids and digests that are not 32 bytes.
+pub fn ledger_check[&l, &i, &d](ledger: &l [byte], id: &i [byte], tx_digest: &d [byte]) -> [] int {
+    if len(ledger) % 64 != 0 || len(id) != 32 || len(tx_digest) != 32 {
+        return -260;
+    }
+    var seen = 0;
+    var conflict = 0;
+    var k = 0;
+    while k < len(ledger) / 64 {
+        if bytes.equal(ledger[64 * k..64 * k + 32], id) {
+            if bytes.equal(ledger[64 * k + 32..64 * k + 64], tx_digest) {
+                seen = 1;
+            } else {
+                conflict = 1;
+            }
+        }
+        k = k + 1;
+    }
+    if conflict == 1 {
+        return -261;
+    }
+    return seen;
+}
+
+// The ledger entry for `id` and `tx_digest` into `out` (64 bytes).
+pub fn ledger_entry[&i, &d, &o](id: &i [byte], tx_digest: &d [byte], out: &!o [byte]) -> [] int {
+    if len(id) != 32 || len(tx_digest) != 32 || len(out) != 64 {
+        return -260;
+    }
+    copy_to(out, 0, id);
+    copy_to(out, 32, tx_digest);
+    return 0;
+}

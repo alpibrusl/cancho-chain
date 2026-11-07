@@ -7,15 +7,17 @@ An auditable authority and execution layer for autonomous blockchain agents, in 
 An agent may *propose* a transaction. A separately enforced policy decides whether it is allowed. A signer, in its own process, signs only the exact
 bytes that were approved. Every step leaves evidence. The agent never holds a key and cannot change its own policy.
 
-**Status: research, phase 0.** Nothing here moves value yet. What exists, and how it is checked:
+**Status: research.** Seven slices are built and a development signer signs one request at a time; no network front, no RPC, nothing moves value yet. What exists, and how it is checked:
 
 | Piece | State | Check |
 |---|---|---|
 | `chain.keccak`, Keccak-256 (Ethereum's padding, not SHA-3's) | built | `scripts/check_keccak.py`: 425 inputs against pycryptodome, 12 of 12 mutants killed |
 | `chain.hex`, `chain.address` (EIP-55), `chain.rlp`, `chain.erc20`, `chain.tx1559` (encoders and the signed type-2 transaction) | built | `scripts/check_eth.py`: 531 checks against eth-account, eth-abi and rlp (signed transactions byte for byte), 29 of 29 mutants killed |
-| `chain.rlp` decoder (strict), `chain.txcheck` (the final-transaction validator, 16 stable reason codes) | built | `scripts/check_decode.py`: 1,423 checks against rlp (strict) and eth-account, 50 of 51 mutants killed (1 equivalent) |
+| `chain.rlp` decoder (strict), `chain.txcheck` (the final-transaction validator, 16 stable reason codes) | built | `scripts/check_decode.py`: 1,423 checks against rlp (strict, and a header-level reference: §9.3), 50 of 51 mutants killed (1 equivalent) |
 | `chain.intent` (the typed ERC-20 transfer intent on `cancho-schema`: canonical form, digest, 13 stable refusals) | built | `scripts/check_intent.py`: 795 checks against a separate model, eth-utils and jsonschema, 44 of 48 mutants killed (4 redundant) |
 | `chain.policy` and `chain.decide` (the policy engine: canonical policy and digest, a pure decision function, 14 stable reasons, a decision record and digest) | built | `scripts/check_policy.py`: 989 checks against a separate model and jsonschema, every combination of up to three reasons, 119 of 121 mutants killed (2 equivalent) |
+| `chain.envelope` (the authorisation envelope: a decision bound to the exact unsigned transaction and signed by an issuer key; `issue`, the signer's `verify` with 10 ordered refusals, the single-use ledger) | built | `scripts/check_envelope.py`: 1,187 checks against a separate model, libsecp256k1 and python-ecdsa; every fault alone, in every pair and in every trio; every changed bit; 85 of 92 mutants killed (7 equivalent) |
+| `signer` (`tools/signer`, `chain.signer`): a process that takes one request line, verifies the envelope, records it in a hash-chained `cancho-log` ledger (flushed before any signature exists) and signs; authority: one directory, the clock, stdio | built | `scripts/check_signer.py`: 386 checks against the envelope model, libsecp256k1, python-ecdsa, eth-account and an independent ledger reader; 14 kinds of ledger damage, none ever signs; 49 of 50 mutants killed (1 equivalent) |
 | everything else in [`docs/design.md`](docs/design.md) | designed, not built | -- |
 
 ```
@@ -26,6 +28,8 @@ CHAIN=build/chain python3 -I scripts/check_keccak.py [--mutants]     # --mutants
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages python3 -I scripts/check_eth.py [--mutants]   # needs pip install eth-account coincurve
 CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages python3 -I scripts/check_decode.py [--mutants]
 CANCHO=the-compiler CANCHO_SCHEMA=../cancho-schema/src/schema.cho python3 -I scripts/check_intent.py [--mutants]   # needs pip install eth-account jsonschema
+CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages CANCHO_SCHEMA=../cancho-schema/src/schema.cho CANCHO_LOG=../cancho-log/src python3 -I scripts/check_signer.py [--mutants]   # the real binary; needs cancho-log checked out too
+CANCHO=the-compiler CANCHO_PACKAGES=../cancho/packages CANCHO_SCHEMA=../cancho-schema/src/schema.cho python3 -I scripts/check_envelope.py [--mutants]   # needs pip install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils
 ```
 
 [`docs/design.md`](docs/design.md) holds the feasibility findings against the actual cancho tree (what exists, what is missing), the trust boundaries, the

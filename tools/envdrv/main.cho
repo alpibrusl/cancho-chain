@@ -1,0 +1,251 @@
+edition 7;
+
+// The driver of `scripts/check_envelope.py` (docs/design.md section 13.5): one command on standard input, one answer on standard output. Not the product's command line. Fields are hex
+// (`_` is empty); an integer is big-endian hex.
+//
+//   I <decision> <message> <chain> <nonce> <token> <recipient> <amount> <feecap> <gascap> <wallet> <id> <now> <issuerkey>
+//                                 issue an envelope                          -> "0 <envelope> <sig65>" or a refusal
+//   V <envelope> <sig65> <message> <issuer20> <chain> <wallet20> <caller> <now>
+//                                 the signer's check                          -> "0" or "<code> <detail>"
+//   L <ledger> <id> <digest>      the single-use ledger                       -> "0" (fresh) or "1" (same) or a refusal
+//   D <envelope>                  the envelope digest                         -> "0 <hex>"
+//   Y <id> <digest>               the ledger entry                            -> "0 <hex>"
+//
+// A refusal prints `E<code>` (the code, positive); a `V` refusal prints `E<code> <txcheck code>`.
+
+import chain.address;
+import chain.decide;
+import chain.envelope;
+import chain.hex;
+import chain.keccak;
+import chain.txcheck;
+import secp256k1;
+import std.buffer;
+import std.io;
+
+fn read_stdin[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    var c = getchar(io);
+    while c >= 0 {
+        out = buffer.push(heap, out, byte_of(c));
+        c = getchar(io);
+    }
+    return out;
+}
+
+// Splits the line into fields. Field k's bytes (hex-decoded; `_` is empty; the text itself for field 1 of `P`) are at arena[meta[k]..meta[k] + meta[16 + k]].
+// Returns the number of fields, the op included.
+fn split_fields[&t, &a, &m](text: &t [byte], arena: &!a [byte], meta: &!m [int]) -> [] int {
+    let raw = false;
+    var n = 0;
+    var at = 0;
+    var i = 0;
+    while i < len(text) && n < 16 {
+        while i < len(text) && (int_of(text[i]) == 32 || int_of(text[i]) == 10) {
+            i = i + 1;
+        }
+        if i < len(text) {
+            var j = i;
+            while j < len(text) && int_of(text[j]) != 32 && int_of(text[j]) != 10 {
+                j = j + 1;
+            }
+            meta[n] = at;
+            if n == 0 || raw && n == 1 {
+                var k = i;
+                while k < j {
+                    arena[at] = text[k];
+                    at = at + 1;
+                    k = k + 1;
+                }
+            } else if !(j - i == 1 && int_of(text[i]) == '_') {
+                var k = i;
+                while k + 1 < j {
+                    arena[at] = byte_of(hex.value(int_of(text[k])) * 16 + hex.value(int_of(text[k + 1])));
+                    at = at + 1;
+                    k = k + 2;
+                }
+            }
+            meta[16 + n] = at - meta[n];
+            n = n + 1;
+            i = j;
+        }
+    }
+    return n;
+}
+
+fn field[&a, &m](arena: &a [byte], meta: &m [int], k: int) -> [] &a [byte] {
+    return arena[meta[k]..meta[k] + meta[16 + k]];
+}
+
+fn emit_char[&o](out: &!o [byte], pos: int, c: int) -> [] int {
+    out[pos] = byte_of(c);
+    return pos + 1;
+}
+
+fn emit_hex[&o, &b](out: &!o [byte], pos: int, bytes: &b [byte]) -> [] int {
+    var p = pos;
+    var k = 0;
+    while k < len(bytes) {
+        let v = int_of(bytes[k]);
+        p = emit_char(out, p, hex.digit(v >> 4));
+        p = emit_char(out, p, hex.digit(v & 15));
+        k = k + 1;
+    }
+    return p;
+}
+
+fn emit_nat[&o](out: &!o [byte], pos: int, v: int) -> [] int {
+    var n = 1;
+    var t = v;
+    while t >= 10 {
+        t = t / 10;
+        n = n + 1;
+    }
+    var u = v;
+    var i = n - 1;
+    while i >= 0 {
+        out[pos + i] = byte_of(48 + u % 10);
+        u = u / 10;
+        i = i - 1;
+    }
+    return pos + n;
+}
+
+fn emit_text[&o, &b](out: &!o [byte], pos: int, text: &b [byte]) -> [] int {
+    var p = pos;
+    var k = 0;
+    while k < len(text) {
+        p = emit_char(out, p, int_of(text[k]));
+        k = k + 1;
+    }
+    return p;
+}
+
+// The big-endian bytes as an integer (at most 7 bytes: enough for a chain id, a nonce or a gas limit).
+fn int_of_bytes[&b](b: &b [byte]) -> [] int {
+    var v = 0;
+    var i = 0;
+    while i < len(b) && i < 7 {
+        v = v * 256 + int_of(b[i]);
+        i = i + 1;
+    }
+    return v;
+}
+
+// Runs the op. Answers the text length written to `out`, or a negative refusal.
+fn run[&a, &m, &s, &w, &c, &o, &x](op: int, nf: int, arena: &a [byte], meta: &m [int], st: &!s [int], work: &!w [int], scratch: &!c [byte], out: &!o [byte], detail: &!x [int]) -> [] int {
+    var p = emit_char(out, 0, '0');
+    p = emit_char(out, p, ' ');
+    if op == 'I' && nf == 14 {
+        let env = scratch[0..400];
+        let sig = scratch[400..465];
+        let n = envelope.issue(st, work, field(arena, meta, 1), field(arena, meta, 2), int_of_bytes(field(arena, meta, 3)), int_of_bytes(field(arena, meta, 4)), field(arena, meta, 5), field(arena, meta, 6), field(arena, meta, 7), field(arena, meta, 8), int_of_bytes(field(arena, meta, 9)), field(arena, meta, 10), field(arena, meta, 11), int_of_bytes(field(arena, meta, 12)), field(arena, meta, 13), env, sig);
+        if n < 0 {
+            return n;
+        }
+        p = emit_hex(out, p, env[0..n]);
+        p = emit_char(out, p, ' ');
+        return emit_hex(out, p, sig);
+    }
+    if op == 'V' && nf == 9 {
+        let r = envelope.verify(st, work, field(arena, meta, 1), field(arena, meta, 2), field(arena, meta, 3), field(arena, meta, 4), int_of_bytes(field(arena, meta, 5)), field(arena, meta, 6), field(arena, meta, 7), int_of_bytes(field(arena, meta, 8)), detail);
+        if r == 0 {
+            return 1;
+        }
+        // A refusal is "E<code> <txcheck code>", written here because it has two numbers.
+        var q = emit_char(out, 0, 'E');
+        q = emit_nat(out, q, 0 - r);
+        q = emit_char(out, q, ' ');
+        return emit_nat(out, q, 0 - detail[0]);
+    }
+    if op == 'L' && nf == 4 {
+        let r = envelope.ledger_check(field(arena, meta, 1), field(arena, meta, 2), field(arena, meta, 3));
+        if r < 0 {
+            return r;
+        }
+        return emit_char(out, 0, '0' + r);
+    }
+    if op == 'Y' && nf == 3 {
+        let r = envelope.ledger_entry(field(arena, meta, 1), field(arena, meta, 2), scratch[600..664]);
+        if r < 0 {
+            return r;
+        }
+        return emit_hex(out, p, scratch[600..664]);
+    }
+    if op == 'D' && nf == 2 {
+        let r = envelope.digest(st, field(arena, meta, 1), scratch[0..32]);
+        if r < 0 {
+            return r;
+        }
+        return emit_hex(out, p, scratch[0..32]);
+    }
+    return -999;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    borrow mut heap as &!h in {
+        borrow mut io as &!i in {
+            let text = read_stdin(h, i);
+            let st = box_slice(h, keccak.state_len(), 0);
+            let work = box_slice(h, secp256k1.work_len(), 0);
+            let scratch = box_slice(h, 4096, byte_of(0));
+            let arena = box_slice(h, 8192, byte_of(0));
+            let out = box_slice(h, 8192, byte_of(0));
+            let meta = box_slice(h, 32, 0);
+            let detail = box_slice(h, 2, 0);
+            var n = -999;
+            borrow text as &tx in {
+                borrow mut arena as &!ar in {
+                    borrow mut meta as &!me in {
+                        let src = buffer.bytes(tx);
+                        let nf = split_fields(src, contents(ar), contents(me));
+                        borrow mut st as &!s1 in {
+                            borrow mut work as &!w1 in {
+                                borrow mut scratch as &!sc in {
+                                    borrow mut out as &!ou in {
+                                        borrow mut detail as &!dt in {
+                                            n = run(int_of(src[0]), nf, contents(ar), contents(me), contents(s1), contents(w1), contents(sc), contents(ou), contents(dt));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            var line = buffer.empty(h, 32);
+            if n < 0 {
+                line = buffer.push(h, line, byte_of('E'));
+                line = buffer.push_nat(h, line, 0 - n);
+            } else {
+                borrow out as &ob in {
+                    line = buffer.append(h, line, contents(ob)[0..n]);
+                }
+            }
+            line = buffer.push(h, line, byte_of(10));
+            borrow line as &lx in {
+                buffer.write(i, lx);
+            }
+            buffer.drop(h, line);
+            buffer.drop(h, text);
+            unbox_slice(h, st);
+            unbox_slice(h, work);
+            unbox_slice(h, scratch);
+            unbox_slice(h, arena);
+            unbox_slice(h, out);
+            unbox_slice(h, meta);
+            unbox_slice(h, detail);
+        }
+    }
+    release(heap);
+    release(io);
+    return 0;
+}

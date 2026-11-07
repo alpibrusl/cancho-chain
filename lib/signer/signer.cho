@@ -1,0 +1,298 @@
+edition 7;
+
+module chain.signer;
+
+import chain.envelope;
+import chain.hex;
+import std.bytes;
+
+// The signer's parts that are not input and output (docs/design.md section 14): its refusals and their repairs, the ledger event's payload, and the two small files it reads.
+
+pub fn max_entries() -> [] int {
+    return 65536;
+}
+
+// `{"id":"<64 hex>","digest":"<64 hex>"}`.
+pub fn payload_len() -> [] int {
+    return 149;
+}
+
+pub fn refused_locked() -> [] int {
+    return -270;
+}
+
+pub fn refused_same_key() -> [] int {
+    return -271;
+}
+
+pub fn refused_ledger_corrupt() -> [] int {
+    return -272;
+}
+
+pub fn refused_ledger_full() -> [] int {
+    return -273;
+}
+
+pub fn refused_ledger_write() -> [] int {
+    return -274;
+}
+
+pub fn refused_request() -> [] int {
+    return -275;
+}
+
+pub fn refused_config() -> [] int {
+    return -276;
+}
+
+pub fn refused_key() -> [] int {
+    return -277;
+}
+
+pub fn refused_sign() -> [] int {
+    return -278;
+}
+
+pub fn refused_clock() -> [] int {
+    return -279;
+}
+
+// The rule tag of a refusal, without the `chain.` prefix: the envelope's own (-240 to -261) or the signer's.
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code <= -240 && code >= -261 {
+        return envelope.refusal_tag(code);
+    }
+    if code == -270 {
+        return "signer-locked";
+    }
+    if code == -271 {
+        return "signer-same-key";
+    }
+    if code == -272 {
+        return "signer-ledger-corrupt";
+    }
+    if code == -273 {
+        return "signer-ledger-full";
+    }
+    if code == -274 {
+        return "signer-ledger-write";
+    }
+    if code == -275 {
+        return "signer-request";
+    }
+    if code == -276 {
+        return "signer-config";
+    }
+    if code == -277 {
+        return "signer-key";
+    }
+    if code == -278 {
+        return "signer-sign";
+    }
+    if code == -279 {
+        return "signer-clock";
+    }
+    return "signer-unknown";
+}
+
+// What to do about a refusal, one line, with no value from the request in it.
+pub fn repair(code: int) -> [] &static [byte] {
+    if code == -270 {
+        return "another signer holds this directory; run one at a time";
+    }
+    if code == -271 {
+        return "the issuer address must not be the wallet's: use two keys";
+    }
+    if code == -272 {
+        return "the ledger does not verify; nothing is signed until a person has looked at it";
+    }
+    if code == -273 {
+        return "the ledger holds the most entries this signer reads; archive it";
+    }
+    if code == -274 {
+        return "the ledger could not be written, so nothing was signed; check the disk and retry";
+    }
+    if code == -275 {
+        return "the request line is four hex fields: envelope, signature, message, caller";
+    }
+    if code == -276 {
+        return "signer.conf must be exactly issuer=<40 hex digits> and chain=<decimal>, one to a line";
+    }
+    if code == -277 {
+        return "wallet.key must be 64 hex digits";
+    }
+    if code == -278 {
+        return "the signature could not be made";
+    }
+    if code == -279 {
+        return "the clock could not be read";
+    }
+    if code == -250 {
+        return "the envelope is not a whole version-1 envelope";
+    }
+    if code == -251 {
+        return "the issuer's signature is not a valid low-s signature";
+    }
+    if code == -252 {
+        return "the envelope was not signed by this signer's issuer";
+    }
+    if code == -253 {
+        return "the envelope is for another chain";
+    }
+    if code == -254 {
+        return "the envelope is for another wallet";
+    }
+    if code == -255 {
+        return "the envelope was issued to another caller";
+    }
+    if code == -256 {
+        return "the envelope is not valid yet; check the issuer's clock";
+    }
+    if code == -257 {
+        return "the envelope has expired; ask the policy side for a new decision";
+    }
+    if code == -258 {
+        return "the message is not the transaction the envelope was issued for";
+    }
+    if code == -259 {
+        return "the message is not what the envelope authorises";
+    }
+    if code == -261 {
+        return "this envelope was already used for another transaction";
+    }
+    return "refused";
+}
+
+fn is_lower_hex(c: int) -> [] bool {
+    return c >= 48 && c <= 57 || c >= 97 && c <= 102;
+}
+
+// The ledger event's payload into `out` (149 bytes): `{"id":"<64 hex>","digest":"<64 hex>"}`, lower-case. `id` and `digest` are 32 bytes each.
+pub fn payload[&i, &d, &o](id: &i [byte], digest: &d [byte], out: &!o [byte]) -> [] int {
+    if len(id) != 32 || len(digest) != 32 || len(out) != 149 {
+        return -272;
+    }
+    var p = 0;
+    let a = "{\"id\":\"";
+    while p < 7 {
+        out[p] = byte_of(int_of(a[p]));
+        p = p + 1;
+    }
+    hex.encode(id, out[7..71]);
+    let b = "\",\"digest\":\"";
+    var q = 0;
+    while q < 12 {
+        out[71 + q] = byte_of(int_of(b[q]));
+        q = q + 1;
+    }
+    hex.encode(digest, out[83..147]);
+    out[147] = byte_of(34);
+    out[148] = byte_of(125);
+    return 149;
+}
+
+// Reads a payload back: exactly the shape `payload` writes, lower-case hex, nothing else. `id` and `digest` get 32 bytes each. 0, or -272.
+pub fn parse_payload[&p, &i, &d](text: &p [byte], id: &!i [byte], digest: &!d [byte]) -> [] int {
+    if len(text) != 149 || len(id) != 32 || len(digest) != 32 {
+        return -272;
+    }
+    var model = true;
+    region r {
+        let m = alloc_slice[r](149, byte_of(0));
+        let zeros = alloc_slice[r](32, byte_of(0));
+        payload(zeros, zeros, m);
+        var k = 0;
+        while k < 149 {
+            let inhex = k >= 7 && k < 71 || k >= 83 && k < 147;
+            if inhex {
+                if !is_lower_hex(int_of(text[k])) {
+                    model = false;
+                }
+            } else if int_of(text[k]) != int_of(m[k]) {
+                model = false;
+            }
+            k = k + 1;
+        }
+    }
+    if !model {
+        return -272;
+    }
+    if hex.decode(text[7..71], id) < 0 || hex.decode(text[83..147], digest) < 0 {
+        return -272;
+    }
+    return 0;
+}
+
+// `signer.conf`: exactly `issuer=<40 lower-case hex digits>` and `chain=<1 to 18 decimal digits, no leading zero>`, each ended by a newline (the last may lack it). The issuer's 20 bytes
+// go to `issuer`; the chain id is answered (a negative number is a refusal, -276).
+pub fn parse_config[&t, &i](text: &t [byte], issuer: &!i [byte]) -> [] int {
+    if len(issuer) != 20 || len(text) < 7 + 40 + 1 + 6 + 1 {
+        return -276;
+    }
+    let a = "issuer=";
+    var k = 0;
+    while k < 7 {
+        if int_of(text[k]) != int_of(a[k]) {
+            return -276;
+        }
+        k = k + 1;
+    }
+    k = 0;
+    while k < 40 {
+        if !is_lower_hex(int_of(text[7 + k])) {
+            return -276;
+        }
+        k = k + 1;
+    }
+    if int_of(text[47]) != 10 {
+        return -276;
+    }
+    let b = "chain=";
+    k = 0;
+    while k < 6 {
+        if int_of(text[48 + k]) != int_of(b[k]) {
+            return -276;
+        }
+        k = k + 1;
+    }
+    var end = len(text);
+    if int_of(text[end - 1]) == 10 {
+        end = end - 1;
+    }
+    let digits = end - 54;
+    if digits < 1 || digits > 18 || digits > 1 && int_of(text[54]) == 48 {
+        return -276;
+    }
+    var chain = 0;
+    k = 0;
+    while k < digits {
+        let c = int_of(text[54 + k]);
+        if c < 48 || c > 57 {
+            return -276;
+        }
+        chain = chain * 10 + (c - 48);
+        k = k + 1;
+    }
+    if hex.decode(text[7..47], issuer) < 0 {
+        return -276;
+    }
+    return chain;
+}
+
+// `wallet.key`: 64 hex digits (either case), then at most one newline. The 32 bytes go to `key`. 0, or -277.
+pub fn parse_key[&t, &o](text: &t [byte], key: &!o [byte]) -> [] int {
+    if len(key) != 32 {
+        return -277;
+    }
+    var n = len(text);
+    if n == 65 && int_of(text[64]) == 10 {
+        n = 64;
+    }
+    if n != 64 {
+        return -277;
+    }
+    if hex.decode(text[0..64], key) < 0 {
+        return -277;
+    }
+    return 0;
+}

@@ -89,6 +89,27 @@ def random_item(rng, depth=0):
     return bytes(rng.randrange(256) for _ in range(rng.choice((0, 1, 1, 2, 3, 20, 55, 56, 57, 100, 300))))
 
 
+def header_ok(data):
+    """Does `data` begin with one canonical item header that exactly fills it? Written here from the specification, for the one case `rlp.decode` cannot answer: `item` looks at a
+    header and never inside a list, so a list whose header is canonical and whose payload is not is accepted by `rlp.whole` and refused by `rlp.decode(strict=True)`. The consumer (`txcheck`)
+    walks the payload field by field and refuses it there (section 9.1)."""
+    if not data:
+        return False
+    b = data[0]
+    if b < 0x80:
+        return len(data) == 1
+    if b < 0xB8 or 0xC0 <= b < 0xF8:
+        n = b - 0x80 if b < 0xB8 else b - 0xC0
+        if b < 0xB8 and n == 1 and len(data) > 1 and data[1] < 0x80:
+            return False
+        return len(data) == 1 + n
+    w = b - 0xB7 if b < 0xC0 else b - 0xF7
+    if w > 7 or len(data) < 1 + w or data[1] == 0:
+        return False
+    n = int.from_bytes(data[1:1 + w], "big")
+    return n >= 56 and len(data) == 1 + w + n
+
+
 def agrees(exe, data):
     rc = call(exe, f"D {data.hex() if data else '_'}")
     if rc == "CRASH":
@@ -99,6 +120,8 @@ def agrees(exe, data):
         theirs = True
     except Exception:
         theirs = False
+    if ours and not theirs and data and data[0] >= 0xC0 and header_ok(data):
+        theirs = True  # a canonical list header over a payload that is not itself canonical: header-level by design, and the consumer's to refuse
     return ours, theirs
 
 
@@ -368,4 +391,5 @@ def main():
         shutil.rmtree(d)
 
 
-main()
+if __name__ == "__main__":
+    main()

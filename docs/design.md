@@ -244,7 +244,10 @@ sixteen codes, a transaction tampered in exactly that field is refused with exac
 `CANCHO=<compiler> CANCHO_PACKAGES=<cancho>/packages python3 -I scripts/check_decode.py --cases 30`: **1,423 of 1,423** checks agree.
 - **Decoder against `rlp.decode(strict=True)`:** 30 random nested encodings (each valid), and for each a truncation, an appended byte, a duplicated first byte, a replaced byte, a deleted byte and
   an inserted byte; 60 random byte strings; 36 length-boundary encodings (every long-form edge: 55, 56 and 57 bytes, the two-byte and three-byte lengths, leading zero length bytes, eight-byte lengths).
-  Accept/reject agree on every one. 20 more cases check the *reason* (`rlp-truncated`, `rlp-noncanonical`, `rlp-oversized`, `rlp-trailing`), which `rlp` cannot give.
+  Accept/reject agree on every one **at the header**. *Corrected 2026-11-06:* this paragraph first said the decoder agrees with `rlp.decode(strict=True)` on these, which is false in general. `item` reads one header and never looks inside a list
+  (`txcheck` walks the payload field by field and refuses it there, `tx-format`), so a list with a canonical header over a payload that is not canonical is accepted by `rlp.whole` and refused by `rlp.decode`. The default seed never produced one; running the
+  same script with `--cases 20` did (`c681e7aeb82ad4`: a list of six bytes whose second item announces 46). `scripts/check_decode.py` now compares the header with a reference written from the specification where `rlp` cannot answer, and the other
+  cases with `rlp`; 983, 1,423, 2,303, 4,503 and 8,903 checks agree for `--cases` 20, 30, 50, 100 and 200. 20 more cases check the *reason* (`rlp-truncated`, `rlp-noncanonical`, `rlp-oversized`, `rlp-trailing`), which `rlp` cannot give.
 - **Validator:** 30 random ERC-20 transfers (chain id, nonce, fees, gas, token, recipient, amounts of 0 to 256 bits) validate unsigned and signed (signed by `eth-account`), and also as built and signed
   by our own encoder and signer; an amount in the expectation padded to 32 bytes with zeros is the same number; 13 single-field tamperings, each as unsigned and as signed, are refused with exactly
   the code of that field (chain id, nonce, `to`, a contract creation, value, calldata one byte short and one long, selector, padding, recipient, amount low and high byte, access list); fee and gas above their caps,
@@ -414,6 +417,136 @@ binds the decision to them). A caller that lies about `now`, `caller` or `histor
 `scripts/check_policy.py` against a model in Python written separately from this section: every policy and intent the model accepts has the same canonical bytes and digest; for random policies, intents, callers, times, registry states and histories
 the decision (outcome, reason, every byte of the record and its digest) is the model's; each of the 14 reasons is reached alone and in every pairing that tests the table's order; every boundary (`now` at `not_before`, `not_after` and one either side; an
 amount at, one below and one above each limit; a history record at and either side of the 86,400-second edge; sums that reach, exceed and overflow the daily total); every malformed input. `--mutants` as for the other slices. Results are added below when measured.
+
+## 13. The authorisation envelope (slice 6)
+
+**Status: built.** Results are in §13.5. The envelope is what crosses from the policy side to the signer: a decision (§11) bound to the exact unsigned transaction,
+signed by an **issuer** key that is not the wallet key. The signer trusts nothing in it until the issuer's signature is checked, and re-derives everything it can.
+
+### 13.1 The envelope
+
+A fixed binary layout (big-endian, version 1), 262 bytes plus the caller:
+
+| bytes | field |
+|---|---|
+| 0 | layout version, 1 |
+| 1 to 33 | envelope id: 32 bytes the issuer draws fresh; the key of single use |
+| 33 to 65 | the decision digest (§11.3): evidence, the signer cannot recompute it |
+| 65 to 97 | the transaction digest: `keccak256` of the unsigned message `02 \|\| rlp(body)`, which is the hash that is signed |
+| 97 to 105 | chain id |
+| 105 to 125 | the address that must sign (the wallet) |
+| 125 to 145 | token contract; 145 to 165 recipient; 165 to 197 amount (32 bytes) |
+| 197 to 205 | nonce; 205 to 237 fee cap per gas (32); 237 to 245 gas cap |
+| 245 to 253 | `issued_at`; 253 to 261 `expires_at` (Unix seconds) |
+| 261 | the caller's length `n` (1 to 64), then the caller's bytes |
+
+The envelope digest is `keccak256("cancho-chain/envelope/v1" || layout)`; the **issuer signs that digest** with secp256k1 (`r || s || recid`, low s, RFC 6979), and the signer recovers the issuer's address from it and compares with the one it was configured with.
+**[choice]** An issuer signature, and not a MAC under a secret both sides hold: the signer then holds no secret that can *make* an envelope, so a compromised signer cannot authorise anything for itself, and a compromised policy service cannot sign (it has no wallet key).
+The two keys must differ; the signer refuses to start if they do not (a later slice).
+
+The fields after the digest are the **expectation** `chain.txcheck` is given (§9.2): the signer recomputes nothing from the decision, but it does decode the exact bytes and require every field to be what the envelope says, and the envelope to be what the issuer signed.
+
+### 13.2 Issuing
+
+`issue` takes the decision record (§11.3), the unsigned message, the expectation, the wallet address, a fresh envelope id, `now` and the issuer key. It refuses (reasons below) unless the decision's outcome is `allow`, `now` is in `[decided_at, expires_at)` of the decision, the decision's amount is the expectation's,
+and `validate_unsigned` passes on the message. The envelope expires when the **decision** does: an envelope cannot outlive the authority it carries. It writes the layout and the signature.
+
+### 13.3 Verifying (the signer's side)
+
+`verify` takes the envelope, the signature, the unsigned message, and **the signer's own configuration**: the issuer address, chain id, wallet address, the authenticated caller of this request and its clock. Checks, in this order, the first failure answers:
+
+1. the layout is whole and version 1 (`ENVELOPE_FORMAT`); nothing in it is believed yet;
+2. the recovered issuer is the configured one (`SIGNATURE_INVALID` if recovery fails or `s` is high; `ISSUER_MISMATCH`);
+3. `chain id`, the wallet address and the caller equal the signer's (`CHAIN_ID_MISMATCH`, `SIGNER_KEY_MISMATCH`, `CALLER_MISMATCH`): the caller is the one the gateway authenticated (`auth_identity_header`), so an envelope issued to one principal is useless to another;
+4. `issued_at <= now < expires_at` (`ENVELOPE_NOT_YET_VALID`, `ENVELOPE_EXPIRED`);
+5. `keccak256(message)` is the envelope's transaction digest (`TRANSACTION_DIGEST_MISMATCH`);
+6. `validate_unsigned` against the envelope's expectation (`TRANSACTION_INVALID`, with `txcheck`'s code as the detail).
+
+Single use is **state**, kept by the signer, and is not part of `verify`: a **ledger** of `envelope id || transaction digest` (64 bytes per entry). `ledger_check(ledger, id, digest)` answers *fresh*, *same* or *conflict*.
+**[choice]** The entry is written and flushed **before** the signature is produced. A crash between the two loses a signature, never lets a second one out. An envelope seen again **with the same transaction digest** is signed again, and gets the same bytes (RFC 6979 is deterministic): a retry after a timeout cannot pay twice, because it is the same
+transaction with the same nonce, and refusing it would leave the caller unable to recover the signature. An envelope id seen with a **different** digest is `AUTHORIZATION_REPLAYED`.
+
+### 13.4 What it does not do
+
+It does not keep the ledger durable (the signer process does, on cancho-log), draw the id's randomness, hold either key, or run the signer; those are the next slice. It proves nothing about the decision beyond the issuer's word that one was made: the decision digest is evidence an auditor can match to the log, not something
+the signer can check. An issuer that is compromised can authorise anything within a policy it is willing to sign for: the signer's own configuration (chain id, wallet) and the expiry bound it, the policy does not (the signer never sees it). That is the trust placed in the issuer, and it is said in §6.
+
+### 13.5 How it is checked
+
+`scripts/check_envelope.py`, against a model in Python written separately from this section: envelopes issued by the code have the model's bytes and digest and a signature the model verifies with libsecp256k1 (`coincurve`) and recovers to the issuer's address; every refusal reached alone and in the pairings that test the order; every boundary (`now` at
+`issued_at`, `expires_at` and one either side); a changed byte at every offset of the envelope, of the signature and of the message (each must be refused, with the reason the order says); the ledger's three answers; `--mutants` as for the other slices. Results are added below when measured.
+
+**[measured]** 2026-11-07, Linux x86-64, the self-hosted `cancho` at `162633a7`, `secp256k1` from alpibrusl/cancho#710 (merged), `coincurve`, `python-ecdsa` and `pycryptodome` from pip.
+`CANCHO=<compiler> CANCHO_PACKAGES=<cancho>/packages CANCHO_SCHEMA=<cancho-schema>/src/schema.cho python3 -I scripts/check_envelope.py`: **1,187 of 1,187** checks pass (`--cases 120`).
+- **Issue:** 120 random cases (chain, nonce, fees, a 1- to 64-byte caller, windows from 1 second): the envelope is the model's, byte for byte; the signature is the model's (libsecp256k1, RFC 6979) and python-ecdsa verifies it; it recovers to the issuer; `verify` accepts it; the digest is the model's;
+  an amount padded to 32 bytes gives the same envelope. The refusal cases of `issue`, each alone, each with its code (the decision's length, version, caller length and outcome, both ends of the window, the amount one either side, each field of the transaction, every length, the issuer key at 0 and at `n`, an issuer that is the wallet).
+- **Verify:** every refusal alone, each with its code; **every one of the ten faults alone, in each of the 44 pairs that can occur together and each of the 112 trios: the first in §13.3's order answers**; every changed bit of the envelope (two bits at each of its bytes) is refused by the signature or the layout, every changed bit of the signature
+  is refused, every changed byte of the message is a digest mismatch; the low-s edge (`s` exactly `n/2` is accepted as low, one above is not); the window's edges (`issued_at` accepted, one before refused; `expires_at` refused, one before accepted); the longest (326 bytes) and the shortest (263 bytes) envelopes; the
+  configuration's lengths; the six `txcheck` detail codes (nonce, token, recipient, amount, gas cap, fee cap) and the chain one. Ledger: 60 random ledgers and the edges (the same id with different digests anywhere in the list conflicts; the same entry twice is the same; a length that is not a multiple of 64).
+- `--mutants`: 92 deliberate faults (every offset of the layout, each bound and comparison of `issue` and `verify`, the order of the checks, the low-s test and its constant at both ends, every expectation field handed to `txcheck`, the ledger's offsets and answers): **85 killed, 7 equivalent**, each explained in the script (a bound that an earlier or later check of the
+  same input already enforces, or a buffer length the driver fixes). The first run killed 83 of 92; the survivors were a case that happened to have amount 0 (so "one less" did not exist), a short digest never given to the ledger, and a 261-byte envelope never given to `verify`; each became a check.
+- **A claim of an earlier slice was found false while building this one** (§9.3, corrected in place): the decoder is header-level and does not agree with `rlp.decode(strict=True)` on every input.
+
+**Not claimed.** That the ledger is durable or the id unique: the caller draws the id (a repeat would be `AUTHORIZATION_REPLAYED` only if the ledger holds it), and the signer keeps the ledger. That the decision digest is the decision of anything the signer can check. That `secp256k1` is constant time (#712). That nothing has been independently reviewed.
+
+## 14. The signer (slice 7)
+
+**Status: built.** Results are in §14.7. The signer is the only process that holds the wallet key. It takes one request, answers with a signature or a refusal with a stable rule tag, and leaves a durable record of what it consumed. This slice is its core and its process boundary; the network front is not in it.
+
+### 14.1 What it is, and what it is not
+
+A program `signer`, built from `tools/signer/main.cho`, run as one process per request, on a request line from its front (v1: a person, a test, or a small adapter; the front that listens on a socket behind `cancho-gateway` is the next slice).
+**[choice]** One request per process: it makes the process boundary and the authority report trivial (no `net_*`, no `exec`, no `signals`, no command line; it performs the clock, one directory, standard input and output, and the heap for the ledger), and recovery and the lock are paid at each start (milliseconds for a ledger of thousands). A long-running signer is an optimisation and changes none of the rules below.
+
+Its directory is a **compile-time constant** (`/var/lib/cancho-signer`), so `cancho authority` names the one path it can read and write, and nothing else (a path taken from the command line would make the report unbounded). The test harness builds a copy with another path.
+
+| file | what |
+|---|---|
+| `wallet.key` | the wallet key, 64 hex digits (a development key: nothing here claims production key management, §6) |
+| `signer.conf` | `issuer=<40 hex digits>` and `chain=<decimal>`: the issuer's address and the one chain it signs for |
+| `ledger.seg` | the ledger: a `cancho-log` segment in **trail mode** (cancho-log `docs/trail.md`), one event `envelope.consumed` per envelope, hash-chained |
+
+### 14.2 A request
+
+One line on standard input: `<envelope hex> <signature hex> <message hex> <caller hex>`: the envelope and its issuer signature (§13), the unsigned message to sign, and the **caller as the front authenticated it** (v1 trusts its front for the caller exactly as §11.4 trusts the service; the front is `cancho-gateway` with `auth_identity_header`, which removes whatever the client sent and says who the key was).
+The time is the signer's own clock; there is no field for it, and no flag that overrides it.
+
+### 14.3 The steps, in this order
+
+1. **Start.** Take `flock` on `ledger.seg` (a second signer on the same directory is refused, `signer-locked`: two signers would each see an envelope as fresh). Read the configuration and the key; derive the wallet address; refuse to start if it is the issuer's (`signer-same-key`).
+   **Verify the whole chain first, read-only** (`trail.verify`: every event, every parent link), and only then recover (cut a torn tail): `recover` cuts a log at the first thing that is not a whole record, and for damage in the middle of the file that would throw away entries that were consumed, after which their envelopes would look fresh. Only a *torn* tail (the file ends inside a record) is ever cut; any other verdict is refused. Then read the entries. A ledger that does not verify is `signer-ledger-corrupt` and nothing is signed: **fail closed**. A ledger over 65,536 entries is `signer-ledger-full`.
+2. `envelope.verify` with the signer's own configuration: the issuer, the chain, the wallet, the caller, its clock, the message (§13.3). Its ten refusals pass through as they are.
+3. `envelope.ledger_check`: *fresh*, *same* or *conflict* (`AUTHORIZATION_REPLAYED`).
+4. **Fresh: append `envelope.consumed` to the ledger and flush, then sign.** If either fails, **no signature is produced** (`signer-ledger-write`): a crash between the flush and the answer loses a signature and never lets a second one out. *Same*: sign again; RFC 6979 gives the same bytes, so the retry is the same transaction.
+5. **Sign** the transaction digest (the envelope's, which `verify` has shown is `keccak256(message)`) with the wallet key, no added randomness: the answer is `r || s || recid`, low s.
+
+The answer is one JSON line: `{"ok":true,"signature":"<130 hex digits>","entry":"fresh"|"same"}`, or `{"ok":false,"rule":"chain.<tag>","repair":"..."}` and exit status 2. No key, digest, envelope or message is ever logged or printed on a refusal; the rule tag is the same one `chain.envelope` gives (§13), plus the signer's own.
+
+### 14.4 The payload of a ledger event, and why trail mode
+
+`{"id":"<64 hex>","digest":"<64 hex>"}`, exactly: 149 bytes, read back by position and refused (`signer-ledger-corrupt`) if it is anything else. **[choice]** Trail mode and not a bare log: the chain makes the ledger tamper-evident to an auditor who holds an anchor `(count, head)` (cancho-log `docs/trail.md` §2 says what it proves and what it cannot: a cut tail or a consistent rewrite verify unless an anchor is held elsewhere), and the same events are the *evidence* that an envelope was consumed, which is the start of the evidence log (§5). The event time is the signer's clock in milliseconds.
+
+### 14.5 What it does not do
+
+It cannot tell a ledger whose **last** record has a damaged length field from a torn tail (both end inside a record), and cuts it: that entry is lost and its envelope would be signed again if presented, once. Closing that needs an anchor `(count, head)` kept where the signer's owner cannot reach it, which `trail.verify` already accepts and this slice does not wire. It does not listen on a socket, draw randomness, rate-limit, keep the history the policy engine reads (that is the evidence store's, later), take the issuer's address from anywhere but its configuration, sign anything but an ERC-20 `transfer` that `txcheck` accepts, or protect the key from a person with the directory (a file readable by root is readable by root: a hardware key is out of scope). A compromised front can ask for signatures it has envelopes for, and no others; a compromised issuer key can authorise anything within the signer's chain and wallet (§13.4).
+
+### 14.6 How it is checked
+
+`scripts/check_signer.py`: the real binary, built with a test directory, against the Python model of §13 (which makes the envelopes) and independent verifiers (libsecp256k1 and python-ecdsa for the signature, which must recover to the wallet's address and be the model's bytes; `eth-account` for the signed transaction built from it): a valid request signs; each refusal of §13 is the rule tag it should be; the same envelope twice gives the same signature and one ledger entry; the same id for another transaction is refused; an expired and a not-yet-valid envelope are refused (against the real clock); a request from another caller is refused; **no signature is ever produced when the ledger cannot be written** (`/dev/full`, a read-only directory, a ledger whose tail is torn, one whose chain is broken, one that a second process holds locked); a signature is never produced for a ledger event that did not reach the disk (a kill between the flush and the answer is a retry that gets the same bytes); the ledger verifies with `cancho-log`'s own `trailtool` and with the independent model in its `tests/trail_sweep.py`; and `cancho authority` of the binary names the one directory and nothing else. `--mutants` as for the other slices. Results are added below when measured.
+
+### 14.7 Measured
+
+**[measured]** 2026-11-07, Linux x86-64, the self-hosted `cancho` at `162633a7`, `cancho-log` at its main (trail mode, merged), `secp256k1` from alpibrusl/cancho#710 (merged).
+`CANCHO=<compiler> CANCHO_PACKAGES=<cancho>/packages CANCHO_SCHEMA=<cancho-schema>/src/schema.cho CANCHO_LOG=<cancho-log>/src python3 -I scripts/check_signer.py [--slow] [--mutants]`: **386 of 386** checks pass.
+- **Valid requests (6 random cases):** the signature is the model's (libsecp256k1, RFC 6979), recovers to the wallet, python-ecdsa verifies it, and `eth-account` signing the same transaction gives the same `r`, `s` and parity; the ledger holds exactly one `envelope.consumed` event with the envelope's id and the transaction digest, read back by a reader written in the script (record layout, lex-trail's event id); its time is the signer's clock in milliseconds; a retry gets the same signature, `"same"`, and writes nothing; `trailtool` of cancho-log verifies the ledger clean.
+- **Refusals, each its rule tag, exit status 2, a repair, no signature, the ledger unchanged:** every envelope refusal reachable from a process (another issuer, a malformed signature, a truncated envelope, another caller, another transaction, a transaction that is not the envelope's expectation, expired, not yet valid, another chain, another wallet, another issuer configured, an id used for another transaction); 23 configuration and key faults (each of the files' shapes, an issuer that is the wallet, files longer than their buffers); 11 request-line faults (up to 4,096 bytes); 14 ledger faults (a torn tail is cut and the ledger goes on, separately; then is cut and the ledger goes on; a flipped byte in any record, a flipped length, a flipped checksum, a deleted middle or first record, two records swapped, a zeroed block, a long garbage tail, and whole events whose payload is not a ledger entry: each is `signer-ledger-corrupt` and the file is **byte for byte as it was**).
+- **No signature without a durable entry:** a ledger that cannot be written (`/dev/full`), one whose flush fails (`/dev/null`), one that is a directory, one another process holds locked (`flock`): each refused, none signs. The state "killed between the flush and the answer" is the retry above: the entry is there, the same bytes come back.
+- **Authority:** `cancho authority` of the binary: performs `clock`, `file_read`, `file_write`, `fs_read("/var/lib/cancho-signer")`, `fs_write("/var/lib/cancho-signer")`, `heap`, `io_read`, `io_write`; never touches the network, the command line, signals, other programs or foreign code. Arguments are ignored (a test passes `--now 5 /tmp` and gets the same answer).
+- **Cost:** one request is 4 ms with an empty ledger, 10 ms at 1,000 entries, 36 ms at 5,000 and 63 ms at 10,000 (a process start, a full verification of the chain, one signature); a ledger of the 65,536-entry limit is about 400 ms by that slope, and is refused beyond it (`--slow` checks that, and takes minutes because the *script* writes 65,537 events in Python).
+- `--mutants`: 50 deliberate faults in the signer (the lock, which damage is cut, the lookup and what is written, the flush, the clock, the hedge, the digest signed, the first event's parent, every bound of the request line and the two files, the payload's every byte, the tags): **49 killed, 1 equivalent** (a torn tail can never be longer than the bound that is checked: a larger declared length is a bad record, not a torn one). The first run killed 38 of 51: the survivors were tests missing (a colon where `=` belongs, the last digit of the issuer in upper case, 19- and 0-digit chains, a 66-digit key, files longer than their buffers, a payload with another quote or one byte too long, a double space between four fields, an unusable flush), and each became a check.
+- **Found while building:** a region holds 64 KiB in all in this language, so the key's workspace and the ledger (4 MiB at the limit) are on the heap, which is why the report says `heap`; and my first design of recovery would have cut a ledger at damage in its middle (above, and §14.3).
+
+**Not claimed.** A front: nothing listens on a socket (the next slice), so "who the caller is" is whatever the line says. That a ledger whose last record is damaged is noticed (§14.5). Durability beyond `fsync` of one file: the directory entry of a new ledger is not synced. That a hardware key or a second signer could be added: one process, one key. Independent review.
 
 ## 12. Open questions for the maintainer
 
