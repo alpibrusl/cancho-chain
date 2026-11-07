@@ -185,9 +185,27 @@ static domain: [byte] {
 }
 
 // n / 2 for secp256k1's group order n: a signature's s above it is not low.
+// Decoded in place, with no call: the Rust evaluator of the pinned compiler cannot run a call to another module inside a `static` (`cancho authority` failed on it in CI).
 static half_n: [byte] {
     let t = alloc_slice[static](32, byte_of(0));
-    hex.decode("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0", t);
+    let s = "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0";
+    var i = 0;
+    while i < 32 {
+        var hi = int_of(s[2 * i]);
+        var lo = int_of(s[2 * i + 1]);
+        if hi < 58 {
+            hi = hi - 48;
+        } else {
+            hi = hi - 87;
+        }
+        if lo < 58 {
+            lo = lo - 48;
+        } else {
+            lo = lo - 87;
+        }
+        t[i] = byte_of(hi * 16 + lo);
+        i = i + 1;
+    }
     return t;
 }
 
