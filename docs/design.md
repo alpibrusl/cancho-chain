@@ -548,6 +548,41 @@ It cannot tell a ledger whose **last** record has a damaged length field from a 
 
 **Not claimed.** A front: nothing listens on a socket (the next slice), so "who the caller is" is whatever the line says. That a ledger whose last record is damaged is noticed (§14.5). Durability beyond `fsync` of one file: the directory entry of a new ledger is not synced. That a hardware key or a second signer could be added: one process, one key. Independent review.
 
+## 15. The front (slice 8)
+
+**Status: design, written before the code.** The signer (§14) takes one request on standard input. This slice puts a network in front of it without giving the network anything the signer has: a small HTTP service, the **front**, behind `cancho-gateway`.
+
+### 15.1 Three processes, three authorities
+
+| process | holds | can reach |
+|---|---|---|
+| `cancho-gateway` (existing) | the digests of the callers' API keys | the network, to the front only (its upstream set is compiled in) |
+| `front` (`tools/front`) | nothing secret | one TCP port in, **one program to start** (the signer's path, a compile-time constant), the clock, the heap. **No file, no network out** |
+| `signer` (§14) | the wallet key | one directory, the clock, standard input and output. No network, no program to start |
+
+The front is the only one that listens and the only one that can start the signer; the signer is the only one that can read the key. `cancho authority` of each shows exactly its row, and a compromised front can ask for signatures for the envelopes it is given, and nothing else (§14.5).
+
+### 15.2 The API
+
+`POST /sign`, nothing else. A request carries **one header the front believes**, `X-Auth-Identity`: the name of the API key the gateway authenticated (`auth_identity_header`, `cancho-gateway` `docs/auth.md` §3.1: the gateway removes whatever the client sent under that name and sets its own). The front **requires exactly one** such header, whose value is 1 to 32 bytes of `[a-z0-9._-]` (the generator's rule for key names), and refuses (`401`, `front-no-identity`) otherwise: it is the **caller** the signer is told. **A deployment that lets a client reach the front without the gateway has no caller at all:** the front must listen on a port only the gateway can reach (loopback, or a private interface); that is the deployment's, and it is said here because the header proves nothing on its own.
+The body is exactly `{"envelope":"<hex>","signature":"<hex>","message":"<hex>"}`: three members in this order, no whitespace, lower-case hex of even length (the envelope at most 652 digits, the signature exactly 130, the message at most 2,048), at most 4,096 bytes in all. **[choice]** One canonical spelling and not a JSON parser: the issuer's side writes it, there is nothing to be liberal about, and a body that is anything else is `400 front-body`.
+
+The front builds the signer's request line from them and the caller, starts the signer with it on standard input, and reads its one line of output, at most 4,096 bytes, for at most 10 seconds:
+
+| the signer | the front answers |
+|---|---|
+| exit 0, `{"ok":true,...}` | `200`, the signer's line as it is |
+| exit 2, `{"ok":false,"rule":...}` | `422`, the signer's line as it is (a refusal is a successful security outcome; the status says the request is understood and refused) |
+| exit 2 with a rule the signer could not act on (`signer-locked`, `signer-ledger-write`, `signer-ledger-corrupt`, `signer-ledger-full`, `signer-config`, `signer-key`, `signer-same-key`) | `503`, the same line: the signer is unwell, not the request |
+| anything else (no such program, a crash, a timeout, output that is not one line) | `502`, `{"ok":false,"rule":"chain.front-signer","repair":"..."}` made by the front |
+
+Any other path is `404`, any other method on `/sign` is `405`, a body that is too large is `413`, a missing or wrong `Content-Type` is not looked at. Every refusal the front makes has a `chain.front-*` rule tag and no value from the request in its repair. **Serial:** one request is served at a time (the signer allows no other, §14.3), so the front never starts two signers.
+
+### 15.3 How it is checked
+
+`scripts/check_front.py`: the real front and the real signer on loopback, the front built with a test port and the signer's path, the signer with a test directory: a valid request signs (the signature the model's, as in §14.6) and the answer is the signer's line byte for byte; each refusal of the signer arrives with its rule tag and the status above; a missing, duplicate, empty, upper-case, too long or badly spelled `X-Auth-Identity` is `401`; every malformed body (a member missing, doubled, reordered, with whitespace, a non-hex digit, an odd length, a field over its bound, trailing bytes) is `400` and **the signer is never started** (counted by a wrapper); the front's answer to a signer that crashes, hangs, writes nothing or writes too much; `cancho authority` of the front names the one port in, the one program and nothing else (no file, no network out); and `--mutants` as for the other slices.
+`scripts/check_stack.py`: `cancho-gateway` (with `auth_identity_header`), the front and the signer, a client with API keys: the caller the signer sees is the name of the key; a forged `X-Auth-Identity` from the client is replaced; a second key whose name is another principal's cannot use the first one's envelope; no key, a wrong key and a key the route does not allow never reach the front. Results are added below when measured.
+
 ## 12. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
