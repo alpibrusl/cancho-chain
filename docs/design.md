@@ -420,7 +420,7 @@ amount at, one below and one above each limit; a history record at and either si
 
 ## 13. The authorisation envelope (slice 6)
 
-**Status: design, written before the code.** Claims are *choice* or *open* until measured; the measured results go into §13.5. The envelope is what crosses from the policy side to the signer: a decision (§11) bound to the exact unsigned transaction,
+**Status: built.** Results are in §13.5. The envelope is what crosses from the policy side to the signer: a decision (§11) bound to the exact unsigned transaction,
 signed by an **issuer** key that is not the wallet key. The signer trusts nothing in it until the issuer's signature is checked, and re-derives everything it can.
 
 ### 13.1 The envelope
@@ -475,6 +475,19 @@ the signer can check. An issuer that is compromised can authorise anything withi
 
 `scripts/check_envelope.py`, against a model in Python written separately from this section: envelopes issued by the code have the model's bytes and digest and a signature the model verifies with libsecp256k1 (`coincurve`) and recovers to the issuer's address; every refusal reached alone and in the pairings that test the order; every boundary (`now` at
 `issued_at`, `expires_at` and one either side); a changed byte at every offset of the envelope, of the signature and of the message (each must be refused, with the reason the order says); the ledger's three answers; `--mutants` as for the other slices. Results are added below when measured.
+
+**[measured]** 2026-11-07, Linux x86-64, the self-hosted `cancho` at `162633a7`, `secp256k1` from alpibrusl/cancho#710 (merged), `coincurve`, `python-ecdsa` and `pycryptodome` from pip.
+`CANCHO=<compiler> CANCHO_PACKAGES=<cancho>/packages CANCHO_SCHEMA=<cancho-schema>/src/schema.cho python3 -I scripts/check_envelope.py`: **1,187 of 1,187** checks pass (`--cases 120`).
+- **Issue:** 120 random cases (chain, nonce, fees, a 1- to 64-byte caller, windows from 1 second): the envelope is the model's, byte for byte; the signature is the model's (libsecp256k1, RFC 6979) and python-ecdsa verifies it; it recovers to the issuer; `verify` accepts it; the digest is the model's;
+  an amount padded to 32 bytes gives the same envelope. 31 refusal cases of `issue`, each alone, each with its code (the decision's length, version, caller length and outcome, both ends of the window, the amount one either side, each field of the transaction, every length, the issuer key at 0 and at `n`, an issuer that is the wallet).
+- **Verify:** every refusal alone, each with its code; **every one of the ten faults alone, in each of the 44 pairs that can occur together and each of the 110 trios: the first in §13.3's order answers**; every changed bit of the envelope (two bits at each of its bytes) is refused by the signature or the layout, every changed bit of the signature
+  is refused, every changed byte of the message is a digest mismatch; the low-s edge (`s` exactly `n/2` is accepted as low, one above is not); the window's edges (`issued_at` accepted, one before refused; `expires_at` refused, one before accepted); the longest (326 bytes) and the shortest (263 bytes) envelopes; the
+  configuration's lengths; the six `txcheck` detail codes (nonce, token, recipient, amount, gas cap, fee cap) and the chain one. Ledger: 60 random ledgers and the edges (the same id with different digests anywhere in the list conflicts; the same entry twice is the same; a length that is not a multiple of 64).
+- `--mutants`: 92 deliberate faults (every offset of the layout, each bound and comparison of `issue` and `verify`, the order of the checks, the low-s test and its constant at both ends, every expectation field handed to `txcheck`, the ledger's offsets and answers): **85 killed, 7 equivalent**, each explained in the script (a bound that an earlier or later check of the
+  same input already enforces, or a buffer length the driver fixes). The first run killed 83 of 92; the survivors were a case that happened to have amount 0 (so "one less" did not exist), a short digest never given to the ledger, and a 261-byte envelope never given to `verify`; each became a check.
+- **A claim of an earlier slice was found false while building this one** (§9.3, corrected in place): the decoder is header-level and does not agree with `rlp.decode(strict=True)` on every input.
+
+**Not claimed.** That the ledger is durable or the id unique: the caller draws the id (a repeat would be `AUTHORIZATION_REPLAYED` only if the ledger holds it), and the signer keeps the ledger. That the decision digest is the decision of anything the signer can check. That `secp256k1` is constant time (#712). That nothing has been independently reviewed.
 
 ## 12. Open questions for the maintainer
 
