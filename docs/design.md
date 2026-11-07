@@ -602,6 +602,39 @@ Any other path is `404`, any other method on `/sign` is `405`, a body that is to
 
 **Not claimed.** TLS between the gateway and the front (loopback or a private link is assumed), rate limiting of the signer's callers beyond the gateway's, logging in the front (there is none: no request value reaches a log), a second signer or a queue (the signer is one at a time by design), and that `exec`'s narrowing is more than a prefix: `exec("/usr/local/lib/cancho-chain/signer")` also admits `.../signer-anything`, so the directory should hold nothing else.
 
+## 16. The RPC codec (slice 9)
+
+**Status: design, written before the code.** What a transaction does after it is signed is read from a provider that is, by §5, *external and untrusted*. This slice is the part of that which needs no network and can be checked exactly: the JSON-RPC requests, and a **strict reader of the responses** that believes nothing about a transaction it has not compared with what was signed. The lifecycle (submitted, included, final, dropped, replaced) and the executor that polls are the next slice; they are built on what this one can say.
+
+### 16.1 Requests
+
+Fixed texts, `{"jsonrpc":"2.0","id":<n>,"method":"<m>","params":[...]}`, written into a buffer of at least 8,448 bytes (a raw transaction is limited to 4,096 bytes, `-312` beyond): `eth_chainId`, `eth_blockNumber`, `eth_getTransactionCount` (an address, `"latest"` or `"pending"`), `eth_sendRawTransaction`, `eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_getBlockByNumber` (a number, no transaction bodies). Quantities are `0x` and lower-case hex with no leading zero; hashes and addresses are `0x` and lower-case hex; `id` is the caller's integer.
+
+### 16.2 Responses
+
+A response is at most 65,536 bytes (`rpc-json`), one JSON object with `"jsonrpc":"2.0"`, the `id` that was sent (`rpc-id`), and **exactly one** of `result` and `error` (`rpc-shape`). **[choice]** A key that appears twice in the response or in an object read from it, or is written with an escape, is refused (`rpc-duplicate`): `std.json` lets the first win, and a reader that takes the first where another takes the last is how two parties come to disagree about what a provider said. Members the codec does not read are ignored: providers add fields.
+An `error` is its code and nothing else (the message is a provider's free text and is never interpreted: **no decision is taken from the wording of an error**).
+
+| reader | accepts | refuses |
+|---|---|---|
+| quantity | `0x0`, or `0x` and 1 to 15 lower-case hex digits starting with 1 to f | upper case, `0X`, a leading zero, an empty `0x`, 16 digits or more, not a string, an escape (`rpc-quantity`) |
+| hash | `0x` and exactly 64 lower-case hex digits | anything else (`rpc-hash`) |
+| address | `0x` and exactly 40 hex digits, either case (providers return checksummed text) | anything else (`rpc-address`) |
+| data | `0x` and an even number of lower-case hex digits | `rpc-data` |
+| chain id | a quantity equal to the configured chain id | `rpc-chain` |
+
+### 16.3 What a transaction must be, to be believed
+
+**A receipt** (`eth_getTransactionReceipt`): `null` is *not found*, not an error. An object is believed only if its `transactionHash` is the hash we computed from the bytes we signed, its `from` is the wallet, its `to` is the token contract (a receipt with no `to` is a contract creation, not ours), `status` is exactly `0x1` or `0x0` (a receipt without a status is pre-Byzantium and not accepted: `rpc-status`), and `blockNumber`, `blockHash` and `gasUsed` are well-formed. A receipt for another transaction, from another account, or to another contract is `rpc-receipt`: a provider that answers about something else is lying or confused, and either way the answer is not used.
+**A transaction** (`eth_getTransactionByHash`): `null` is not found. An object is believed only if its `hash`, `from`, `to`, `nonce`, `input` and `value` are exactly the hash, wallet, token, nonce, calldata and zero that were signed (`rpc-tx`); `blockNumber` is `null` (pending) or a quantity (mined).
+**A block** (`eth_getBlockByNumber`): `null` or an object whose `number` is the number asked for and whose `hash` is well-formed; it is how a block hash at a height is read again later, so that a reorganisation is a hash that changed.
+
+### 16.4 How it is checked
+
+`scripts/check_rpc.py`: requests are compared with the model's text byte for byte and must parse as JSON with exactly the fields; responses are fixtures in the shapes real clients write (Geth, Erigon, an Infura-style gateway: extra fields, checksummed addresses, `null` for not found, the error codes of `-32000`, `-32601`, `-32602`), with the transaction built and signed by `eth-account` (the hash, the sender and every field of the node's answer come from its transaction, not from this code), and the adversarial ones: a duplicate key at every level, a wrong `id`, both or neither of `result` and `error`, another `jsonrpc`, each quantity and hash and address spoiled each way, a receipt with another hash, sender, contract, or no status, a transaction object that differs from what was signed in each field, a chain id off by one; every response truncated at every byte (never accepted, never a trap); and `--mutants`. Results are added below when measured.
+
+**Not in this slice, said now.** A network connection (nothing here opens a socket), a second provider for critical reads (§5 asks for one: the executor will take two answers and require them to agree before a transaction is called final), and the lifecycle's states and transitions.
+
 ## 12. Open questions for the maintainer
 
 1. secp256k1: build it in cancho core (preferred) or here first? Are fallbacks acceptable if it proves too large?
