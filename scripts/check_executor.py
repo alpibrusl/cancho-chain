@@ -209,6 +209,8 @@ class Node:
         self.fault = None      # None, "down", "hang", "garbage", "chunked", "http500", "short", or a callable (method, result) -> result
         self.chain_id = chain.case.tx.chain
         self.wrong_send = False
+        self.connections = 0
+        self.keepalive = False  # speak HTTP/1.1 and keep the connection for the next request (otherwise HTTP/1.0: one request a connection)
         self.last_path = None
         self.last_headers = {}
         self.last_method = None
@@ -219,6 +221,10 @@ class Node:
         node = self
 
         class H(http.server.BaseHTTPRequestHandler):
+            @property
+            def protocol_version(self):
+                return "HTTP/1.1" if node.keepalive else "HTTP/1.0"
+
             def log_message(self, *a):
                 pass
 
@@ -319,6 +325,9 @@ class Node:
         class Server(http.server.ThreadingHTTPServer):
             def get_request(self):
                 sock, addr = super().get_request()
+                node.connections += 1
+                # the mock writes a response's head and its body separately; on a connection that stays open, Nagle's algorithm and the client's delayed acknowledgement would make each answer wait 40 ms
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 if node.ctx is not None:
                     sock = node.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
                 return sock, addr
@@ -340,6 +349,32 @@ class Node:
     def stop(self):
         self.srv.shutdown()
         self.srv.server_close()
+
+    def hole(self):
+        """The port becomes a black hole: a listener with a full accept queue, so that the kernel drops the next SYN and a connect neither succeeds nor is refused."""
+        self.stop()
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", int(self.port)))
+        s.listen(0)
+        fill = []
+        for _ in range(5):
+            c = socket.socket()
+            c.setblocking(False)
+            try:
+                c.connect(("127.0.0.1", int(self.port)))
+            except BlockingIOError:
+                pass
+            fill.append(c)
+        time.sleep(0.3)
+        self.holed = (s, fill)
+
+    def unhole(self):
+        s, fill = self.holed
+        for c in fill:
+            c.close()
+        s.close()
+        self.start()
 
     def txobj(self, mined):
         c, ch = self.chain.case, self.chain
@@ -463,7 +498,7 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
     check("honest: both providers were asked once to take it", (na.sends, nb.sends, chain.pool), (1, 1, True))
     for node, who in ((na, "A"), (nb, "B")):
         h = node.last_headers
-        check(f"honest: the request to {who} is a POST of JSON, to the provider's host, with a length, and asks for the connection to close", (node.last_method, node.last_path, h.get("content-type"), h.get("connection"), int(h.get("content-length", "0")) > 0), ("POST", "/", "application/json", "close", True))
+        check(f"honest: the request to {who} is a POST of JSON, to the provider's host, with a length, and does not ask for the connection to close (it is kept for the next call)", (node.last_method, node.last_path, h.get("content-type"), h.get("connection"), int(h.get("content-length", "0")) > 0), ("POST", "/", "application/json", None, True))
         check(f"honest: the Host header to {who} is the provider's host", h.get("host"), ("localhost" if node is na else "127.0.0.1") if mode == "tls" else "127.0.0.1")
     chain.mine()
     rc, j, out, _ = job.tick()
@@ -484,6 +519,19 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
         shutil.copy(os.path.join(job.dir, "evidence.seg"), os.path.join(t, "0.seg"))
         v = subprocess.run([trailtool, "verify", t], capture_output=True, text=True).stdout.split()
         check("honest: cancho-log's trailtool verifies the evidence (clean, 3 events)", (v[1], v[5]), ("0", "3"))
+    # connections to each provider in a tick: one for the queries when the provider keeps the connection (and one more for the send), one for each call when it ends it after each answer
+    for keep in (True, False):
+        job, chain = fresh()
+        na.keepalive = nb.keepalive = keep
+        c0 = (na.connections, nb.connections)
+        job.tick()
+        c1 = (na.connections, nb.connections)
+        chain.mine()
+        job.tick()
+        c2 = (na.connections, nb.connections)
+        check(f"keep-alive {keep}: connections to each provider in the first tick (five queries and a send)", (c1[0] - c0[0], c1[1] - c0[1]), (2, 2) if keep else (6, 6))
+        check(f"keep-alive {keep}: connections to each provider in a tick that asks six questions", (c2[0] - c1[0], c2[1] - c1[1]), (1, 1) if keep else (6, 6))
+        na.keepalive = nb.keepalive = False
     # (2) a revert
     job, chain = fresh(status=0)
     job.tick()
@@ -613,6 +661,16 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
         rc, j, out, took = job.tick()
         check(f"{who} with its port closed: no decision, nothing is sent, and the tick does not wait for the deadline", (ok(j), j and j["agree"], j and j["state"], na.sends + nb.sends, took < 1.5), (True, False, "signed", 0, True))
         node.start()
+    # a provider whose connection attempts hang (a host that drops packets): the TCP handshake is the poller's, so the 3,000 ms bound it, as they bound everything after it
+    for node, who in ((na, "A"), (nb, "B")):
+        job, chain = fresh()
+        node.hole()
+        try:
+            rc, j, out, took = job.tick(timeout=30)
+        except subprocess.TimeoutExpired:
+            rc, j, out, took = -1, None, "", 30.0
+        check(f"{who} that drops the SYN: the tick answers in about three seconds with no decision, and nothing is sent", (ok(j), j and j["agree"], j and j["state"], 2.5 < took < 8, na.sends + nb.sends), (True, False, "signed", True, 0))
+        node.unhole()
     # (8) a provider on another chain
     job, chain = fresh()
     nb.chain_id = job.case.tx.chain + 1
@@ -1043,7 +1101,7 @@ MUTANTS = [
     ("main", "agree: the block", "if ints[2] != ints[10] || ints[3] != ints[11] {", "if ints[2] != ints[10] {"),
     ("main", "agree: the block hash", "if int_of(bytes_[i]) != int_of(bytes_[64 + i]) || int_of(bytes_[32 + i]) != int_of(bytes_[96 + i]) {", "if int_of(bytes_[32 + i]) != int_of(bytes_[96 + i]) {"),
     ("main", "agree: the hash at the height", "if int_of(bytes_[i]) != int_of(bytes_[64 + i]) || int_of(bytes_[32 + i]) != int_of(bytes_[96 + i]) {", "if int_of(bytes_[i]) != int_of(bytes_[64 + i]) {"),
-    ("main", "send: the hash that came back", "&& bytes.equal(got, tx_hash) {\n                took = true;", "{\n                took = true;"),
+    ("main", "send: the hash that came back", "&& bytes.equal(got, tx_hash) {\n                                took = true;", "{\n                                took = true;"),
     ("main", "a nonce below the config", "lifecycle.new(rec, nonce, ms);", "lifecycle.new(rec, 0, ms);"),
     ("main", "a state for another nonce", "if lifecycle.check(rec) != 0 || lifecycle.nonce(rec) != nonce {", "if lifecycle.check(rec) != 0 {"),
     ("main", "a state that is not canonical", "if lifecycle.check(rec) != 0 || lifecycle.nonce(rec) != nonce {", "if lifecycle.nonce(rec) != nonce {"),
@@ -1079,21 +1137,26 @@ MUTANTS = [
     ("main", "damaged evidence", "if v.0 == trail.clean() || v.0 == trail.torn() && tail < max_log_len() + 4 {", "if v.0 != 99 {"),
     ("main", "a torn tail", "if v.0 == trail.clean() || v.0 == trail.torn() && tail < max_log_len() + 4 {", "if v.0 == trail.clean() {"),
     # the transport (design section 21)
+    ("main", "the dial is not blocking (A)", "return tcp_connect_start(out, host_a(), 18545);", "return tcp_connect(out, host_a(), 18545);"),
+    ("main", "the dial is not blocking (B)", "return tcp_connect_start(out, host_b(), 18546);", "return tcp_connect(out, host_b(), 18546);"),
+    ("main", "a connection is used for more than one request", "idle_per_key: 1, max_requests: 100 }", "idle_per_key: 1, max_requests: 1 }"),
+    ("main", "an idle connection is kept", "idle_per_key: 1, max_requests: 100 }", "idle_per_key: 0, max_requests: 100 }"),
+    ("main", "a connection that must close is closed before the next request", "fio.shut(ioh, cw, slot, now0);", "hc.tick(cw, now0);"),
+    ("main", "the session's idle connections are told to close", "hc.close_idle(cw, clock_ms(clock));", "hc.tick(cw, clock_ms(clock));"),
     ("main", "the status must be 200", "if hc.status(cw, tk) != 200 {", "if hc.status(cw, tk) < 0 {"),
     ("main", "a body longer than the buffer", "if got + avail > len(resp) {", "if got + avail > len(resp) + 1000000 {"),
     ("main", "the body is copied", "resp[got + z] = piece[z];", "resp[got + z] = piece[0];"),
     ("main", "the body's length is kept", "info[1] = got;", "info[1] = got - 1;"),
     ("main", "the deadline of a call", "while status == -341 && !finished && now - started_at < 3000 {", "while status == -341 && !finished && now - started_at < 30000 {"),
     ("main", "a call that ran out of time is said so", "if status == -341 && !finished && now - started_at >= 3000 {", "if status == -341 && !finished && now - started_at >= 3000000 {"),
-    ("main", "the first turn does not wait", "if now == now0 {\n                                wait = 0;", "if now == -7 {\n                                wait = 0;"),
+    ("main", "the first turn does not wait", "if now == now0 {\n                    wait = 0;", "if now == -7 {\n                    wait = 0;"),
     ("main", "a wait is bounded", "if wait > 100 {", "if wait > 100000 {"),
     ("main", "the request's body is sent", "let m = hc.send_body(cw, t, body[sent..len(body)], now);", "let m = hc.send_body(cw, t, body[0..0], now);"),
     ("main", "a dial that failed is told", "hc.connect_failed(cw, slot, hc.kind_connect(), now);", "hc.tick(cw, now);"),
     ("main", "the provider's name is the TLS name", "fio.add_upstream(ioh, \"127.0.0.1\", port, secure, host);", "fio.add_upstream(ioh, \"127.0.0.1\", port, secure, \"localhost\");"),
     ("main", "the Host header", "\"POST\", \"/\", host,", "\"POST\", \"/\", \"example.test\","),
     ("main", "the request path", "nb[toff..toff + tlen], host,", "nb[toff..toff + 1], host,"),
-    ("main", "the content type", "\"Content-Type: application/json\\r\\n\", len(body), hc.flag_close());\n                    } else {", "\"\", len(body), hc.flag_close());\n                    } else {"),
-    ("main", "the connection is closed after the answer", "\"Content-Type: application/json\\r\\n\", len(body), hc.flag_close());\n                    }\n                    if t > 0", "\"Content-Type: application/json\\r\\n\", len(body), 0);\n                    }\n                    if t > 0"),
+    ("main", "the content type (a path)", "host, \"Content-Type: application/json\\r\\n\", len(body), 0);\n        } else {", "host, \"\", len(body), 0);\n        } else {"),
     ("main", "the TLS engine is on for an https provider", "match fio.open(heap, 1, secure) {", "match fio.open(heap, 1, false) {"),
     ("main", "the engine is seeded", "|| fio.seed(ioh, entropy) != 0 {", "|| fio.seed(ioh, nb[nb_roots()..nb_roots() + 32]) != 0 {"),
     ("main", "the roots are all read", "roots = fio.trust(ioh, nb[nb_roots()..nb_roots() + rl]);", "roots = fio.trust(ioh, nb[nb_roots()..nb_roots() + rl - 40]);"),
