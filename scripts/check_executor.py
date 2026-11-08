@@ -24,17 +24,42 @@ FAILS, COUNT = cs.FAILS, cs.COUNT
 K, DROP_MS, SETTLE_MS = 3, 400, 400
 
 
+EXAMPLES = os.path.join(cs.PKGS, "..", "examples", "http_fetch_nb")
+
+
+def net_sources():
+    """What the transport needs from cancho (design section 21): its driver, the HTTP client, the TLS engine and X.509."""
+    p = lambda pkg, *names: [os.path.join(cs.PKGS, pkg, n + ".cho") for n in names]
+    return ([os.path.join(EXAMPLES, "fetch_io.cho")] + p("http-client", "slot", "wire", "client")
+            + p("tls", "tls", "record", "message", "slot", "cident", "client12", "client", "hello", "identity", "ticket", "clientauth", "server", "saved") + p("x509", "verify", "names", "x509", "key"))
+
+
 def sources(libdir):
     lib = lambda *p: os.path.join(libdir, *p)
     eth = [os.path.join(ROOT, "lib/eth", f) for f in ("hex.cho", "erc20.cho", "rlp.cho", "txcheck.cho", "address.cho")]
     return ([lib("executor/executor.cho"), os.path.join(ROOT, "lib/rpc/rpc.cho"), os.path.join(ROOT, "lib/lifecycle/lifecycle.cho"), os.path.join(ROOT, "lib/keccak/keccak.cho")] + eth
-            + [os.path.join(LOGSRC, f) for f in ("crc.cho", "record.cho", "segment.cho", "log.cho", "trail.cho")])
+            + [os.path.join(LOGSRC, f) for f in ("crc.cho", "record.cho", "segment.cho", "log.cho", "trail.cho")] + net_sources())
 
 
-def build(cancho, libdir, main_text, state_dir, port_a, port_b, out):
+def substitute(main_text, state_dir, port_a, port_b, host_a="127.0.0.1", host_b="127.0.0.1", secure=(0, 0)):
+    """The constants of the executor, set for a test: its directory, each provider's host, port and scheme."""
+    t = main_text.replace(CONST, state_dir)
+    t = t.replace(f"127.0.0.1:{PORT_A}", f"{host_a}:{PORT_A}").replace(f"127.0.0.1:{PORT_B}", f"{host_b}:{PORT_B}")
+    for fn, host in (("host_a", host_a), ("host_b", host_b)):
+        old = f'fn {fn}() -> [] &static [byte] {{\n    return "127.0.0.1";'
+        assert t.count(old) == 1, fn
+        t = t.replace(old, f'fn {fn}() -> [] &static [byte] {{\n    return "{host}";')
+    for fn, v in (("secure_a", secure[0]), ("secure_b", secure[1])):
+        old = f"fn {fn}() -> [] int {{\n    return 0;"
+        assert t.count(old) == 1, fn
+        t = t.replace(old, f"fn {fn}() -> [] int {{\n    return {v};")
+    return t.replace(PORT_A, str(port_a)).replace(PORT_B, str(port_b))
+
+
+def build(cancho, libdir, main_text, state_dir, port_a, port_b, out, host_a="127.0.0.1", host_b="127.0.0.1", secure=(0, 0)):
     with tempfile.TemporaryDirectory() as t:
         m = os.path.join(t, "main.cho")
-        open(m, "w").write(main_text.replace(CONST, state_dir).replace(PORT_A, str(port_a)).replace(PORT_B, str(port_b)))
+        open(m, "w").write(substitute(main_text, state_dir, port_a, port_b, host_a, host_b, secure))
         r = subprocess.run([cancho, "build", "--std", m, *sources(libdir), "-o", out], capture_output=True, text=True)
         if r.returncode != 0:
             raise SystemExit("executor build failed:\n" + r.stderr[:1500])
@@ -690,7 +715,7 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng):
     # (11) the authority
     r = subprocess.run([cancho, "authority", "--std", os.path.join(ROOT, "tools/executor/main.cho"), *sources(os.path.join(ROOT, "lib"))], capture_output=True, text=True)
     perf = r.stdout.split("performs")[1].split("never touches")[0].split()
-    check("authority: performs exactly these", perf, ["clock", "conn_read", "conn_write", "file_read", "file_write", f'fs_read("{CONST}")', f'fs_write("{CONST}")', "heap", "io_write", f'net_out("127.0.0.1:{PORT_A}")', f'net_out("127.0.0.1:{PORT_B}")', "poll"])
+    check("authority: performs exactly these (the directory, the entropy, two providers)", sorted(perf), sorted(["clock", "conn_read", "conn_write", "file_read", "file_write", 'fs_read("/dev/urandom")', f'fs_read("{CONST}")', f'fs_write("{CONST}")', "heap", "io_write", f'net_out("127.0.0.1:{PORT_A}")', f'net_out("127.0.0.1:{PORT_B}")', "poll"]))
     check("authority: never touches the command line, signals, other programs or foreign code, and is bounded", (all(w in r.stdout.split("never touches")[1] for w in ("the command line", "signals", "other programs", "foreign code")), "UNBOUNDED" not in r.stdout), (True, True))
 
 
