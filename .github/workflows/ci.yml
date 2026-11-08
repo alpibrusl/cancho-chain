@@ -62,7 +62,7 @@ jobs:
       - name: Python oracles
         run: |
           python3 -m venv "$HOME/venv"
-          "$HOME/venv/bin/pip" install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils jsonschema
+          "$HOME/venv/bin/pip" install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils jsonschema cryptography
           echo "$HOME/venv/bin" >> "$GITHUB_PATH"
 
       - name: Gate

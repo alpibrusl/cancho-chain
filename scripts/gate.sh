@@ -7,7 +7,7 @@
 # Formatting, the file budget, the unit tests, and every check against its independent oracle. The mutant runs (`--mutants` on each
 # check) rebuild the program once per fault and take much longer: they are run when a check or the code it judges changes, not here.
 # `check_stack.py` needs a built cancho-gateway and is run by hand (README).
-# needs: pip install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils jsonschema
+# needs: pip install coincurve ecdsa pycryptodome eth-account eth-abi rlp eth-utils jsonschema cryptography
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CANCHO=${CANCHO:-cancho}

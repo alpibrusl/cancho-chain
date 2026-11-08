@@ -2,12 +2,12 @@
 """The executor against two mock nodes (docs/design.md section 18.4).
 
     CANCHO=the-compiler CANCHO_PACKAGES=... CANCHO_SCHEMA=... CANCHO_LOG=../cancho-log/src python3 -I scripts/check_executor.py [--mutants]
-    needs what check_signer.py and check_rpc.py need
+    needs what check_signer.py and check_rpc.py need, and `pip install cryptography` (the test CA); and a cancho checkout whose `examples/http_fetch_nb` has `fetch_io.adopt` (CANCHO_PACKAGES=<it>/packages)
 
 The binary is built with a temporary directory and two test ports. The nodes are Python HTTP servers speaking JSON-RPC from one model of a chain (blocks with hashes, a mempool, an account's nonce), each of which can
 be made to forget, reorganise, lie, answer for another chain, hang, answer in chunks or with garbage, or be down; the transaction is built and signed by eth-account. The script drives the ticks and the chain between them.
 """
-import concurrent.futures, glob, http.server, json, os, random, shutil, socket, subprocess, sys, tempfile, threading, time
+import concurrent.futures, datetime, glob, http.server, json, os, random, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
 from eth_account import Account
 from eth_utils import to_checksum_address
 
@@ -77,6 +77,70 @@ def kec(b):
     return ce.kec(b)
 
 
+# ---- the certificates of the TLS tests (design section 21.4): a CA, and servers' certificates that are good, for another name, expired, not yet valid, from another CA, or self-signed
+def make_pki(dirpath):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+    now = datetime.datetime.now(datetime.timezone.utc)
+    day = datetime.timedelta(days=1)
+
+    def name(cn):
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+
+    def ca(cn):
+        key = ec.generate_private_key(ec.SECP256R1())
+        cert = (x509.CertificateBuilder().subject_name(name(cn)).issuer_name(name(cn)).public_key(key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now - day).not_valid_after(now + 365 * day)
+                .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+                .add_extension(x509.KeyUsage(digital_signature=True, key_cert_sign=True, crl_sign=True, content_commitment=False, key_encipherment=False, data_encipherment=False, key_agreement=False, encipher_only=False, decipher_only=False), critical=True)
+                .sign(key, hashes.SHA256()))
+        return key, cert
+
+    def leaf(issuer_key, issuer_cert, dns, before, after, self_signed=False):
+        key = ec.generate_private_key(ec.SECP256R1())
+        b = (x509.CertificateBuilder().subject_name(name(dns)).issuer_name(issuer_cert.subject if not self_signed else name(dns)).public_key(key.public_key()).serial_number(x509.random_serial_number())
+             .not_valid_before(before).not_valid_after(after).add_extension(x509.SubjectAlternativeName([x509.DNSName(dns)]), critical=False)
+             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+             .add_extension(x509.KeyUsage(digital_signature=True, key_cert_sign=False, crl_sign=False, content_commitment=False, key_encipherment=False, data_encipherment=False, key_agreement=False, encipher_only=False, decipher_only=False), critical=True)
+             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False))
+        cert = b.sign(key if self_signed else issuer_key, hashes.SHA256())
+        return key, cert
+
+    def pem(cert):
+        return cert.public_bytes(serialization.Encoding.PEM)
+
+    def keypem(key):
+        return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+
+    ck, cc = ca("cancho test CA")
+    ok_, oc = ca("another CA")
+    chains = {
+        "good": leaf(ck, cc, "localhost", now - day, now + 30 * day),
+        "wrong_name": leaf(ck, cc, "other.test", now - day, now + 30 * day),
+        "expired": leaf(ck, cc, "localhost", now - 30 * day, now - day),
+        "not_yet": leaf(ck, cc, "localhost", now + day, now + 30 * day),
+        "other_ca": leaf(ok_, oc, "localhost", now - day, now + 30 * day),
+        "self_signed": leaf(None, None, "localhost", now - day, now + 30 * day, self_signed=True),
+    }
+    ctxs = {}
+    for k, (key, cert) in chains.items():
+        cp, kp = os.path.join(dirpath, k + ".pem"), os.path.join(dirpath, k + ".key")
+        open(cp, "wb").write(pem(cert))
+        open(kp, "wb").write(keypem(key))
+        c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        c.minimum_version = ssl.TLSVersion.TLSv1_3
+        c.load_cert_chain(cp, kp)
+        ctxs[k] = c
+    c12 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    c12.minimum_version = ssl.TLSVersion.TLSv1_2
+    c12.maximum_version = ssl.TLSVersion.TLSv1_2
+    c12.load_cert_chain(os.path.join(dirpath, "good.pem"), os.path.join(dirpath, "good.key"))
+    ctxs["tls12"] = c12
+    return ctxs, pem(cc), pem(oc)
+
+
 # ---- the model of a chain
 class Chain:
     def __init__(self, case, status=1):
@@ -138,6 +202,10 @@ class Node:
         self.fault = None      # None, "down", "hang", "garbage", "chunked", "http500", "short", or a callable (method, result) -> result
         self.chain_id = chain.case.tx.chain
         self.wrong_send = False
+        self.last_path = None
+        self.last_headers = {}
+        self.last_method = None
+        self.ctx = None        # an ssl.SSLContext: the node speaks TLS with it (chosen per connection, so a test can change it between ticks)
         self.srv = None
 
     def start(self):
@@ -151,6 +219,9 @@ class Node:
                 n = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(n)
                 node.requests += 1
+                node.last_path = self.path
+                node.last_headers = {k.lower(): v for k, v in self.headers.items()}
+                node.last_method = "POST"
                 f = node.fault
                 if f == "down":
                     self.connection.close()
@@ -203,6 +274,30 @@ class Node:
                     self.end_headers()
                     self.wfile.write(pad)
                     return
+                if f in ("chunked_ok", "chunked_split", "chunked_bytes", "chunked_bad", "chunked_lie"):
+                    # HTTP/1.1 chunked, as a real provider answers: one chunk; chunks of 7 bytes with an extension and a trailer; one byte each; a size that is not hex; a size that promises more than is sent
+                    def chunk(b, ext=b""):
+                        return f"{len(b):x}".encode() + ext + b"\r\n" + b + b"\r\n"
+                    if f == "chunked_ok":
+                        payload = chunk(data) + b"0\r\n\r\n"
+                    elif f == "chunked_split":
+                        payload = b"".join(chunk(data[i:i + 7], b";x=1") for i in range(0, len(data), 7)) + b"0\r\nX-Trailer: 1\r\n\r\n"
+                    elif f == "chunked_bytes":
+                        payload = b"".join(chunk(data[i:i + 1]) for i in range(len(data))) + b"0\r\n\r\n"
+                    elif f == "chunked_bad":
+                        payload = b"zz\r\n" + data + b"\r\n0\r\n\r\n"
+                    else:
+                        payload = f"{len(data) + 100:x}".encode() + b"\r\n" + data
+                    self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + payload)
+                    return
+                if f == "slow_bytes":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    for i in range(len(data)):
+                        self.wfile.write(data[i:i + 1])
+                    return
                 self.send_response(201 if f == "status201" else 200)
                 self.send_header("Content-Type", "application/json")
                 if f == "chunked":
@@ -214,7 +309,24 @@ class Node:
                 self.end_headers()
                 self.wfile.write(data)
 
-        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(self.port)), H)
+        class Server(http.server.ThreadingHTTPServer):
+            def get_request(self):
+                sock, addr = super().get_request()
+                if node.ctx is not None:
+                    sock = node.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+                return sock, addr
+
+            def process_request(self, request, client_address):
+                if node.fault == "tls_hang":
+                    # the connection is accepted and nothing is ever said: the handshake never starts
+                    node.held = getattr(node, "held", []) + [request]
+                    return
+                super().process_request(request, client_address)
+
+            def handle_error(self, request, client_address):
+                pass
+
+        self.srv = Server(("127.0.0.1", int(self.port)), H)
         self.srv.daemon_threads = True
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
@@ -275,8 +387,8 @@ def live(rng):
 
 
 class Job:
-    def __init__(self, tmp, exe, case, chain, na, nb):
-        self.dir, self.exe, self.case, self.chain, self.na, self.nb = tmp, exe, case, chain, na, nb
+    def __init__(self, tmp, exe, case, chain, na, nb, roots=b""):
+        self.dir, self.exe, self.case, self.chain, self.na, self.nb, self.roots = tmp, exe, case, chain, na, nb, roots
 
     def write(self, name, text):
         open(os.path.join(self.dir, name), "w").write(text)
@@ -294,6 +406,8 @@ class Job:
             self.write("envelope", (env_bytes or self.case.env).hex() + "\n")
         if raw:
             self.write("raw", (raw_bytes or self.chain.raw).hex() + "\n")
+        if self.roots:
+            open(os.path.join(self.dir, "roots.pem"), "wb").write(self.roots)
 
     def tick(self, timeout=60):
         t0 = time.time()
@@ -318,7 +432,7 @@ def states(job):
     return [p["state"] for _, p, _ in job.evidence()]
 
 
-def run_checks(exe, tmp, na, nb, trailtool, cancho, rng):
+def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None, roots=b""):
     def fresh(status=1):
         case = live(rng)
         chain = Chain(case, status)
@@ -327,7 +441,8 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng):
         na.wrong_send = nb.wrong_send = False
         na.chain_id = nb.chain_id = case.tx.chain
         na.sends = nb.sends = na.requests = nb.requests = 0
-        job = Job(tmp, exe, case, chain, na, nb)
+        na.ctx = nb.ctx = ctxs["good"] if mode == "tls" else None
+        job = Job(tmp, exe, case, chain, na, nb, roots)
         job.setup()
         return job, chain
 
@@ -339,6 +454,10 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng):
     rc, j, out, _ = job.tick()
     check("honest: the first tick submits and the providers took it", (rc, ok(j), j and j["state"], j and j["action"], j and j["sent"], j and j["agree"]), (0, True, "submitted", "submit", True, True))
     check("honest: both providers were asked once to take it", (na.sends, nb.sends, chain.pool), (1, 1, True))
+    for node, who in ((na, "A"), (nb, "B")):
+        h = node.last_headers
+        check(f"honest: the request to {who} is a POST of JSON, to the provider's host, with a length, and asks for the connection to close", (node.last_method, node.last_path, h.get("content-type"), h.get("connection"), int(h.get("content-length", "0")) > 0), ("POST", "/", "application/json", "close", True))
+        check(f"honest: the Host header to {who} is the provider's host", h.get("host"), "localhost" if mode == "tls" else "127.0.0.1")
     chain.mine()
     rc, j, out, _ = job.tick()
     check("honest: mined, the next tick says included", (ok(j), j["state"], j["action"]), (True, "included", "nothing"))
@@ -448,14 +567,32 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng):
             node.fault = fault
             rc, j, out, took = job.tick()
             check(f"{who} {name}: no decision (agree false), nothing is sent, the state is signed", (ok(j), j and j["agree"], j and j["state"], na.sends + nb.sends), (True, False, "signed", 0))
+            if fault == "down":
+                check(f"{who} down: refused at once, not after the deadline", took < 1.5, True)
             node.fault = None
             rc, j, *_ = job.tick()
             check(f"{who} {name}: back, it goes on", (j["agree"], j["state"]), (True, "submitted"))
     job, chain = fresh()
     na.fault = "nolength"
     rc, j, out, took = job.tick()
-    check("A answering without a length and closing: the body is read to the end", (ok(j), j and j["agree"], j and j["state"]), (True, True, "submitted"))
+    # over plain TCP the end of the connection ends the body; over TLS it needs close_notify (design 21.2 D7), which a server that just closes does not send: unusable
+    check("A answering without a length and closing: " + ("the body is read to the end" if mode == "plain" else "unusable (no close_notify)"), (ok(j), j and j["agree"], j and j["state"]), (True, True, "submitted") if mode == "plain" else (True, False, "signed"))
     na.fault = None
+    # HTTP/1.1 chunked answers are read (design section 21): in one chunk, in chunks of 7 bytes with an extension and a trailer, a byte at a time, and an answer sent a byte at a time
+    for fault, name in (("chunked_ok", "one chunk"), ("chunked_split", "chunks with extensions and a trailer"), ("chunked_bytes", "one byte a chunk"), ("slow_bytes", "a byte at a time")):
+        for node, who in ((na, "A"), (nb, "B")):
+            job, chain = fresh()
+            node.fault = fault
+            rc, j, out, took = job.tick()
+            check(f"{who} answering in {name}: it is read, both agree, the transaction is submitted", (ok(j), j and j["agree"], j and j["state"], na.sends + nb.sends), (True, True, "submitted", 2))
+            node.fault = None
+    for fault, name in (("chunked_bad", "a chunk size that is not hex"), ("chunked_lie", "a chunk that promises more than it sends")):
+        for node, who in ((na, "A"), (nb, "B")):
+            job, chain = fresh()
+            node.fault = fault
+            rc, j, out, took = job.tick()
+            check(f"{who} answering with {name}: unusable, nothing is sent", (ok(j), j and j["agree"], j and j["state"], na.sends + nb.sends), (True, False, "signed", 0))
+            node.fault = None
     for node, who in ((na, "A"), (nb, "B")):
         job, chain = fresh()
         node.fault = "hang"
@@ -712,11 +849,109 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng):
     job.write("config", f"chain={cid}\nk={K}\ndrop_ms={DROP_MS}\nsettle_ms={SETTLE_MS}\n\n")
     rc, j, *_ = job.tick()
     check("config with an empty line at the end: executor-config", (j or {}).get("rule"), "chain.executor-config")
-    # (11) the authority
+    # (11) the authority (once: both builds report the same)
+    if mode != "plain":
+        return
     r = subprocess.run([cancho, "authority", "--std", os.path.join(ROOT, "tools/executor/main.cho"), *sources(os.path.join(ROOT, "lib"))], capture_output=True, text=True)
     perf = r.stdout.split("performs")[1].split("never touches")[0].split()
     check("authority: performs exactly these (the directory, the entropy, two providers)", sorted(perf), sorted(["clock", "conn_read", "conn_write", "file_read", "file_write", 'fs_read("/dev/urandom")', f'fs_read("{CONST}")', f'fs_write("{CONST}")', "heap", "io_write", f'net_out("127.0.0.1:{PORT_A}")', f'net_out("127.0.0.1:{PORT_B}")', "poll"]))
     check("authority: never touches the command line, signals, other programs or foreign code, and is bounded", (all(w in r.stdout.split("never touches")[1] for w in ("the command line", "signals", "other programs", "foreign code")), "UNBOUNDED" not in r.stdout), (True, True))
+
+
+def run_tls_checks(exe, state, na, nb, ctxs, roots, other_roots, rng):
+    """What only a TLS provider can do wrong (design section 21.4). Every provider failure is the same: the provider is unusable, nothing is sent, nothing is decided, the state is unchanged."""
+    def fresh():
+        case = live(rng)
+        chain = Chain(case)
+        na.chain = nb.chain = chain
+        na.fault = nb.fault = None
+        na.wrong_send = nb.wrong_send = False
+        na.chain_id = nb.chain_id = case.tx.chain
+        na.sends = nb.sends = na.requests = nb.requests = 0
+        na.ctx = nb.ctx = ctxs["good"]
+        job = Job(state, exe, case, chain, na, nb, roots)
+        job.setup()
+        return job, chain
+
+    def unusable(name, setup):
+        for node, who in ((na, "A"), (nb, "B")):
+            job, chain = fresh()
+            setup(node)
+            rc, j, out, took = job.tick()
+            check(f"TLS, {name} ({who}): unusable, no decision, nothing is sent, the state is signed", (rc, (j or {}).get("ok"), (j or {}).get("agree"), (j or {}).get("state"), na.sends + nb.sends), (0, True, False, "signed", 0))
+            node.ctx = ctxs["good"]
+            rc, j, *_ = job.tick()
+            check(f"TLS, {name} ({who}): a good certificate again, it goes on", ((j or {}).get("agree"), (j or {}).get("state")), (True, "submitted"))
+
+    def serve(key):
+        def f(node):
+            node.ctx = ctxs[key]
+        return f
+    unusable("a certificate for another name", serve("wrong_name"))
+    unusable("an expired certificate", serve("expired"))
+    unusable("a certificate that is not valid yet", serve("not_yet"))
+    unusable("a certificate from a CA that is not in the roots", serve("other_ca"))
+    unusable("a self-signed certificate", serve("self_signed"))
+    # The engine has a TLS 1.2 client (`packages/tls/client12.cho`), so a server that speaks only 1.2 is served; measured here, not claimed away (design 21.4 said "refused" before this was run).
+    job, chain = fresh()
+    na.ctx = nb.ctx = ctxs["tls12"]
+    rc, j, *_ = job.tick()
+    check("TLS, servers that speak TLS 1.2 only: the engine's 1.2 client is accepted by this executor", ((j or {}).get("ok"), (j or {}).get("agree"), (j or {}).get("state")), (True, True, "submitted"))
+    # a server that accepts the connection and never answers the handshake: the 3,000 ms
+    for node, who in ((na, "A"), (nb, "B")):
+        job, chain = fresh()
+        node.fault = "tls_hang"
+        rc, j, out, took = job.tick()
+        check(f"TLS, a handshake that never completes ({who}): the tick answers in about three seconds with no decision", ((j or {}).get("ok"), (j or {}).get("agree"), 2.5 < took < 8), (True, False, True))
+        node.fault = None
+    # the roots: none, garbage, other than the server's
+    job, chain = fresh()
+    os.unlink(os.path.join(state, "roots.pem"))
+    rc, j, out, _ = job.tick()
+    check("TLS, no roots.pem: executor-tls-roots, nothing is sent", (rc, (j or {}).get("rule"), na.sends + nb.sends + na.requests + nb.requests), (2, "chain.executor-tls-roots", 0))
+    for name, data in (("empty", b""), ):
+        job, chain = fresh()
+        open(os.path.join(state, "roots.pem"), "wb").write(data)
+        rc, j, out, _ = job.tick()
+        check(f"TLS, an {name} roots.pem: executor-tls-roots, nothing is sent", (rc, (j or {}).get("rule"), na.sends + nb.sends + na.requests + nb.requests), (2, "chain.executor-tls-roots", 0))
+    for name, data in (("garbage", b"this is not a certificate\n"), ("another CA's", other_roots)):
+        job, chain = fresh()
+        open(os.path.join(state, "roots.pem"), "wb").write(data)
+        rc, j, out, _ = job.tick()
+        check(f"TLS, a roots.pem of {name}: both providers unusable, no decision, nothing is sent", (rc, (j or {}).get("ok"), (j or {}).get("agree"), na.sends + nb.sends), (0, True, False, 0))
+    # a request path from target_a and target_b (a provider whose RPC key is in its path), and a bad one
+    job, chain = fresh()
+    job.write("target_a", "/v3/abc-DEF_123.x~y%20\n")
+    rc, j, out, _ = job.tick()
+    check("TLS, target_a is the request path of provider A, and B's is /", ((j or {}).get("ok"), na.last_path, nb.last_path), (True, "/v3/abc-DEF_123.x~y%20", "/"))
+    for name, text in (("not starting with a slash", "v3/abc\n"), ("with a space", "/v3/a b\n"), ("with a quote", "/v3/a\"b\n"), ("empty", "\n"), ("over 255 bytes", "/" + "a" * 256 + "\n"), ("with CRLF", "/v3/a\r\n"), ("with a brace", "/v3/a{\n"), ("with an at sign", "/v3/a@\n"), ("with a bracket", "/v3/a[\n"), ("with a backquote", "/v3/a`\n"),
+                       ("with a colon", "/v3/a:\n"), ("with a question mark", "/v3/a?x=1\n"), ("with a hash", "/v3/a#\n"), ("with a backslash", "/v3/a\\b\n")):
+        job, chain = fresh()
+        job.write("target_b", text)
+        rc, j, out, _ = job.tick()
+        check(f"TLS, a target path {name}: executor-config, nothing is sent", (rc, (j or {}).get("rule"), na.sends + nb.sends + na.requests + nb.requests), (2, "chain.executor-config", 0))
+    # no two connections start the TLS engine's generator from the same bytes: the client randoms the nodes saw (the key log of the server's context) are all different, within a tick and across two
+    keylog = os.path.join(state + "-keylog.txt")
+    open(keylog, "w").close()
+    ctxs["good"].keylog_filename = keylog
+    job, chain = fresh()
+    ctxs["good"].keylog_filename = keylog
+    seen_requests = 0
+    for i in range(2):
+        rc, j, *_ = job.tick()
+        seen_requests = na.requests + nb.requests
+    randoms = {l.split()[1] for l in open(keylog).read().splitlines() if len(l.split()) == 3}
+    check("TLS, the client randoms of all the connections of two ticks are different (the engine is seeded afresh for each)", (len(randoms), seen_requests), (seen_requests, seen_requests))
+    # a provider that changes its certificate between two ticks is verified afresh at each
+    job, chain = fresh()
+    rc, j, *_ = job.tick()
+    check("TLS, a good certificate: submitted", (j or {}).get("state"), "submitted")
+    na.ctx = ctxs["expired"]
+    rc, j, *_ = job.tick()
+    check("TLS, the certificate expires between two ticks: no decision this tick", ((j or {}).get("agree"), (j or {}).get("state")), (False, "submitted"))
+    na.ctx = ctxs["good"]
+    rc, j, *_ = job.tick()
+    check("TLS, and the next tick, with a good one, decides again", (j or {}).get("agree"), True)
 
 
 job_chain = None
@@ -753,19 +988,6 @@ def lie_hash(m, r):
 
 
 MUTANTS = [
-    ("main", "the status line: HTTP", "!header_is(text, 0, \"http/1.\") ||", ""),
-    ("main", "the status: a 200", "int_of(text[9]) != 50 || int_of(text[10]) != 48 || int_of(text[11]) != 48 {", "int_of(text[9]) != 50 {"),
-    ("main", "a response without a whole head", "if head_end < 0 {\n        return -342;", "if false {\n        return -342;"),
-    ("main", "a transfer coding", "if header_is(text, at, \"transfer-encoding:\") {\n            return -343;", "if false {\n            return -343;"),
-    ("main", "the content length", "if header_is(text, at, \"content-length:\") {", "if header_is(text, at, \"content-lengtx:\") {"),
-    ("main", "a body shorter than its length", "if len(text) - head_end < length {\n        return -341;", "if false {\n        return -341;"),
-    ("main", "no content length reads to the end", "if length < 0 {\n        length = len(text) - head_end;", "if length < 0 {\n        length = 0;"),
-    ("main", "the body's start", "info[0] = head_end;", "info[0] = head_end + 1;"),
-    ("main", "the body's length", "info[1] = length;", "info[1] = length + 1;"),
-    ("main", "the deadline", "let deadline = clock_ms(clock) + 3000;", "let deadline = clock_ms(clock) + 30000;"),
-    ("main", "the write deadline", "if left <= 0 {\n                                        status = -344;\n                                    } else if poller_wait(pw, events, left) <= 0 {\n                                        status = -344;\n                                    }\n                                }\n                                Sent::Failed", "if left <= -1000000 {\n                                        status = -344;\n                                    } else if poller_wait(pw, events, left) <= -1 {\n                                        status = -344;\n                                    }\n                                }\n                                Sent::Failed"),
-    ("main", "a response longer than the buffer", "if got >= len(resp) {\n                                        status = -344;", "if false {\n                                        status = -344;"),
-    ("main", "a transport failure on read", "Received::Failed(e) => {\n                                    status = -341;", "Received::Failed(e) => {\n                                    status = 0;"),
     ("main", "the chain id of a provider", "if c == -308 {\n                ints[off + 6] = 1;", "if c == -999 {\n                ints[off + 6] = 1;"),
     ("main", "the chain id unusable", "} else if c < 0 {\n                done = 1;\n            }", "} else if c < -1000 {\n                done = 1;\n            }"),
     ("main", "the nonce", "ints[off + 4] = v;", "ints[off + 4] = 0;"),
@@ -819,6 +1041,44 @@ MUTANTS = [
     ("main", "the lock", "Done::Failed(e2) => {\n                                    locked = false;", "Done::Failed(e2) => {\n                                    locked = true;"),
     ("main", "damaged evidence", "if v.0 == trail.clean() || v.0 == trail.torn() && tail < max_log_len() + 4 {", "if v.0 != 99 {"),
     ("main", "a torn tail", "if v.0 == trail.clean() || v.0 == trail.torn() && tail < max_log_len() + 4 {", "if v.0 == trail.clean() {"),
+    # the transport (design section 21)
+    ("main", "the status must be 200", "if hc.status(cw, tk) != 200 {", "if hc.status(cw, tk) < 0 {"),
+    ("main", "a body longer than the buffer", "if got + avail > len(resp) {", "if got + avail > len(resp) + 1000000 {"),
+    ("main", "the body is copied", "resp[got + z] = piece[z];", "resp[got + z] = piece[0];"),
+    ("main", "the body's length is kept", "info[1] = got;", "info[1] = got - 1;"),
+    ("main", "the deadline of a call", "while status == -341 && !finished && now - started_at < 3000 {", "while status == -341 && !finished && now - started_at < 30000 {"),
+    ("main", "a call that ran out of time is said so", "if status == -341 && !finished && now - started_at >= 3000 {", "if status == -341 && !finished && now - started_at >= 3000000 {"),
+    ("main", "the first turn does not wait", "if now == now0 {\n                                wait = 0;", "if now == -7 {\n                                wait = 0;"),
+    ("main", "a wait is bounded", "if wait > 100 {", "if wait > 100000 {"),
+    ("main", "the request's body is sent", "let m = hc.send_body(cw, t, body[sent..len(body)], now);", "let m = hc.send_body(cw, t, body[0..0], now);"),
+    ("main", "a dial that failed is told", "hc.connect_failed(cw, slot, hc.kind_connect(), now);", "hc.tick(cw, now);"),
+    ("main", "the provider's name is the TLS name", "fio.add_upstream(ioh, \"127.0.0.1\", port, secure, host);", "fio.add_upstream(ioh, \"127.0.0.1\", port, secure, \"localhost\");"),
+    ("main", "the Host header", "\"POST\", \"/\", host,", "\"POST\", \"/\", \"example.test\","),
+    ("main", "the request path", "nb[toff..toff + tlen], host,", "nb[toff..toff + 1], host,"),
+    ("main", "the content type", "\"Content-Type: application/json\\r\\n\", len(body), hc.flag_close());\n                    } else {", "\"\", len(body), hc.flag_close());\n                    } else {"),
+    ("main", "the connection is closed after the answer", "\"Content-Type: application/json\\r\\n\", len(body), hc.flag_close());\n                    }\n                    if t > 0", "\"Content-Type: application/json\\r\\n\", len(body), 0);\n                    }\n                    if t > 0"),
+    ("main", "the TLS engine is on for an https provider", "match fio.open(heap, 1, secure) {", "match fio.open(heap, 1, false) {"),
+    ("main", "the engine is seeded", "|| fio.seed(ioh, entropy) != 0 {", "|| fio.seed(ioh, nb[nb_roots()..nb_roots() + 32]) != 0 {"),
+    ("main", "the roots are all read", "roots = fio.trust(ioh, nb[nb_roots()..nb_roots() + rl]);", "roots = fio.trust(ioh, nb[nb_roots()..nb_roots() + rl - 40]);"),
+    ("main", "no roots is unusable", "if roots > 0 {\n                        upstream", "if roots > -5 {\n                        upstream"),
+    ("main", "each connection has its own entropy", "c = c + 1;", "c = c + 0;"),
+    ("main", "a TLS provider's counter", "nb[nb_counter() + i] = byte_of(c >> 8 * (3 - i) & 255);", "nb[nb_counter() + i] = byte_of(0);"),
+    ("main", "the entropy is read", "if fs_read(ur, \"/dev/urandom\", e) != 32 {", "if fs_read(ur, \"/dev/urandom\", e) < -5 {"),
+    ("main", "the roots file is required", "if rl < 1 {\n            return -339;", "if rl < -5 {\n            return -339;"),
+    ("main", "a target must start with a slash", "|| int_of(nb[at]) != 47 {", "|| false {"),
+    ("main", "a target is at most 255 bytes", "|| end > 255 ||", "|| end > 256 ||"),
+    ("main", "a target is not empty", "if got < 0 || end < 1", "if got < 0 || end < 0"),
+    ("main", "target: the top of a-z", "c >= 97 && c <= 122 ||", "c >= 97 && c <= 123 ||"),
+    ("main", "target: upper case", "c >= 65 && c <= 90 ||", "c >= 64 && c <= 90 ||"),
+    ("main", "target: the top of upper case", "c >= 65 && c <= 90 ||", "c >= 65 && c <= 91 ||"),
+    ("main", "target: digits", "c >= 48 && c <= 57 || c == 47", "c >= 48 && c <= 58 || c == 47"),
+    ("main", "target: below the digits", "c >= 48 && c <= 57 || c == 47", "c >= 47 && c <= 57 || c == 47"),
+    ("main", "target: a tilde", "|| c == 126 ||", "|| c == 127 ||"),
+    ("main", "target: a percent", "|| c == 37 ||", "|| c == 38 ||"),
+    ("main", "target: a hyphen", "|| c == 37 || c == 45)", "|| c == 37 || c == 46)"),
+    ("main", "target: a dot", "|| c == 46 || c == 95", "|| c == 47 || c == 95"),
+    ("main", "target: an underscore", "|| c == 95 ||", "|| c == 96 ||"),
+    ("lib", "the roots refusal's tag", "return \"executor-tls-roots\";", "return \"executor-roots\";"),
     ("lib", "config: the chain", "var lit = \"chain=\";", "var lit = \"chaim=\";"),
     ("lib", "config: k", "lit = \"k=\";", "lit = \"l=\";"),
     ("lib", "config: k of 0", "if v < 0 || which == 1 && v < 1 {", "if v < 0 {"),
@@ -835,11 +1095,7 @@ MUTANTS = [
 
 # Mutants no input can tell from the original, each with the reason.
 EQUIVALENT = {
-    "a body shorter than its length": "the response buffer is zero-filled, so a body cut short and then read to its stated length is followed by NUL bytes and the JSON reader refuses it: unusable either way, only the internal code differs",
-    "a response longer than the buffer": "an answer that fills the buffer is cut, and the cut body is refused by the length check below it (-341) or, with no length, by the JSON reader: unusable either way",
-    "a transport failure on read": "a connection that fails mid-answer leaves a cut answer, refused by the head or the length check (-342/-341): unusable either way",
     "a receipt without its transaction": "NOT PROVEN equivalent: for a transaction that is not mined, tx_block is 0, so the clause is the only one that rejects only a receipt in block 0 next to a pending transaction; a test that sends exactly that from both providers is refused by the unmutated and the mutated executor alike (the cause was not traced), so no input is known that this clause alone catches",
-    "the write deadline": "the request is a few hundred bytes and always fits the socket's buffer, so the write never waits and its deadline cannot be reached by any provider",
     "the evidence is written": "an append that failed is followed by a flush that fails too (nothing was staged), so the flush check alone refuses the tick; the same refusal is checked with /dev/full",
 }
 
@@ -870,11 +1126,15 @@ def mutants(cancho):
             os.mkdir(state)
             pa, pb = free_port(), free_port()
             exe = os.path.join(d, "executor")
+            state2 = os.path.join(d, "state-tls")
+            os.mkdir(state2)
+            exe2 = os.path.join(d, "executor-tls")
             try:
                 build(cancho, libdir, main, state, pa, pb, exe)
+                build(cancho, libdir, main, state2, pa, pb, exe2, "localhost", "localhost", (1, 1))
             except SystemExit as e:
                 return name, "did not build: " + str(e)[:200]
-            r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--exe", exe, "--state", state, "--ports", str(pa), str(pb), "--trailtool", TRAILTOOL[0]], capture_output=True, text=True, timeout=3000)
+            r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--exe", exe, "--state", state, "--exe2", exe2, "--state2", state2, "--ports", str(pa), str(pb), "--trailtool", TRAILTOOL[0]], capture_output=True, text=True, timeout=3000)
             return name, ("killed" if r.returncode != 0 else "SURVIVED")
         finally:
             shutil.rmtree(d, ignore_errors=True)
@@ -918,10 +1178,23 @@ def main():
             build(cancho, os.path.join(ROOT, "lib"), open(os.path.join(ROOT, "tools/executor/main.cho")).read(), state, pa, pb, exe)
         seed = live(random.Random(1))
         na, nb = Node(Chain(seed), pa), Node(Chain(seed), pb)
+        pki = os.path.join(tmp, "pki")
+        os.mkdir(pki)
+        ctxs, roots, other_roots = make_pki(pki)
         na.start()
         nb.start()
         try:
-            run_checks(exe, state, na, nb, trailtool, cancho, random.Random(2468))
+            run_checks(exe, state, na, nb, trailtool, cancho, random.Random(2468), "plain", ctxs, roots)
+            # the same providers over TLS, by name, with the CA's certificate as the only root: every scenario above, and then the transport's own
+            if "--exe2" in sys.argv:
+                exe2, state2 = arg("--exe2"), arg("--state2")
+            else:
+                state2 = os.path.join(tmp, "state-tls")
+                os.mkdir(state2)
+                exe2 = os.path.join(tmp, "executor-tls")
+                build(cancho, os.path.join(ROOT, "lib"), open(os.path.join(ROOT, "tools/executor/main.cho")).read(), state2, pa, pb, exe2, "localhost", "localhost", (1, 1))
+            run_checks(exe2, state2, na, nb, trailtool, cancho, random.Random(2468), "tls", ctxs, roots)
+            run_tls_checks(exe2, state2, na, nb, ctxs, roots, other_roots, random.Random(1357))
         finally:
             na.stop()
             nb.stop()
