@@ -828,19 +828,25 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
         rc, j, *_ = job.tick()
         check(f"both providers say {name}: no decision", (ok(j), j["agree"], j["state"]), (True, False, "submitted"))
         na.fault = nb.fault = None
-    # a receipt in block 0 for a transaction that is pending, from both providers
-    def rec0(m, r):
-        if m == "eth_getTransactionReceipt" and r:
-            return dict(r, blockNumber="0x0", blockHash="0x" + ch0.bh(0).hex())
-        return tx_pending(m, r)
-    job, chain = fresh()
-    ch0 = chain
-    job.tick()
-    chain.mine()
-    na.fault = nb.fault = rec0
-    rc, j, *_ = job.tick()
-    check("both providers say a receipt in block 0 for a pending transaction: no decision", (ok(j), j["agree"], j["state"]), (True, False, "submitted"))
-    na.fault = nb.fault = None
+    # a receipt in any of the first sixteen blocks for a transaction that is pending, from both providers: never believed. (For a transaction that is not mined, `tx_block` is a stale index into the
+    # JSON tape, so a receipt whose block happens to be that index would pass a comparison of blocks alone: the clause on the transaction's kind is what refuses it, and a sweep finds the index.)
+    def rec_at(n, ch):
+        def lie(m, r):
+            if m == "eth_getTransactionReceipt" and r:
+                return dict(r, blockNumber=hex(n), blockHash="0x" + ch.bh(n).hex())
+            return tx_pending(m, r)
+        return lie
+    wrongly = []
+    for n in range(16):
+        job, chain = fresh()
+        job.tick()
+        chain.mine()
+        na.fault = nb.fault = rec_at(n, chain)
+        rc, j, *_ = job.tick()
+        if (ok(j), j["agree"], j["state"]) != (True, False, "submitted"):
+            wrongly.append((n, j and j["agree"], j and j["state"]))
+        na.fault = nb.fault = None
+    check("both providers say a receipt in block 0 to 15 for a pending transaction: never believed", wrongly, [])
     # both providers behind: a tip below the block decides nothing
     job, chain = fresh()
     job.tick()
@@ -1238,7 +1244,6 @@ EQUIVALENT = {
     "the entropy is read": "the failing branch cannot be reached by the harness: /dev/urandom cannot be made unreadable for the process (untested, not argued away)",
     "a target is not empty": "an empty target file has no byte 47 at its start, and the slash check refuses it with the same code",
     "target: below the digits": "byte 47 is `/`, which the set already holds: the mutant admits nothing new",
-    "a receipt without its transaction": "NOT PROVEN equivalent: for a transaction that is not mined, tx_block is 0, so the clause is the only one that rejects only a receipt in block 0 next to a pending transaction; a test that sends exactly that from both providers is refused by the unmutated and the mutated executor alike (the cause was not traced), so no input is known that this clause alone catches",
     "the evidence is written": "an append that failed is followed by a flush that fails too (nothing was staged), so the flush check alone refuses the tick; the same refusal is checked with /dev/full",
 }
 
