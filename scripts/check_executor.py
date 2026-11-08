@@ -210,6 +210,8 @@ class Node:
         self.chain_id = chain.case.tx.chain
         self.wrong_send = False
         self.connections = 0
+        self.clean_closes = 0   # TLS connections the client ended with close_notify
+        self.ragged_closes = 0  # TLS connections it ended without
         self.keepalive = False  # speak HTTP/1.1 and keep the connection for the next request (otherwise HTTP/1.0: one request a connection)
         self.last_path = None
         self.last_headers = {}
@@ -227,6 +229,16 @@ class Node:
 
             def log_message(self, *a):
                 pass
+
+            def handle_one_request(self):
+                # over TLS: the end of a connection that was kept for another request is a close_notify (clean) or the socket just closing (ragged)
+                try:
+                    super().handle_one_request()
+                    if not getattr(self, "raw_requestline", b"x") and node.ctx is not None:
+                        node.clean_closes += 1
+                except ssl.SSLEOFError:
+                    node.ragged_closes += 1
+                    self.close_connection = True
 
             def do_POST(self):
                 n = int(self.headers.get("Content-Length", "0"))
@@ -329,7 +341,7 @@ class Node:
                 # the mock writes a response's head and its body separately; on a connection that stays open, Nagle's algorithm and the client's delayed acknowledgement would make each answer wait 40 ms
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 if node.ctx is not None:
-                    sock = node.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+                    sock = node.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False, suppress_ragged_eofs=False)
                 return sock, addr
 
             def process_request(self, request, client_address):
@@ -524,6 +536,7 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
         job, chain = fresh()
         na.keepalive = nb.keepalive = keep
         c0 = (na.connections, nb.connections)
+        k0 = (na.clean_closes, nb.clean_closes, na.ragged_closes, nb.ragged_closes)
         job.tick()
         c1 = (na.connections, nb.connections)
         chain.mine()
@@ -531,6 +544,9 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
         c2 = (na.connections, nb.connections)
         check(f"keep-alive {keep}: connections to each provider in the first tick (five queries and a send)", (c1[0] - c0[0], c1[1] - c0[1]), (2, 2) if keep else (6, 6))
         check(f"keep-alive {keep}: connections to each provider in a tick that asks six questions", (c2[0] - c1[0], c2[1] - c1[1]), (1, 1) if keep else (6, 6))
+        if keep and mode == "tls":
+            time.sleep(0.3)
+            check("keep-alive over TLS: the executor ends each connection with close_notify, not by closing the socket", (na.clean_closes - k0[0], nb.clean_closes - k0[1], na.ragged_closes - k0[2], nb.ragged_closes - k0[3]), (c2[0] - c0[0], c2[1] - c0[1], 0, 0))
         na.keepalive = nb.keepalive = False
     # (2) a revert
     job, chain = fresh(status=0)
@@ -1195,6 +1211,7 @@ MUTANTS = [
 
 # Mutants no input can tell from the original, each with the reason.
 EQUIVALENT = {
+    "a dial that failed is told": "`tcp_connect_start` reports a refused connection through the poller (`connect_status`), not as `Failed`, so only a name that does not resolve (or a kernel that refuses at once) reaches this branch, and the harness cannot make a name fail to resolve for a build whose names must resolve (untested, not argued away; a provider with a closed port is tested and fast)",
     "a call that ran out of time is said so": "-341 and -344 both make the provider unusable (`call_one` answers -1 for any negative status); only the internal code differs",
     "a wait is bounded": "the wait is the time left of the 3,000 ms, and the 100 ms cap only makes the loop turn more often; the deadline is the same either way",
     "the TLS engine is on for an https provider": "one connection is one engine slot either way (`fio.open` sizes the engine at `slots` or 1), and `tls_on` only decides whether more are allocated",
