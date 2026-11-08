@@ -514,6 +514,10 @@ fn decide[&l, &ac, &k, &i, &a, &m, &s, &w, &y, &t, &d, &x, &g, &h](lg: &!l log.L
     if seen < 0 {
         return refuse(io, seen);
     }
+    if seen == 0 && len(ledger) / 64 >= signer.max_entries() {
+        // The ledger holds the most entries the signer reads (and the anchor can count): a fresh envelope would be appended and then could not be anchored, so it is refused before it is.
+        return refuse(io, -273);
+    }
     if seen == 0 {
         // Fresh: the entry is on the disk before the signature exists.
         var written = -274;

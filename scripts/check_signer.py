@@ -663,6 +663,23 @@ def run_checks(st, trailtool, cancho, rng, slow):
         write_chain(st.ledger(), [(b"envelope.consumed", json.dumps({"id": i.to_bytes(32, "big").hex(), "digest": "0" * 64}, separators=(",", ":")).encode(), 1000) for i in range(65537)])
         st.adopt(count=65536)  # one behind the ledger: allowed, and then the ledger is full
         expect_refusal("a ledger over 65,536 entries", st.run(c), "signer-ledger-full", st)
+        # exactly 65,536 entries: an entry that is in it is still answered, and a fresh envelope is refused before it is appended (it would not fit the anchor, and its entry could never be signed)
+        c = live_case(rng)
+        st.reset(c)
+        d0 = with_nonce(c, c.tx.nonce)
+        d0.id = bytes([0x77]) * 32
+        d0.env = ce.layout(d0)
+        first = (b"envelope.consumed", json.dumps({"id": d0.id.hex(), "digest": ce.kec(d0.tx.unsigned()).hex()}, separators=(",", ":")).encode(), 1000)
+        write_chain(st.ledger(), [first] + [(b"envelope.consumed", json.dumps({"id": (i + 1).to_bytes(32, "big").hex(), "digest": "0" * 64}, separators=(",", ":")).encode(), 1000) for i in range(65535)])
+        st.adopt(count=65536)
+        before = open(st.ledger(), "rb").read()
+        d1 = with_nonce(c, c.tx.nonce)
+        d1.id = bytes([0x78]) * 32
+        d1.env = ce.layout(d1)
+        expect_refusal("a fresh envelope at exactly 65,536 entries", st.run(d1), "signer-ledger-full", st, before)
+        check("... and the anchor is still the ledger's", st.anchor_text() is not None and st.anchor_text().startswith(b"65536 "), True)
+        rc, j, out = st.run(d0)
+        check("an entry that is in a ledger of exactly 65,536 is still answered (same)", (rc, (j or {}).get("entry"), (j or {}).get("anchor", {}).get("count")), (0, "same", 65536))
 
 
 # (name, file, old, new): `old` must occur exactly once in the file. "main" is tools/signer/main.cho, "signer" is lib/signer/signer.cho.

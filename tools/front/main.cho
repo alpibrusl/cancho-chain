@@ -264,7 +264,7 @@ fn hex_char(v: int) -> [] int {
 
 // Is the rule `tag` (after `chain.` in the signer's answer) one of an unwell signer's, not of a bad request?
 fn unwell[&t](tag: &t [byte]) -> [] bool {
-    return bytes.equal(tag, "signer-locked") || bytes.equal(tag, "signer-ledger-write") || bytes.equal(tag, "signer-ledger-corrupt") || bytes.equal(tag, "signer-ledger-full") || bytes.equal(tag, "signer-config") || bytes.equal(tag, "signer-key") || bytes.equal(tag, "signer-same-key") || bytes.equal(tag, "signer-anchor-corrupt") || bytes.equal(tag, "signer-anchor-missing") || bytes.equal(tag, "signer-anchor-short") || bytes.equal(tag, "signer-anchor-mismatch") || bytes.equal(tag, "signer-anchor-behind") || bytes.equal(tag, "signer-anchor-write") || bytes.equal(tag, "signer-witness-missing") || bytes.equal(tag, "signer-witness-short") || bytes.equal(tag, "signer-witness-mismatch") || bytes.equal(tag, "signer-witness-behind");
+    return bytes.equal(tag, "signer-locked") || bytes.equal(tag, "signer-ledger-write") || bytes.equal(tag, "signer-ledger-corrupt") || bytes.equal(tag, "signer-ledger-full") || bytes.equal(tag, "signer-config") || bytes.equal(tag, "signer-key") || bytes.equal(tag, "signer-same-key") || bytes.equal(tag, "signer-sign") || bytes.equal(tag, "signer-clock") || bytes.equal(tag, "signer-anchor-corrupt") || bytes.equal(tag, "signer-anchor-missing") || bytes.equal(tag, "signer-anchor-short") || bytes.equal(tag, "signer-anchor-mismatch") || bytes.equal(tag, "signer-anchor-behind") || bytes.equal(tag, "signer-anchor-write") || bytes.equal(tag, "signer-witness-missing") || bytes.equal(tag, "signer-witness-short") || bytes.equal(tag, "signer-witness-mismatch") || bytes.equal(tag, "signer-witness-behind");
 }
 
 // The rule tag of a refusal `{"ok":false,"rule":"chain.<tag>",...}`: the span of the tag in `answer`, or (0, 0).
@@ -479,9 +479,9 @@ fn main(world: World) -> [] int {
     var status = 3;
     let dir = narrow(fs, "/var/lib/cancho-front");
     let signer = narrow(exec, "/usr/local/lib/cancho-chain/signer");
-    let inbound = narrow(ports, "8742");
+    let inbound = narrow(ports, "127.0.0.1:8742");
     borrow inbound as &nn in {
-        match tcp_listen(nn, 8742, 1024, 0) {
+        match tcp_listen_on(nn, "127.0.0.1", 8742, 1024, 0) {
             Listening::Ok(l) => {
                 var listener = l;
                 borrow mut listener as &!lh in {

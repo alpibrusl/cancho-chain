@@ -1008,7 +1008,19 @@ def run_tls_checks(exe, state, na, nb, ctxs, roots, other_roots, rng):
         open(os.path.join(state, "roots.pem"), "wb").write(data)
         rc, j, out, _ = job.tick()
         check(f"TLS, an {name} roots.pem: executor-tls-roots, nothing is sent", (rc, (j or {}).get("rule"), na.sends + nb.sends + na.requests + nb.requests), (2, "chain.executor-tls-roots", 0))
-    for name, data in (("garbage", b"this is not a certificate\n"), ("another CA's", other_roots)):
+    job, chain = fresh()
+    open(os.path.join(state, "roots.pem"), "wb").write(b"this is not a certificate\n")
+    rc, j, out, _ = job.tick()
+    check("TLS, a roots.pem with no certificate in it: executor-tls-roots, nothing is sent (the operator is told, not left with a provider that is never usable)", (rc, (j or {}).get("rule"), na.sends + nb.sends + na.requests + nb.requests), (2, "chain.executor-tls-roots", 0))
+    job, chain = fresh()
+    open(os.path.join(state, "roots.pem"), "wb").write(b"-----BEGIN CERTIFICATE----\nAAAA\n")
+    rc, j, out, _ = job.tick()
+    check("TLS, a roots.pem whose header is a dash short is not a certificate: executor-tls-roots", (rc, (j or {}).get("rule")), (2, "chain.executor-tls-roots"))
+    job, chain = fresh()
+    open(os.path.join(state, "roots.pem"), "wb").write(b"-----BEGIN CERTIFICATE-----")
+    rc, j, out, _ = job.tick()
+    check("TLS, a roots.pem that is only a certificate's first line, at the end of the file, is looked at (no certificate parses, both providers unusable)", (rc, (j or {}).get("ok"), (j or {}).get("agree"), na.sends + nb.sends), (0, True, False, 0))
+    for name, data in (("another CA's", other_roots),):
         job, chain = fresh()
         open(os.path.join(state, "roots.pem"), "wb").write(data)
         rc, j, out, _ = job.tick()
@@ -1026,13 +1038,13 @@ def run_tls_checks(exe, state, na, nb, ctxs, roots, other_roots, rng):
     job, chain = fresh()
     job.write("target_b", "/" + "a" * 255)
     rc, j, out, _ = job.tick()
-    check("TLS, a target path of 256 bytes is refused: executor-config", (rc, (j or {}).get("rule")), (2, "chain.executor-config"))
+    check("TLS, a target path of 256 bytes is refused: executor-target", (rc, (j or {}).get("rule")), (2, "chain.executor-target"))
     for name, text in (("not starting with a slash", "v3/abc\n"), ("with a space", "/v3/a b\n"), ("with a quote", "/v3/a\"b\n"), ("empty", "\n"), ("over 255 bytes", "/" + "a" * 256 + "\n"), ("with CRLF", "/v3/a\r\n"), ("with a brace", "/v3/a{\n"), ("with an at sign", "/v3/a@\n"), ("with a bracket", "/v3/a[\n"), ("with a backquote", "/v3/a`\n"),
                        ("with a colon", "/v3/a:\n"), ("with a question mark", "/v3/a?x=1\n"), ("with a hash", "/v3/a#\n"), ("with a backslash", "/v3/a\\b\n")):
         job, chain = fresh()
         job.write("target_b", text)
         rc, j, out, _ = job.tick()
-        check(f"TLS, a target path {name}: executor-config, nothing is sent", (rc, (j or {}).get("rule"), na.sends + nb.sends + na.requests + nb.requests), (2, "chain.executor-config", 0))
+        check(f"TLS, a target path {name}: executor-target, nothing is sent", (rc, (j or {}).get("rule"), na.sends + nb.sends + na.requests + nb.requests), (2, "chain.executor-target", 0))
     # no two connections start the TLS engine's generator from the same bytes: the client randoms the nodes saw (the key log of the server's context) are all different, within a tick and across two
     keylog = os.path.join(state + "-keylog.txt")
     open(keylog, "w").close()
@@ -1140,8 +1152,9 @@ MUTANTS = [
     ("main", "evidence on a block change", "var m = 34;\n        while m < 74 {", "var m = 74;\n        while m < 74 {"),
     ("main", "the evidence's state", "executor.payload(env[1..33], tx_hash, lifecycle.state(rec), lifecycle.block(rec), body);", "executor.payload(env[1..33], tx_hash, lifecycle.state(prev), lifecycle.block(rec), body);"),
     ("main", "the evidence's envelope", "executor.payload(env[1..33], tx_hash,", "executor.payload(env[33..65], tx_hash,"),
-    ("main", "the evidence is flushed", "if blen < 0 || r2.0 != 0 || log.flush(lg) != 0 {", "if blen < 0 || r2.0 != 0 {"),
-    ("main", "the evidence is written", "if blen < 0 || r2.0 != 0 || log.flush(lg) != 0 {", "if blen < 0 || log.flush(lg) != 0 {"),
+    ("main", "the evidence is flushed", "if r2.0 != 0 || log.flush(lg) != 0 {", "if r2.0 != 0 {"),
+    ("main", "the evidence is written", "if r2.0 != 0 || log.flush(lg) != 0 {", "if log.flush(lg) != 0 {"),
+    ("main", "a failed payload is refused before it is used", "if blen < 0 {\n                failure = -332;", "if blen < -1000 {\n                failure = -332;"),
     ("main", "the state is written", "if fs_write(fs, \"/var/lib/cancho-executor/state.new\", line) != 149 {", "if fs_write(fs, \"/var/lib/cancho-executor/state.new\", line) != 0 - 5 {"),
     ("main", "the state file is renamed", "match fs_rename(fs, \"/var/lib/cancho-executor/state.new\", \"/var/lib/cancho-executor/state\") {", "match fs_rename(fs, \"/var/lib/cancho-executor/state.new\", \"/var/lib/cancho-executor/state.new\") {"),
     ("main", "the job: the envelope's length", "ok = calln >= 1 && calln <= 64 && en == 262 + calln && be8(env, 97) == config[0];", "ok = calln >= 1 && calln <= 64 && be8(env, 97) == config[0];"),
@@ -1159,6 +1172,9 @@ MUTANTS = [
     ("main", "an idle connection is kept", "idle_per_key: 1, max_requests: 100 }", "idle_per_key: 0, max_requests: 100 }"),
     ("main", "a connection that must close is closed before the next request", "fio.shut(ioh, cw, slot, now0);", "hc.tick(cw, now0);"),
     ("main", "the session's idle connections are told to close", "hc.close_idle(cw, clock_ms(clock));", "hc.tick(cw, clock_ms(clock));"),
+    ("main", "roots must hold a certificate", "if rl < 1 || !has_pem(nb[nb_roots()..nb_roots() + rl]) {", "if rl < 1 {"),
+    ("main", "a certificate header at the end of the roots", "while i + len(lit) <= len(text) {", "while i + len(lit) < len(text) {"),
+    ("main", "the header is compared whole", "if k == len(lit) {\n            return true;", "if k >= len(lit) - 1 {\n            return true;"),
     ("main", "the status must be 200", "if hc.status(cw, tk) != 200 {", "if hc.status(cw, tk) < 0 {"),
     ("main", "a body longer than the buffer", "if got + avail > len(resp) {", "if got + avail > len(resp) + 1000000 {"),
     ("main", "the body is copied", "resp[got + z] = piece[z];", "resp[got + z] = piece[0];"),
@@ -1180,7 +1196,7 @@ MUTANTS = [
     ("main", "each connection has its own entropy", "c = c + 1;", "c = c + 0;"),
     ("main", "a TLS provider's counter", "nb[nb_counter() + i] = byte_of(c >> 8 * (3 - i) & 255);", "nb[nb_counter() + i] = byte_of(0);"),
     ("main", "the entropy is read", "if fs_read(ur, \"/dev/urandom\", e) != 32 {", "if fs_read(ur, \"/dev/urandom\", e) < -5 {"),
-    ("main", "the roots file is required", "if rl < 1 {\n            return -339;", "if rl < -5 {\n            return -339;"),
+    ("main", "the roots file is required", "if rl < 1 || !has_pem(", "if rl < -5 || !has_pem("),
     ("main", "a target must start with a slash", "|| int_of(nb[at]) != 47 {", "|| false {"),
     ("main", "a target is at most 255 bytes", "|| end > 255 ||", "|| end > 256 ||"),
     ("main", "a target is not empty", "if got < 0 || end < 1", "if got < 0 || end < 0"),
@@ -1194,6 +1210,7 @@ MUTANTS = [
     ("main", "target: a hyphen", "|| c == 37 || c == 45)", "|| c == 37 || c == 46)"),
     ("main", "target: a dot", "|| c == 46 || c == 95", "|| c == 47 || c == 95"),
     ("main", "target: an underscore", "|| c == 95 ||", "|| c == 96 ||"),
+    ("lib", "payload: the buffer's minimum", "|| block < 0 || len(out) < 202 {", "|| block < 0 || len(out) < 20 {"),
     ("lib", "the roots refusal's tag", "return \"executor-tls-roots\";", "return \"executor-roots\";"),
     ("lib", "config: the chain", "var lit = \"chain=\";", "var lit = \"chaim=\";"),
     ("lib", "config: k", "lit = \"k=\";", "lit = \"l=\";"),
@@ -1211,6 +1228,8 @@ MUTANTS = [
 
 # Mutants no input can tell from the original, each with the reason.
 EQUIVALENT = {
+    "a failed payload is refused before it is used": "`payload` cannot fail for the values the binary gives it (a state `lifecycle.check` accepted, a block that is not negative, a buffer of 220), so the branch is unreachable from it: a defence a review asked for, untested, not argued away",
+    "payload: the buffer's minimum": "the binary gives `payload` 220 bytes, so a guard against a buffer under its 202-byte worst case cannot be reached from it (found by a review; the guard was 200, which a 202-byte payload would have overrun)",
     "a dial that failed is told": "`tcp_connect_start` reports a refused connection through the poller (`connect_status`), not as `Failed`, so only a name that does not resolve (or a kernel that refuses at once) reaches this branch, and the harness cannot make a name fail to resolve for a build whose names must resolve (untested, not argued away; a provider with a closed port is tested and fast)",
     "a call that ran out of time is said so": "-341 and -344 both make the provider unusable (`call_one` answers -1 for any negative status); only the internal code differs",
     "a wait is bounded": "the wait is the time left of the 3,000 ms, and the 100 ms cap only makes the loop turn more often; the deadline is the same either way",
