@@ -18,6 +18,8 @@ import segment;
 import std.buffer;
 import std.bytes;
 import std.conns;
+import fetch_io as fio;
+import http_client as hc;
 import std.io;
 import trail;
 
@@ -105,227 +107,299 @@ fn read_hex_file[&c, &p, &o, &b](fs: &c Fs("/var/lib/cancho-executor"), path: &p
 }
 
 // ---------------------------------------------------------------------
-// The providers: plain HTTP/1.1 with a Content-Length, over a socket, with a deadline
+// The providers: HTTP/1.1 over TCP or TLS 1.3, through `packages/http-client` and cancho's `fetch_io` driver, with a deadline (design section 21)
 // ---------------------------------------------------------------------
 
-fn dial_a[&o](out: &o Out("127.0.0.1:18545")) -> [net_out("127.0.0.1:18545")] Dialed {
-    return tcp_connect(out, "127.0.0.1", 18545);
+// What a provider is, fixed at build time (so that `cancho authority` names exactly what the executor can reach): its host, its port (also in the `Out` types below)
+// and whether it speaks TLS. The harness of `scripts/check_executor.py` builds copies with others.
+fn host_a() -> [] &static [byte] {
+    return "127.0.0.1";
 }
 
-fn dial_b[&o](out: &o Out("127.0.0.1:18546")) -> [net_out("127.0.0.1:18546")] Dialed {
-    return tcp_connect(out, "127.0.0.1", 18546);
+fn host_b() -> [] &static [byte] {
+    return "127.0.0.1";
 }
 
-fn put_text[&o, &t](out: &!o [byte], at: int, text: &t [byte]) -> [] int {
-    var i = 0;
-    while i < len(text) {
-        out[at + i] = text[i];
-        i = i + 1;
-    }
-    return at + len(text);
+fn port_a() -> [] int {
+    return 18545;
 }
 
-fn put_decimal[&o](out: &!o [byte], at: int, v: int) -> [] int {
-    var n = 1;
-    var t = v;
-    while t >= 10 {
-        t = t / 10;
-        n = n + 1;
-    }
-    var u = v;
-    var i = n - 1;
-    while i >= 0 {
-        out[at + i] = byte_of(48 + u % 10);
-        u = u / 10;
-        i = i - 1;
-    }
-    return at + n;
+fn port_b() -> [] int {
+    return 18546;
 }
 
-fn lower(c: int) -> [] int {
-    if c >= 65 && c <= 90 {
-        return c + 32;
-    }
-    return c;
-}
-
-// Does the header line at `at` in `text` start with the lower-case `name` (any case in the text)?
-fn header_is[&t, &n](text: &t [byte], at: int, name: &n [byte]) -> [] bool {
-    if len(text) - at < len(name) {
-        return false;
-    }
-    var i = 0;
-    while i < len(name) {
-        if lower(int_of(text[at + i])) != int_of(name[i]) {
-            return false;
-        }
-        i = i + 1;
-    }
-    return true;
-}
-
-// An HTTP response in `text`: the body's start and length into `info[0..2]`. 0, or -342 (not a 200 with a whole head), -343 (chunked, or any transfer coding), -341 (the body is shorter than its Content-Length).
-fn parse_http[&t, &i](text: &t [byte], info: &!i [int]) -> [] int {
-    if len(text) < 16 || !header_is(text, 0, "http/1.") || int_of(text[8]) != 32 || int_of(text[9]) != 50 || int_of(text[10]) != 48 || int_of(text[11]) != 48 {
-        return -342;
-    }
-    var head_end = -1;
-    var i2 = 0;
-    while i2 + 3 < len(text) && head_end < 0 {
-        if int_of(text[i2]) == 13 && int_of(text[i2 + 1]) == 10 && int_of(text[i2 + 2]) == 13 && int_of(text[i2 + 3]) == 10 {
-            head_end = i2 + 4;
-        }
-        i2 = i2 + 1;
-    }
-    if head_end < 0 {
-        return -342;
-    }
-    var length = -1;
-    var at = 0;
-    while at < head_end {
-        var eol = at;
-        while eol < head_end && int_of(text[eol]) != 10 {
-            eol = eol + 1;
-        }
-        if header_is(text, at, "transfer-encoding:") {
-            return -343;
-        }
-        if header_is(text, at, "content-length:") {
-            var v = 0;
-            var j = at + 15;
-            while j < eol && (int_of(text[j]) == 32 || int_of(text[j]) == 9) {
-                j = j + 1;
-            }
-            var digits = 0;
-            while j < eol && int_of(text[j]) >= 48 && int_of(text[j]) <= 57 && digits < 9 {
-                v = v * 10 + (int_of(text[j]) - 48);
-                digits = digits + 1;
-                j = j + 1;
-            }
-            if digits == 0 {
-                return -342;
-            }
-            length = v;
-        }
-        at = eol + 1;
-    }
-    if length < 0 {
-        length = len(text) - head_end;
-    }
-    if len(text) - head_end < length {
-        return -341;
-    }
-    info[0] = head_end;
-    info[1] = length;
+fn secure_a() -> [] int {
     return 0;
 }
 
-// Write `request` to the connection `conn` and read the whole answer into `resp`, with 3,000 ms for all of it. The body's span goes to `info[0..2]`. 0, or -341 (transport), -342 (a bad answer), -343 (chunked),
-// -344 (an answer that is too long or too slow).
-fn exchange[&h, &k, &q, &r, &i](heap: &!h Heap, clock: &k Clock, conn: Conn, request: &q [byte], resp: &!r [byte], info: &!i [int]) -> [heap, poll, clock] int {
-    var status = 0;
-    var table = conns.empty(heap, 1);
-    let (put_table, slot) = conns.put(heap, table, conn);
-    table = put_table;
-    match poller_new() {
-        Polling::Failed(e) => {
+fn secure_b() -> [] int {
+    return 0;
+}
+
+// Connected by name: the provider's `Out` is `net_out("<host>:<port>")` and nothing wider. The name is resolved by the C library (blocking, outside the deadline: design 21.2 D6).
+fn dial_a[&o](out: &o Out("127.0.0.1:18545")) -> [net_out("127.0.0.1:18545")] Dialed {
+    return tcp_connect(out, host_a(), 18545);
+}
+
+fn dial_b[&o](out: &o Out("127.0.0.1:18546")) -> [net_out("127.0.0.1:18546")] Dialed {
+    return tcp_connect(out, host_b(), 18546);
+}
+
+// The area of network facts a tick keeps in `nb` (design 21.2): the tick's entropy, a counter, each provider's request path, and the PEM roots.
+fn nb_seed() -> [] int {
+    return 0;
+}
+
+fn nb_counter() -> [] int {
+    return 32;
+}
+
+fn nb_target_len() -> [] int {
+    return 40;
+}
+
+fn nb_roots_len() -> [] int {
+    return 44;
+}
+
+fn nb_target() -> [] int {
+    return 64;
+}
+
+fn nb_roots() -> [] int {
+    return 1024;
+}
+
+fn nb_roots_max() -> [] int {
+    return 24576;
+}
+
+fn nb_len() -> [] int {
+    return 1024 + 24576;
+}
+
+fn limits() -> [] hc.Limits {
+    return hc.Limits { connect_ms: 3000, head_ms: 3000, body_ms: 3000, total_ms: 3000, expect_ms: 1000, idle_ms: 3000, lifetime_ms: 5000, idle_per_key: 1, max_requests: 1 };
+}
+
+// Entropy for one connection: the tick's, hashed with a counter, so that no two connections of a tick (nor of two ticks) start the TLS engine's generator from the same bytes.
+fn fresh_seed[&k, &n, &o](st: &!k [int], nb: &!n [byte], out: &!o [byte]) -> [] int {
+    var c = 0;
+    var i = 0;
+    while i < 4 {
+        c = c * 256 + int_of(nb[nb_counter() + i]);
+        i = i + 1;
+    }
+    c = c + 1;
+    i = 0;
+    while i < 4 {
+        nb[nb_counter() + i] = byte_of(c >> 8 * (3 - i) & 255);
+        i = i + 1;
+    }
+    var code = 0;
+    region g {
+        let input = alloc_slice[g](36, byte_of(0));
+        i = 0;
+        while i < 32 {
+            input[i] = nb[nb_seed() + i];
+            i = i + 1;
+        }
+        i = 0;
+        while i < 4 {
+            input[32 + i] = nb[nb_counter() + i];
+            i = i + 1;
+        }
+        code = keccak.hash256(st, input, out);
+    }
+    return code;
+}
+
+// Ask provider `which` (0 or 1) with the JSON `body`: the answer's body is in `resp[0..info[1]]` (`info[0]` is 0). 0, or -341 (the provider cannot be reached, the handshake or the framing failed), -342 (a status other than 200),
+// -344 (an answer that is too long, or the 3,000 ms are over).
+fn ask[&h, &k, &oa, &ob, &b, &w, &r, &i, &n, &s](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), body: &b [byte], wire: &!w [byte], resp: &!r [byte], info: &!i [int], nb: &!n [byte], st: &!s [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] int {
+    var status = -341;
+    var secure = secure_a() == 1;
+    var host = host_a();
+    var port = port_a();
+    var tlen = int_of(nb[nb_target_len()]);
+    var toff = nb_target();
+    if which == 1 {
+        secure = secure_b() == 1;
+        host = host_b();
+        port = port_b();
+        tlen = int_of(nb[nb_target_len() + 1]);
+        toff = nb_target() + 256;
+    }
+    info[0] = 0;
+    info[1] = 0;
+    let started_at = clock_ms(clock);
+    match fio.open(heap, 1, secure) {
+        fio.Started::Failed(e) => {
             status = -341;
         }
-        Polling::Ok(p) => {
-            var poller = p;
-            let deadline = clock_ms(clock) + 3000;
-            region a {
-                let events = alloc_slice[a](4, 0);
-                borrow mut table as &!tb in {
-                    conns.nonblocking(tb, slot);
-                    borrow mut poller as &!pw in {
-                        conns.watch(tb, pw, slot, 1, 2);
-                        var at = 0;
-                        while at < len(request) && status == 0 {
-                            match conns.write(tb, slot, request[at..len(request)]) {
-                                Sent::Wrote(n) => {
-                                    at = at + n;
-                                }
-                                Sent::Again => {
-                                    let left = deadline - clock_ms(clock);
-                                    if left <= 0 {
-                                        status = -344;
-                                    } else if poller_wait(pw, events, left) <= 0 {
-                                        status = -344;
-                                    }
-                                }
-                                Sent::Failed(e) => {
-                                    status = -341;
-                                }
+        fio.Started::Ok(l) => {
+            var iov = l;
+            var upstream = -1;
+            region g {
+                let entropy = alloc_slice[g](32, byte_of(0));
+                var roots = 1;
+                borrow mut iov as &!ioh in {
+                    if secure {
+                        if fresh_seed(st, nb, entropy) != 0 || fio.seed(ioh, entropy) != 0 {
+                            roots = 0;
+                        } else {
+                            var rl = 0;
+                            var q = 0;
+                            while q < 4 {
+                                rl = rl * 256 + int_of(nb[nb_roots_len() + q]);
+                                q = q + 1;
                             }
+                            roots = fio.trust(ioh, nb[nb_roots()..nb_roots() + rl]);
                         }
-                        conns.rewatch(tb, pw, slot, 1, 1);
-                        var got = 0;
-                        var done = false;
-                        while !done && status == 0 {
-                            match conns.read(tb, slot, resp[got..len(resp)]) {
-                                Received::Data(n) => {
-                                    got = got + n;
-                                    if got >= len(resp) {
-                                        status = -344;
-                                    }
-                                }
-                                Received::End => {
-                                    done = true;
-                                }
-                                Received::Again => {
-                                    let left = deadline - clock_ms(clock);
-                                    if left <= 0 {
-                                        status = -344;
-                                    } else if poller_wait(pw, events, left) <= 0 {
-                                        status = -344;
-                                    }
-                                }
-                                Received::Failed(e) => {
-                                    status = -341;
-                                }
-                            }
-                        }
-                        if status == 0 {
-                            status = parse_http(resp[0..got], info);
-                        }
+                    }
+                    if roots > 0 {
+                        upstream = fio.add_upstream(ioh, "127.0.0.1", port, secure, host);
                     }
                 }
             }
-            poller_close(poller);
-        }
-    }
-    borrow mut table as &!tb in {
-        conns.close(tb, slot);
-    }
-    conns.drop(heap, table);
-    return status;
-}
-
-// Ask provider `which` (0 or 1) with the JSON `body`: the answer's body is in `resp[info[0]..info[0] + info[1]]`. 0 or the refusal of `exchange`, or -341 if the provider cannot be dialled.
-fn ask[&h, &k, &oa, &ob, &b, &w, &r, &i](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), body: &b [byte], wire: &!w [byte], resp: &!r [byte], info: &!i [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock] int {
-    var at = put_text(wire, 0, "POST / HTTP/1.1\r\nHost: provider\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
-    at = put_decimal(wire, at, len(body));
-    at = put_text(wire, at, "\r\n\r\n");
-    at = put_text(wire, at, body);
-    var status = -341;
-    if which == 0 {
-        match dial_a(a) {
-            Dialed::Ok(c) => {
-                status = exchange(heap, clock, c, wire[0..at], resp, info);
+            if upstream >= 0 {
+                var client = hc.open(heap, 1, 65536, 16384, limits());
+                borrow mut client as &!cw in {
+                    let now0 = clock_ms(clock);
+                    var t = 0;
+                    if tlen > 0 {
+                        t = hc.request(cw, now0, upstream, "POST", nb[toff..toff + tlen], host, "Content-Type: application/json\r\n", len(body), hc.flag_close());
+                    } else {
+                        t = hc.request(cw, now0, upstream, "POST", "/", host, "Content-Type: application/json\r\n", len(body), hc.flag_close());
+                    }
+                    if t > 0 {
+                        var sent = 0;
+                        var got = 0;
+                        var finished = false;
+                        var now = now0;
+                        var heard = false;
+                        while status == -341 && !finished && now - started_at < 3000 {
+                            if sent < len(body) {
+                                let m = hc.send_body(cw, t, body[sent..len(body)], now);
+                                if m > 0 {
+                                    sent = sent + m;
+                                }
+                            }
+                            var wait = 3000 - (now - started_at);
+                            if wait > 100 {
+                                wait = 100;
+                            }
+                            // The first turn only asks the client for what it wants (the connection to dial): nothing is there to wait for yet.
+                            if now == now0 {
+                                wait = 0;
+                            }
+                            borrow mut iov as &!ioh in {
+                                fio.step(ioh, cw, clock, wait);
+                            }
+                            now = clock_ms(clock);
+                            var going = true;
+                            while going {
+                                match hc.poll(cw, now) {
+                                    hc.Event::None => {
+                                        going = false;
+                                    }
+                                    hc.Event::Connect(slot) => {
+                                        var dialled = false;
+                                        if which == 0 {
+                                            match dial_a(a) {
+                                                Dialed::Ok(c) => {
+                                                    iov = fio.adopt(heap, iov, c, cw, slot, now);
+                                                    dialled = true;
+                                                }
+                                                Dialed::Failed(e) => {
+                                                }
+                                            }
+                                        } else {
+                                            match dial_b(b) {
+                                                Dialed::Ok(c) => {
+                                                    iov = fio.adopt(heap, iov, c, cw, slot, now);
+                                                    dialled = true;
+                                                }
+                                                Dialed::Failed(e) => {
+                                                }
+                                            }
+                                        }
+                                        if !dialled {
+                                            hc.connect_failed(cw, slot, hc.kind_connect(), now);
+                                        }
+                                    }
+                                    hc.Event::Close(slot) => {
+                                        borrow mut iov as &!ioh in {
+                                            fio.shut(ioh, cw, slot, now);
+                                        }
+                                    }
+                                    hc.Event::Head(tk) => {
+                                        heard = true;
+                                        if hc.status(cw, tk) != 200 {
+                                            status = -342;
+                                            going = false;
+                                        }
+                                    }
+                                    hc.Event::Body(tk) => {
+                                        let avail = hc.avail(cw, tk);
+                                        if got + avail > len(resp) {
+                                            status = -344;
+                                            going = false;
+                                        } else {
+                                            let piece = hc.body(cw, tk);
+                                            var z = 0;
+                                            while z < avail {
+                                                resp[got + z] = piece[z];
+                                                z = z + 1;
+                                            }
+                                            got = got + avail;
+                                            hc.consume(cw, tk, avail, now);
+                                        }
+                                    }
+                                    hc.Event::Done(tk) => {
+                                        finished = true;
+                                        info[1] = got;
+                                        status = 0;
+                                        going = false;
+                                    }
+                                    hc.Event::Failed(tk) => {
+                                        status = -341;
+                                        finished = true;
+                                        going = false;
+                                    }
+                                    hc.Event::Continue(tk) => {
+                                    }
+                                }
+                            }
+                            hc.tick(cw, now);
+                        }
+                        if status == -341 && !finished && now - started_at >= 3000 {
+                            status = -344;
+                        }
+                        if heard && status == -341 {
+                            status = -341;
+                        }
+                    }
+                    hc.close_idle(cw, clock_ms(clock));
+                    var closing = true;
+                    while closing {
+                        match hc.poll(cw, clock_ms(clock)) {
+                            hc.Event::Close(slot) => {
+                                borrow mut iov as &!ioh in {
+                                    fio.shut(ioh, cw, slot, clock_ms(clock));
+                                }
+                            }
+                            hc.Event::None => {
+                                closing = false;
+                            }
+                            _ => {
+                            }
+                        }
+                    }
+                }
+                hc.close(heap, client);
             }
-            Dialed::Failed(e) => {
-                status = -341;
-            }
-        }
-    } else {
-        match dial_b(b) {
-            Dialed::Ok(c) => {
-                status = exchange(heap, clock, c, wire[0..at], resp, info);
-            }
-            Dialed::Failed(e) => {
-                status = -341;
-            }
+            fio.close(heap, iov);
         }
     }
     return status;
@@ -334,8 +408,8 @@ fn ask[&h, &k, &oa, &ob, &b, &w, &r, &i](heap: &!h Heap, clock: &k Clock, which:
 // The state a tick works with, in one record so that the functions below do not carry twenty arguments: `ints` and `bytes` hold the facts of each provider (§18.2 step 5), `tape`, `resp`, `wire` and `req` are the buffers.
 //   ints, provider p at 8 * p: [0] usable  [1] kind (0 not found, 1 pending, 2 mined)  [2] status_ok  [3] block  [4] latest nonce  [5] tip  [6] chain id wrong  [7] unused
 //   bytes, provider p at 64 * p: [0..32] the block hash  [32..64] the hash now at that height
-fn call_one[&h, &k, &oa, &ob, &t, &q, &w, &r, &i, &j](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), id: int, request_len: int, req: &q [byte], wire: &!w [byte], resp: &!r [byte], hi: &!i [int], tape: &!t [int], ri: &!j [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock] int {
-    let status = ask(heap, clock, which, a, b, req[0..request_len], wire, resp, hi);
+fn call_one[&h, &k, &oa, &ob, &t, &q, &w, &r, &i, &j, &nbx, &stx](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), id: int, request_len: int, req: &q [byte], wire: &!w [byte], resp: &!r [byte], hi: &!i [int], tape: &!t [int], ri: &!j [int], nb: &!nbx [byte], st: &!stx [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] int {
+    let status = ask(heap, clock, which, a, b, req[0..request_len], wire, resp, hi, nb, st);
     if status < 0 {
         return -1;
     }
@@ -346,7 +420,7 @@ fn call_one[&h, &k, &oa, &ob, &t, &q, &w, &r, &i, &j](heap: &!h Heap, clock: &k 
     return ri[0];
 }
 
-fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), chain: int, nonce: int, wallet: &wa [byte], token: &tk [byte], calldata: &cd [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte], ints: &!f [int], bytes_: &!x [byte]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock] int {
+fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &stx](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), chain: int, nonce: int, wallet: &wa [byte], token: &tk [byte], calldata: &cd [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte], ints: &!f [int], bytes_: &!x [byte], nb: &!nbx [byte], st: &!stx [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] int {
     let off = 8 * which;
     let boff = 64 * which;
     ints[off] = 0;
@@ -357,7 +431,7 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th](heap: &!h
         let ri = alloc_slice[g](4, 0);
         // 1. the chain id: a provider for another chain is not unusable, it is refused.
         var n = rpc.req_chain_id(1, req);
-        var node = call_one(heap, clock, which, a, b, 1, n, req, wire, resp, hi, tape, ri);
+        var node = call_one(heap, clock, which, a, b, 1, n, req, wire, resp, hi, tape, ri, nb, st);
         if node < 0 {
             done = 1;
         } else {
@@ -372,7 +446,7 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th](heap: &!h
         // 2. the account's latest nonce, 3. the tip.
         if done == 0 {
             n = rpc.req_nonce(2, wallet, false, req);
-            node = call_one(heap, clock, which, a, b, 2, n, req, wire, resp, hi, tape, ri);
+            node = call_one(heap, clock, which, a, b, 2, n, req, wire, resp, hi, tape, ri, nb, st);
             let v = rpc.quantity(resp[hi[0]..hi[0] + hi[1]], tape, node);
             if node < 0 || v < 0 {
                 done = 1;
@@ -382,7 +456,7 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th](heap: &!h
         }
         if done == 0 {
             n = rpc.req_block_number(3, req);
-            node = call_one(heap, clock, which, a, b, 3, n, req, wire, resp, hi, tape, ri);
+            node = call_one(heap, clock, which, a, b, 3, n, req, wire, resp, hi, tape, ri, nb, st);
             let v = rpc.quantity(resp[hi[0]..hi[0] + hi[1]], tape, node);
             if node < 0 || v < 0 {
                 done = 1;
@@ -395,7 +469,7 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th](heap: &!h
         var tx_block = 0;
         if done == 0 {
             n = rpc.req_tx(4, tx_hash, req);
-            node = call_one(heap, clock, which, a, b, 4, n, req, wire, resp, hi, tape, ri);
+            node = call_one(heap, clock, which, a, b, 4, n, req, wire, resp, hi, tape, ri, nb, st);
             if node < 0 {
                 done = 1;
             } else {
@@ -410,7 +484,7 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th](heap: &!h
         var block = 0;
         if done == 0 {
             n = rpc.req_receipt(5, tx_hash, req);
-            node = call_one(heap, clock, which, a, b, 5, n, req, wire, resp, hi, tape, ri);
+            node = call_one(heap, clock, which, a, b, 5, n, req, wire, resp, hi, tape, ri, nb, st);
             if node < 0 {
                 done = 1;
             } else {
@@ -430,7 +504,7 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th](heap: &!h
         // 6. If it is mined, the hash now at its height.
         if done == 0 && rc != 0 {
             n = rpc.req_block(6, block, req);
-            node = call_one(heap, clock, which, a, b, 6, n, req, wire, resp, hi, tape, ri);
+            node = call_one(heap, clock, which, a, b, 6, n, req, wire, resp, hi, tape, ri, nb, st);
             if node < 0 || rpc.block_check(resp[hi[0]..hi[0] + hi[1]], tape, node, block, bytes_[boff + 32..boff + 64]) != 1 {
                 done = 1;
             }
@@ -479,7 +553,7 @@ fn agree[&f, &x](ints: &f [int], bytes_: &x [byte]) -> [] bool {
 }
 
 // `raw` sent to provider `which`: did it take the transaction (its `result` is this transaction's hash)?
-fn send_to[&h, &k, &oa, &ob, &t, &w, &r, &q, &y, &th](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), raw: &y [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock] bool {
+fn send_to[&h, &k, &oa, &ob, &t, &w, &r, &q, &y, &th, &nbx, &stx](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), raw: &y [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte], nb: &!nbx [byte], st: &!stx [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] bool {
     var took = false;
     region g {
         let hi = alloc_slice[g](2, 0);
@@ -487,7 +561,7 @@ fn send_to[&h, &k, &oa, &ob, &t, &w, &r, &q, &y, &th](heap: &!h Heap, clock: &k 
         let got = alloc_slice[g](32, byte_of(0));
         let n = rpc.req_send_raw(7, raw, req);
         if n > 0 {
-            let node = call_one(heap, clock, which, a, b, 7, n, req, wire, resp, hi, tape, ri);
+            let node = call_one(heap, clock, which, a, b, 7, n, req, wire, resp, hi, tape, ri, nb, st);
             if node >= 0 && rpc.hash32(resp[hi[0]..hi[0] + hi[1]], tape, node, got) == 0 && bytes.equal(got, tx_hash) {
                 took = true;
             }
@@ -507,7 +581,7 @@ fn be8[&c](c: &c [byte], at: int) -> [] int {
 }
 
 // The tick, once the evidence log is open and verified: the job is checked, the providers asked, the lifecycle applied, what must be sent is sent, the evidence written and the state kept.
-fn core[&c, &k, &i, &q, &oa, &ob, &l, &hd, &t, &r, &w, &rq, &f, &x, &s, &g, &e, &y, &th, &cd](fs: &c Fs("/var/lib/cancho-executor"), clock: &k Clock, io: &!i Io, heap: &!q Heap, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), lg: &!l log.Log, head: &!hd [byte], tape: &!t [int], resp: &!r [byte], wire: &!w [byte], req: &!rq [byte], ints: &!f [int], bytes_: &!x [byte], config: &g [int], env: &e [byte], raw: &y [byte], tx_hash: &th [byte], calldata: &cd [byte], st: &!s [int]) -> [fs_read("/var/lib/cancho-executor"), fs_write("/var/lib/cancho-executor"), file_read, file_write, heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, io_write] int {
+fn core[&c, &k, &i, &q, &oa, &ob, &l, &hd, &t, &r, &w, &rq, &f, &x, &s, &g, &e, &y, &th, &cd, &nbx](fs: &c Fs("/var/lib/cancho-executor"), clock: &k Clock, io: &!i Io, heap: &!q Heap, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), lg: &!l log.Log, head: &!hd [byte], tape: &!t [int], resp: &!r [byte], wire: &!w [byte], req: &!rq [byte], ints: &!f [int], bytes_: &!x [byte], config: &g [int], env: &e [byte], raw: &y [byte], tx_hash: &th [byte], calldata: &cd [byte], st: &!s [int], nb: &!nbx [byte]) -> [fs_read("/var/lib/cancho-executor"), fs_write("/var/lib/cancho-executor"), file_read, file_write, heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, io_write, conn_read, conn_write] int {
     var status = 2;
     region g2 {
         let rec = alloc_slice[g2](74, byte_of(0));
@@ -535,8 +609,8 @@ fn core[&c, &k, &i, &q, &oa, &ob, &l, &hd, &t, &r, &w, &rq, &f, &x, &s, &g, &e, 
             lifecycle.new(rec, nonce, ms);
         }
         // Ask both providers.
-        query(heap, clock, 0, a, b, config[0], nonce, env[105..125], env[125..145], calldata, tx_hash, tape, wire, resp, req, ints, bytes_);
-        query(heap, clock, 1, a, b, config[0], nonce, env[105..125], env[125..145], calldata, tx_hash, tape, wire, resp, req, ints, bytes_);
+        query(heap, clock, 0, a, b, config[0], nonce, env[105..125], env[125..145], calldata, tx_hash, tape, wire, resp, req, ints, bytes_, nb, st);
+        query(heap, clock, 1, a, b, config[0], nonce, env[105..125], env[125..145], calldata, tx_hash, tape, wire, resp, req, ints, bytes_, nb, st);
         if ints[6] == 1 || ints[14] == 1 {
             return refuse(io, -335);
         }
@@ -566,8 +640,8 @@ fn core[&c, &k, &i, &q, &oa, &ob, &l, &hd, &t, &r, &w, &rq, &f, &x, &s, &g, &e, 
         action = o;
         var sent = false;
         if action == 1 || action == 2 {
-            let took_a = send_to(heap, clock, 0, a, b, raw, tx_hash, tape, wire, resp, req);
-            let took_b = send_to(heap, clock, 1, a, b, raw, tx_hash, tape, wire, resp, req);
+            let took_a = send_to(heap, clock, 0, a, b, raw, tx_hash, tape, wire, resp, req, nb, st);
+            let took_b = send_to(heap, clock, 1, a, b, raw, tx_hash, tape, wire, resp, req, nb, st);
             sent = took_a || took_b;
             lifecycle.after_send(rec, sent, ms);
         }
@@ -642,7 +716,7 @@ fn core[&c, &k, &i, &q, &oa, &ob, &l, &hd, &t, &r, &w, &rq, &f, &x, &s, &g, &e, 
 }
 
 // Opens the evidence log, locks it, verifies it whole and read-only, recovers a torn tail (the signer's rule, docs/design.md section 14.3), and runs `core`.
-fn with_evidence[&c, &k, &i, &q, &oa, &ob, &t, &r, &w, &rq, &f, &x, &s, &g, &e, &y, &th, &cd](fs: &c Fs("/var/lib/cancho-executor"), clock: &k Clock, io: &!i Io, heap: &!q Heap, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), tape: &!t [int], resp: &!r [byte], wire: &!w [byte], req: &!rq [byte], ints: &!f [int], bytes_: &!x [byte], config: &g [int], env: &e [byte], raw: &y [byte], tx_hash: &th [byte], calldata: &cd [byte], st: &!s [int]) -> [fs_read("/var/lib/cancho-executor"), fs_write("/var/lib/cancho-executor"), file_read, file_write, heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, io_write] int {
+fn with_evidence[&c, &k, &i, &q, &oa, &ob, &t, &r, &w, &rq, &f, &x, &s, &g, &e, &y, &th, &cd, &nbx](fs: &c Fs("/var/lib/cancho-executor"), clock: &k Clock, io: &!i Io, heap: &!q Heap, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), tape: &!t [int], resp: &!r [byte], wire: &!w [byte], req: &!rq [byte], ints: &!f [int], bytes_: &!x [byte], config: &g [int], env: &e [byte], raw: &y [byte], tx_hash: &th [byte], calldata: &cd [byte], st: &!s [int], nb: &!nbx [byte]) -> [fs_read("/var/lib/cancho-executor"), fs_write("/var/lib/cancho-executor"), file_read, file_write, heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, io_write, conn_read, conn_write] int {
     var status = 2;
     region r {
         let window = alloc_slice[r](max_log_len() + 4096, byte_of(0));
@@ -709,7 +783,7 @@ fn with_evidence[&c, &k, &i, &q, &oa, &ob, &t, &r, &w, &rq, &f, &x, &s, &g, &e, 
                                 Opened::Ok(rd) => {
                                     var lg = log.attach(w0, rd, rec.1, rec.2, rec.3, rec.4, max_log_len());
                                     borrow mut lg as &!l in {
-                                        status = core(fs, clock, io, heap, a, b, l, head, tape, resp, wire, req, ints, bytes_, config, env, raw, tx_hash, calldata, st);
+                                        status = core(fs, clock, io, heap, a, b, l, head, tape, resp, wire, req, ints, bytes_, config, env, raw, tx_hash, calldata, st, nb);
                                     }
                                     log.close(lg);
                                 }
@@ -724,8 +798,74 @@ fn with_evidence[&c, &k, &i, &q, &oa, &ob, &t, &r, &w, &rq, &f, &x, &s, &g, &e, 
     return status;
 }
 
+// The request path of provider `which` (an optional file `target_a` or `target_b`, one line of at most 255 bytes: `/` and then letters, digits and `/._~%-`) into `nb`, its length in `nb[nb_target_len() + which]`. 0, or -333.
+// A provider whose RPC key is in its path keeps it in this file, so the executor holds that credential (design 21.2 D8): read-only access to a provider, never a key that signs.
+fn read_target[&c, &n](fs: &c Fs("/var/lib/cancho-executor"), which: int, nb: &!n [byte]) -> [fs_read("/var/lib/cancho-executor"), file_read] int {
+    var path = "/var/lib/cancho-executor/target_a";
+    if which == 1 {
+        path = "/var/lib/cancho-executor/target_b";
+    }
+    let at = nb_target() + 256 * which;
+    let got = read_small(fs, path, nb[at..at + 256]);
+    if got == -1 {
+        nb[nb_target_len() + which] = byte_of(0);
+        return 0;
+    }
+    var end = got;
+    if end > 0 && int_of(nb[at + end - 1]) == 10 {
+        end = end - 1;
+    }
+    if got < 0 || end < 1 || end > 255 || int_of(nb[at]) != 47 {
+        return -333;
+    }
+    var i = 0;
+    while i < end {
+        let c = int_of(nb[at + i]);
+        if !(c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 47 || c == 46 || c == 95 || c == 126 || c == 37 || c == 45) {
+            return -333;
+        }
+        i = i + 1;
+    }
+    nb[nb_target_len() + which] = byte_of(end);
+    return 0;
+}
+
+// The network area (design 21.2): each provider's path, and, if one is `https`, the tick's entropy and the PEM roots. 0, -333 (a bad `target_*`) or -339 (no roots, or no entropy).
+fn fill_net[&c, &u, &n](fs: &c Fs("/var/lib/cancho-executor"), ur: &u Fs("/dev/urandom"), nb: &!n [byte]) -> [fs_read("/var/lib/cancho-executor"), fs_read("/dev/urandom"), file_read] int {
+    var code = read_target(fs, 0, nb);
+    if code == 0 {
+        code = read_target(fs, 1, nb);
+    }
+    if code != 0 {
+        return code;
+    }
+    if secure_a() == 1 || secure_b() == 1 {
+        region g {
+            let e = alloc_slice[g](32, byte_of(0));
+            if fs_read(ur, "/dev/urandom", e) != 32 {
+                return -339;
+            }
+            var i = 0;
+            while i < 32 {
+                nb[nb_seed() + i] = e[i];
+                i = i + 1;
+            }
+        }
+        let rl = read_small(fs, "/var/lib/cancho-executor/roots.pem", nb[nb_roots()..nb_roots() + nb_roots_max()]);
+        if rl < 1 {
+            return -339;
+        }
+        var q = 0;
+        while q < 4 {
+            nb[nb_roots_len() + q] = byte_of(rl >> 8 * (3 - q) & 255);
+            q = q + 1;
+        }
+    }
+    return 0;
+}
+
 // Reads the job (the configuration, the envelope and the signed transaction), checks that what is to be sent is what was authorised, and goes on.
-fn with_job[&c, &k, &i, &q, &oa, &ob, &t, &r, &w, &rq, &f, &x, &s](fs: &c Fs("/var/lib/cancho-executor"), clock: &k Clock, io: &!i Io, heap: &!q Heap, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), tape: &!t [int], resp: &!r [byte], wire: &!w [byte], req: &!rq [byte], ints: &!f [int], bytes_: &!x [byte], st: &!s [int]) -> [fs_read("/var/lib/cancho-executor"), fs_write("/var/lib/cancho-executor"), file_read, file_write, heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, io_write] int {
+fn with_job[&c, &ur, &k, &i, &q, &oa, &ob, &t, &r, &w, &rq, &f, &x, &s, &nbx](fs: &c Fs("/var/lib/cancho-executor"), ur: &ur Fs("/dev/urandom"), clock: &k Clock, io: &!i Io, heap: &!q Heap, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), tape: &!t [int], resp: &!r [byte], wire: &!w [byte], req: &!rq [byte], ints: &!f [int], bytes_: &!x [byte], st: &!s [int], nb: &!nbx [byte]) -> [fs_read("/var/lib/cancho-executor"), fs_read("/dev/urandom"), fs_write("/var/lib/cancho-executor"), file_read, file_write, heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, io_write, conn_read, conn_write] int {
     var status = 2;
     region r {
         let config = alloc_slice[r](4, 0);
@@ -756,7 +896,11 @@ fn with_job[&c, &k, &i, &q, &oa, &ob, &t, &r, &w, &rq, &f, &x, &s](fs: &c Fs("/v
         if keccak.hash256(st, raw[0..rn], tx_hash) != 0 || erc20.transfer_calldata(env[145..165], env[165..197], calldata) < 0 {
             return refuse(io, -334);
         }
-        status = with_evidence(fs, clock, io, heap, a, b, tape, resp, wire, req, ints, bytes_, config, env[0..en], raw[0..rn], tx_hash, calldata, st);
+        let netcode = fill_net(fs, ur, nb);
+        if netcode != 0 {
+            return refuse(io, netcode);
+        }
+        status = with_evidence(fs, clock, io, heap, a, b, tape, resp, wire, req, ints, bytes_, config, env[0..en], raw[0..rn], tx_hash, calldata, st, nb);
     }
     return status;
 }
@@ -772,7 +916,7 @@ fn main(world: World) -> [] int {
     var status = 2;
     var console = io;
     var pool = heap;
-    let dir = narrow(fs, "/var/lib/cancho-executor");
+    let (dir, urandom) = narrow(fs, "/var/lib/cancho-executor", "/dev/urandom");
     let (pa, pb) = narrow(out, "127.0.0.1:18545", "127.0.0.1:18546");
     borrow mut pool as &!hp in {
         let tape = box_slice(hp, 3 * 70000, 0);
@@ -781,6 +925,7 @@ fn main(world: World) -> [] int {
         let req = box_slice(hp, 9000, byte_of(0));
         let ints = box_slice(hp, 16, 0);
         let bytes_ = box_slice(hp, 128, byte_of(0));
+        let nbox = box_slice(hp, nb_len(), byte_of(0));
         let st = box_slice(hp, keccak.state_len(), 0);
         borrow mut tape as &!t1 in {
             borrow mut resp as &!r1 in {
@@ -789,12 +934,16 @@ fn main(world: World) -> [] int {
                         borrow mut ints as &!f1 in {
                             borrow mut bytes_ as &!x1 in {
                                 borrow mut st as &!s1 in {
-                                    borrow dir as &c1 in {
-                                        borrow clock as &k1 in {
-                                            borrow pa as &a1 in {
-                                                borrow pb as &b1 in {
-                                                    borrow mut console as &!i1 in {
-                                                        status = with_job(c1, k1, i1, hp, a1, b1, contents(t1), contents(r1), contents(w1), contents(q1), contents(f1), contents(x1), contents(s1));
+                                    borrow mut nbox as &!n1 in {
+                                        borrow urandom as &u1 in {
+                                            borrow dir as &c1 in {
+                                                borrow clock as &k1 in {
+                                                    borrow pa as &a1 in {
+                                                        borrow pb as &b1 in {
+                                                            borrow mut console as &!i1 in {
+                                                                status = with_job(c1, u1, k1, i1, hp, a1, b1, contents(t1), contents(r1), contents(w1), contents(q1), contents(f1), contents(x1), contents(s1), contents(n1));
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -807,6 +956,7 @@ fn main(world: World) -> [] int {
                 }
             }
         }
+        unbox_slice(hp, nbox);
         unbox_slice(hp, tape);
         unbox_slice(hp, resp);
         unbox_slice(hp, wire);
@@ -817,6 +967,7 @@ fn main(world: World) -> [] int {
     }
     release(pool);
     release(dir);
+    release(urandom);
     release(pa);
     release(pb);
     release(clock);

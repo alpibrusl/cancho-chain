@@ -44,6 +44,10 @@ pub fn refused_clock() -> [] int {
     return -338;
 }
 
+pub fn refused_tls_roots() -> [] int {
+    return -339;
+}
+
 pub fn refusal_tag(code: int) -> [] &static [byte] {
     if code == -330 {
         return "executor-locked";
@@ -71,6 +75,9 @@ pub fn refusal_tag(code: int) -> [] &static [byte] {
     }
     if code == -338 {
         return "executor-clock";
+    }
+    if code == -339 {
+        return "executor-tls-roots";
     }
     return "executor-unknown";
 }
@@ -102,6 +109,9 @@ pub fn repair(code: int) -> [] &static [byte] {
     }
     if code == -338 {
         return "the clock could not be read";
+    }
+    if code == -339 {
+        return "an https provider needs trust roots: put at least one PEM certificate in roots.pem in the executor's directory";
     }
     return "refused";
 }
