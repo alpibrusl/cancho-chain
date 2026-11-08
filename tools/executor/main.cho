@@ -751,9 +751,14 @@ fn core[&c, &k, &i, &q, &oa, &ob, &l, &hd, &t, &r, &w, &rq, &f, &x, &s, &g, &e, 
                     q2 = q2 + 1;
                 }
             }
-            let r2 = trail.append(lg, head, scratch, "tx.state", parent[0..plen], body[0..blen], ms, max_log_len());
-            if blen < 0 || r2.0 != 0 || log.flush(lg) != 0 {
+            // The payload's length first: a negative one is a failed payload, and must not be used as the end of a slice.
+            if blen < 0 {
                 failure = -332;
+            } else {
+                let r2 = trail.append(lg, head, scratch, "tx.state", parent[0..plen], body[0..blen], ms, max_log_len());
+                if r2.0 != 0 || log.flush(lg) != 0 {
+                    failure = -332;
+                }
             }
         }
         if failure != 0 {
@@ -898,13 +903,13 @@ fn read_target[&c, &n](fs: &c Fs("/var/lib/cancho-executor"), which: int, nb: &!
         end = end - 1;
     }
     if got < 0 || end < 1 || end > 255 || int_of(nb[at]) != 47 {
-        return -333;
+        return -340;
     }
     var i = 0;
     while i < end {
         let c = int_of(nb[at + i]);
         if !(c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 47 || c == 46 || c == 95 || c == 126 || c == 37 || c == 45) {
-            return -333;
+            return -340;
         }
         i = i + 1;
     }
@@ -912,7 +917,24 @@ fn read_target[&c, &n](fs: &c Fs("/var/lib/cancho-executor"), which: int, nb: &!
     return 0;
 }
 
-// The network area (design 21.2): each provider's path, and, if one is `https`, the tick's entropy and the PEM roots. 0, -333 (a bad `target_*`) or -339 (no roots, or no entropy).
+// Does the text hold a PEM certificate's first line?
+fn has_pem[&t](text: &t [byte]) -> [] bool {
+    let lit = "-----BEGIN CERTIFICATE-----";
+    var i = 0;
+    while i + len(lit) <= len(text) {
+        var k = 0;
+        while k < len(lit) && int_of(text[i + k]) == int_of(lit[k]) {
+            k = k + 1;
+        }
+        if k == len(lit) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// The network area (design 21.2): each provider's path, and, if one is `https`, the tick's entropy and the PEM roots. 0, -340 (a bad `target_*`) or -339 (no roots, or no entropy).
 fn fill_net[&c, &u, &n](fs: &c Fs("/var/lib/cancho-executor"), ur: &u Fs("/dev/urandom"), nb: &!n [byte]) -> [fs_read("/var/lib/cancho-executor"), fs_read("/dev/urandom"), file_read] int {
     var code = read_target(fs, 0, nb);
     if code == 0 {
@@ -934,7 +956,7 @@ fn fill_net[&c, &u, &n](fs: &c Fs("/var/lib/cancho-executor"), ur: &u Fs("/dev/u
             }
         }
         let rl = read_small(fs, "/var/lib/cancho-executor/roots.pem", nb[nb_roots()..nb_roots() + nb_roots_max()]);
-        if rl < 1 {
+        if rl < 1 || !has_pem(nb[nb_roots()..nb_roots() + rl]) {
             return -339;
         }
         var q = 0;

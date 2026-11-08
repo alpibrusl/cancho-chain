@@ -48,6 +48,10 @@ pub fn refused_tls_roots() -> [] int {
     return -339;
 }
 
+pub fn refused_target() -> [] int {
+    return -340;
+}
+
 pub fn refusal_tag(code: int) -> [] &static [byte] {
     if code == -330 {
         return "executor-locked";
@@ -79,6 +83,9 @@ pub fn refusal_tag(code: int) -> [] &static [byte] {
     if code == -339 {
         return "executor-tls-roots";
     }
+    if code == -340 {
+        return "executor-target";
+    }
     return "executor-unknown";
 }
 
@@ -90,7 +97,7 @@ pub fn repair(code: int) -> [] &static [byte] {
         return "the evidence log does not verify; nothing is done until a person has looked at it";
     }
     if code == -332 {
-        return "the evidence could not be written; nothing was changed; check the disk and retry";
+        return "the evidence could not be written and the state was not kept; if this tick sent the transaction it was sent and is not recorded: check the disk and run the tick again, which will find the transaction pending and will not send it twice";
     }
     if code == -333 {
         return "config must be exactly chain=, k=, drop_ms= and settle_ms=, one to a line, in that order";
@@ -110,8 +117,11 @@ pub fn repair(code: int) -> [] &static [byte] {
     if code == -338 {
         return "the clock could not be read";
     }
+    if code == -340 {
+        return "target_a and target_b, if present, are one line: a / and then letters, digits and the characters . _ ~ % - and /, at most 255 bytes";
+    }
     if code == -339 {
-        return "an https provider needs trust roots: put at least one PEM certificate in roots.pem in the executor's directory";
+        return "an https provider needs trust roots and entropy: put at least one PEM certificate in roots.pem in the executor's directory, and make sure /dev/urandom can be read";
     }
     return "refused";
 }
@@ -223,7 +233,7 @@ fn put_decimal[&o](out: &!o [byte], at: int, v: int) -> [] int {
 // The evidence event's payload (docs/design.md section 18.3), `{"envelope":"<id hex>","tx":"<hash hex>","state":"<name>","block":<n>}`, into `out` (at least 200 bytes): its length, or -332.
 // `id` and `tx` are 32 bytes each; `state` is a lifecycle state (1 to 9); `block` is 0 or more.
 pub fn payload[&i, &h, &o](id: &i [byte], tx: &h [byte], state: int, block: int, out: &!o [byte]) -> [] int {
-    if len(id) != 32 || len(tx) != 32 || state < 1 || state > 9 || block < 0 || len(out) < 200 {
+    if len(id) != 32 || len(tx) != 32 || state < 1 || state > 9 || block < 0 || len(out) < 202 {
         return -332;
     }
     var at = put(out, 0, "{\"envelope\":\"");

@@ -260,7 +260,7 @@ def run_checks(sk, rng):
         sk.set_mode(mode)
         status, _, out = sk.post(good)
         check(f"a signer that {name}: 502 front-signer", (status, json.loads(out).get("rule")), (502, "chain.front-signer"))
-    for tag, want in (("signer-locked", 503), ("signer-ledger-write", 503), ("signer-ledger-corrupt", 503), ("signer-ledger-full", 503), ("signer-config", 503), ("signer-key", 503), ("signer-same-key", 503),
+    for tag, want in (("signer-locked", 503), ("signer-ledger-write", 503), ("signer-ledger-corrupt", 503), ("signer-ledger-full", 503), ("signer-config", 503), ("signer-key", 503), ("signer-same-key", 503), ("signer-sign", 503), ("signer-clock", 503),
                       ("signer-anchor-corrupt", 503), ("signer-anchor-missing", 503), ("signer-anchor-short", 503), ("signer-anchor-mismatch", 503), ("signer-anchor-behind", 503), ("signer-anchor-write", 503),
                       ("signer-witness-missing", 503), ("signer-witness-short", 503), ("signer-witness-mismatch", 503), ("signer-witness-behind", 503),
                       ("envelope-expired", 422), ("signer-request", 422), ("envelope-replayed", 422)):
@@ -385,10 +385,18 @@ def run_checks(sk, rng):
     [t.start() for t in ts]
     [t.join() for t in ts]
     check("six clients at once: all 200 with one signature, one ledger entry", (sorted(r[0] for r in results), len({json.loads(r[2])["signature"] for r in results}), len(cs.read_events(state.ledger()))), ([200] * 6, 1, 1))
+    # the front listens on the loopback address and on no other: it believes its X-Auth-Identity, so only the gateway on this host may reach it
+    listening = []
+    for l in open("/proc/net/tcp").read().splitlines()[1:]:
+        f = l.split()
+        if f[3] == "0A" and int(f[1].split(":")[1], 16) == sk.port:
+            a = bytes.fromhex(f[1].split(":")[0])[::-1]
+            listening.append(".".join(str(b) for b in a))
+    check("the front listens on 127.0.0.1 only, not on every interface", listening, ["127.0.0.1"])
     # (8) the authority of the front
     r = subprocess.run([cancho_path(), "authority", "--std", os.path.join(ROOT, "tools/front/main.cho"), *front_sources(None)], capture_output=True, text=True)
     perf = r.stdout.split("performs")[1].split("never touches")[0].split()
-    check("authority: performs exactly these (one directory)", sorted(perf), sorted(["child_signal", "clock", "conn_accept", "conn_read", "conn_write", f'exec("{FRONT_PATH}")', f'fs_read("{FRONT_DIR}")', f'fs_write("{FRONT_DIR}")', "file_read", "heap", f'net_in("{FRONT_PORT}")', "pipe_read", "pipe_write", "poll"]))
+    check("authority: performs exactly these (one directory)", sorted(perf), sorted(["child_signal", "clock", "conn_accept", "conn_read", "conn_write", f'exec("{FRONT_PATH}")', f'fs_read("{FRONT_DIR}")', f'fs_write("{FRONT_DIR}")', "file_read", "heap", f'net_in("127.0.0.1:{FRONT_PORT}")', "pipe_read", "pipe_write", "poll"]))
     check("authority: never touches the console, the command line, signals or foreign code", all(w in r.stdout.split("never touches")[1] for w in ("the console", "the command line", "signals", "foreign code")), True)
     check("authority: it is bounded (no UNBOUNDED line)", "UNBOUNDED" not in r.stdout, True)
 
@@ -494,6 +502,8 @@ MUTANTS = [
     ("unwell: signer-ledger-full", "bytes.equal(tag, \"signer-ledger-full\") ||", "bytes.equal(tag, \"signer-ledger-ful\") ||"),
     ("unwell: signer-config", "bytes.equal(tag, \"signer-config\") ||", "bytes.equal(tag, \"signer-confi\") ||"),
     ("unwell: signer-key", "bytes.equal(tag, \"signer-key\") ||", "bytes.equal(tag, \"signer-ke\") ||"),
+    ("unwell: signer-sign", "bytes.equal(tag, \"signer-sign\") ||", "bytes.equal(tag, \"signer-sig\") ||"),
+    ("unwell: signer-clock", "bytes.equal(tag, \"signer-clock\") ||", "bytes.equal(tag, \"signer-cloc\") ||"),
     ("unwell: signer-same-key", "bytes.equal(tag, \"signer-same-key\") ||", "bytes.equal(tag, \"signer-same-ke\") ||"),
     ("rule_of: the prefix", "let head = \"{\\\"ok\\\":false,\\\"rule\\\":\\\"chain.\";", "let head = \"{\\\"ok\\\":false,\\\"rule\\\":\\\"chai.\";"),
     ("refusal: the allow header", "keep, \"Allow: POST\\r\\n\");", "keep, \"\");"),
