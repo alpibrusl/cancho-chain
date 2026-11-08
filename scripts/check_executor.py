@@ -7,7 +7,7 @@
 The binary is built with a temporary directory and two test ports. The nodes are Python HTTP servers speaking JSON-RPC from one model of a chain (blocks with hashes, a mempool, an account's nonce), each of which can
 be made to forget, reorganise, lie, answer for another chain, hang, answer in chunks or with garbage, or be down; the transaction is built and signed by eth-account. The script drives the ticks and the chain between them.
 """
-import concurrent.futures, datetime, glob, http.server, json, os, random, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
+import concurrent.futures, datetime, glob, http.server, ipaddress, json, os, random, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
 from eth_account import Account
 from eth_utils import to_checksum_address
 
@@ -99,9 +99,14 @@ def make_pki(dirpath):
         return key, cert
 
     def leaf(issuer_key, issuer_cert, dns, before, after, self_signed=False):
+        """`dns` is a DNS name, or an IPv4 literal (then the certificate carries an iPAddress name and no DNS name)."""
         key = ec.generate_private_key(ec.SECP256R1())
+        try:
+            san = x509.IPAddress(ipaddress.ip_address(dns))
+        except ValueError:
+            san = x509.DNSName(dns)
         b = (x509.CertificateBuilder().subject_name(name(dns)).issuer_name(issuer_cert.subject if not self_signed else name(dns)).public_key(key.public_key()).serial_number(x509.random_serial_number())
-             .not_valid_before(before).not_valid_after(after).add_extension(x509.SubjectAlternativeName([x509.DNSName(dns)]), critical=False)
+             .not_valid_before(before).not_valid_after(after).add_extension(x509.SubjectAlternativeName([san]), critical=False)
              .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
              .add_extension(x509.KeyUsage(digital_signature=True, key_cert_sign=False, crl_sign=False, content_commitment=False, key_encipherment=False, data_encipherment=False, key_agreement=False, encipher_only=False, decipher_only=False), critical=True)
              .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False))
@@ -116,14 +121,15 @@ def make_pki(dirpath):
 
     ck, cc = ca("cancho test CA")
     ok_, oc = ca("another CA")
-    chains = {
-        "good": leaf(ck, cc, "localhost", now - day, now + 30 * day),
-        "wrong_name": leaf(ck, cc, "other.test", now - day, now + 30 * day),
-        "expired": leaf(ck, cc, "localhost", now - 30 * day, now - day),
-        "not_yet": leaf(ck, cc, "localhost", now + day, now + 30 * day),
-        "other_ca": leaf(ok_, oc, "localhost", now - day, now + 30 * day),
-        "self_signed": leaf(None, None, "localhost", now - day, now + 30 * day, self_signed=True),
-    }
+    chains = {}
+    # provider A is reached as "localhost" and B as "127.0.0.1", so each certificate is for the name its provider is built with (and "_ip" is B's)
+    for suffix, host, other in (("", "localhost", "other.test"), ("_ip", "127.0.0.1", "127.0.0.2")):
+        chains["good" + suffix] = leaf(ck, cc, host, now - day, now + 30 * day)
+        chains["wrong_name" + suffix] = leaf(ck, cc, other, now - day, now + 30 * day)
+        chains["expired" + suffix] = leaf(ck, cc, host, now - 30 * day, now - day)
+        chains["not_yet" + suffix] = leaf(ck, cc, host, now + day, now + 30 * day)
+        chains["other_ca" + suffix] = leaf(ok_, oc, host, now - day, now + 30 * day)
+        chains["self_signed" + suffix] = leaf(None, None, host, now - day, now + 30 * day, self_signed=True)
     ctxs = {}
     for k, (key, cert) in chains.items():
         cp, kp = os.path.join(dirpath, k + ".pem"), os.path.join(dirpath, k + ".key")
@@ -133,11 +139,12 @@ def make_pki(dirpath):
         c.minimum_version = ssl.TLSVersion.TLSv1_3
         c.load_cert_chain(cp, kp)
         ctxs[k] = c
-    c12 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    c12.minimum_version = ssl.TLSVersion.TLSv1_2
-    c12.maximum_version = ssl.TLSVersion.TLSv1_2
-    c12.load_cert_chain(os.path.join(dirpath, "good.pem"), os.path.join(dirpath, "good.key"))
-    ctxs["tls12"] = c12
+    for suffix in ("", "_ip"):
+        c12 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        c12.minimum_version = ssl.TLSVersion.TLSv1_2
+        c12.maximum_version = ssl.TLSVersion.TLSv1_2
+        c12.load_cert_chain(os.path.join(dirpath, "good" + suffix + ".pem"), os.path.join(dirpath, "good" + suffix + ".key"))
+        ctxs["tls12" + suffix] = c12
     return ctxs, pem(cc), pem(oc)
 
 
@@ -441,7 +448,7 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
         na.wrong_send = nb.wrong_send = False
         na.chain_id = nb.chain_id = case.tx.chain
         na.sends = nb.sends = na.requests = nb.requests = 0
-        na.ctx = nb.ctx = ctxs["good"] if mode == "tls" else None
+        na.ctx, nb.ctx = (ctxs["good"], ctxs["good_ip"]) if mode == "tls" else (None, None)
         job = Job(tmp, exe, case, chain, na, nb, roots)
         job.setup()
         return job, chain
@@ -457,7 +464,7 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
     for node, who in ((na, "A"), (nb, "B")):
         h = node.last_headers
         check(f"honest: the request to {who} is a POST of JSON, to the provider's host, with a length, and asks for the connection to close", (node.last_method, node.last_path, h.get("content-type"), h.get("connection"), int(h.get("content-length", "0")) > 0), ("POST", "/", "application/json", "close", True))
-        check(f"honest: the Host header to {who} is the provider's host", h.get("host"), "localhost" if mode == "tls" else "127.0.0.1")
+        check(f"honest: the Host header to {who} is the provider's host", h.get("host"), ("localhost" if node is na else "127.0.0.1") if mode == "tls" else "127.0.0.1")
     chain.mine()
     rc, j, out, _ = job.tick()
     check("honest: mined, the next tick says included", (ok(j), j["state"], j["action"]), (True, "included", "nothing"))
@@ -599,6 +606,13 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
         rc, j, out, took = job.tick()
         check(f"{who} hanging: the tick answers in about three seconds with no decision", (ok(j), j["agree"], 2.5 < took < 8), (True, False, True))
         node.fault = None
+    # a provider whose port is closed (connection refused, not a connection that is accepted and dropped): refused at once, not after the deadline
+    for node, who in ((na, "A"), (nb, "B")):
+        job, chain = fresh()
+        node.stop()
+        rc, j, out, took = job.tick()
+        check(f"{who} with its port closed: no decision, nothing is sent, and the tick does not wait for the deadline", (ok(j), j and j["agree"], j and j["state"], na.sends + nb.sends, took < 1.5), (True, False, "signed", 0, True))
+        node.start()
     # (8) a provider on another chain
     job, chain = fresh()
     nb.chain_id = job.case.tx.chain + 1
@@ -868,10 +882,13 @@ def run_tls_checks(exe, state, na, nb, ctxs, roots, other_roots, rng):
         na.wrong_send = nb.wrong_send = False
         na.chain_id = nb.chain_id = case.tx.chain
         na.sends = nb.sends = na.requests = nb.requests = 0
-        na.ctx = nb.ctx = ctxs["good"]
+        na.ctx, nb.ctx = ctxs["good"], ctxs["good_ip"]
         job = Job(state, exe, case, chain, na, nb, roots)
         job.setup()
         return job, chain
+
+    def tctx(node, key):
+        return ctxs[key] if node is na else ctxs[key + "_ip"]
 
     def unusable(name, setup):
         for node, who in ((na, "A"), (nb, "B")):
@@ -879,13 +896,16 @@ def run_tls_checks(exe, state, na, nb, ctxs, roots, other_roots, rng):
             setup(node)
             rc, j, out, took = job.tick()
             check(f"TLS, {name} ({who}): unusable, no decision, nothing is sent, the state is signed", (rc, (j or {}).get("ok"), (j or {}).get("agree"), (j or {}).get("state"), na.sends + nb.sends), (0, True, False, "signed", 0))
-            node.ctx = ctxs["good"]
+            node.ctx = tctx(node, "good")
             rc, j, *_ = job.tick()
             check(f"TLS, {name} ({who}): a good certificate again, it goes on", ((j or {}).get("agree"), (j or {}).get("state")), (True, "submitted"))
 
+    def tctx(node, key):
+        return ctxs[key] if node is na else ctxs[key + "_ip"]
+
     def serve(key):
         def f(node):
-            node.ctx = ctxs[key]
+            node.ctx = tctx(node, key)
         return f
     unusable("a certificate for another name", serve("wrong_name"))
     unusable("an expired certificate", serve("expired"))
@@ -894,7 +914,7 @@ def run_tls_checks(exe, state, na, nb, ctxs, roots, other_roots, rng):
     unusable("a self-signed certificate", serve("self_signed"))
     # The engine has a TLS 1.2 client (`packages/tls/client12.cho`), so a server that speaks only 1.2 is served; measured here, not claimed away (design 21.4 said "refused" before this was run).
     job, chain = fresh()
-    na.ctx = nb.ctx = ctxs["tls12"]
+    na.ctx, nb.ctx = ctxs["tls12"], ctxs["tls12_ip"]
     rc, j, *_ = job.tick()
     check("TLS, servers that speak TLS 1.2 only: the engine's 1.2 client is accepted by this executor", ((j or {}).get("ok"), (j or {}).get("agree"), (j or {}).get("state")), (True, True, "submitted"))
     # a server that accepts the connection and never answers the handshake: the 3,000 ms
@@ -924,6 +944,15 @@ def run_tls_checks(exe, state, na, nb, ctxs, roots, other_roots, rng):
     job.write("target_a", "/v3/abc-DEF_123.x~y%20\n")
     rc, j, out, _ = job.tick()
     check("TLS, target_a is the request path of provider A, and B's is /", ((j or {}).get("ok"), na.last_path, nb.last_path), (True, "/v3/abc-DEF_123.x~y%20", "/"))
+    check("TLS, a request to a provider with a path is still a JSON POST", (na.last_method, na.last_headers.get("content-type"), nb.last_headers.get("content-type")), ("POST", "application/json", "application/json"))
+    job, chain = fresh()
+    job.write("target_a", "/" + "a" * 254 + "\n")
+    rc, j, out, _ = job.tick()
+    check("TLS, a target path of 255 bytes is accepted and sent whole", ((j or {}).get("ok"), len(na.last_path or "")), (True, 255))
+    job, chain = fresh()
+    job.write("target_b", "/" + "a" * 255)
+    rc, j, out, _ = job.tick()
+    check("TLS, a target path of 256 bytes is refused: executor-config", (rc, (j or {}).get("rule")), (2, "chain.executor-config"))
     for name, text in (("not starting with a slash", "v3/abc\n"), ("with a space", "/v3/a b\n"), ("with a quote", "/v3/a\"b\n"), ("empty", "\n"), ("over 255 bytes", "/" + "a" * 256 + "\n"), ("with CRLF", "/v3/a\r\n"), ("with a brace", "/v3/a{\n"), ("with an at sign", "/v3/a@\n"), ("with a bracket", "/v3/a[\n"), ("with a backquote", "/v3/a`\n"),
                        ("with a colon", "/v3/a:\n"), ("with a question mark", "/v3/a?x=1\n"), ("with a hash", "/v3/a#\n"), ("with a backslash", "/v3/a\\b\n")):
         job, chain = fresh()
@@ -933,15 +962,23 @@ def run_tls_checks(exe, state, na, nb, ctxs, roots, other_roots, rng):
     # no two connections start the TLS engine's generator from the same bytes: the client randoms the nodes saw (the key log of the server's context) are all different, within a tick and across two
     keylog = os.path.join(state + "-keylog.txt")
     open(keylog, "w").close()
-    ctxs["good"].keylog_filename = keylog
     job, chain = fresh()
-    ctxs["good"].keylog_filename = keylog
+    ctxs["good"].keylog_filename = ctxs["good_ip"].keylog_filename = keylog
     seen_requests = 0
     for i in range(2):
         rc, j, *_ = job.tick()
         seen_requests = na.requests + nb.requests
     randoms = {l.split()[1] for l in open(keylog).read().splitlines() if len(l.split()) == 3}
     check("TLS, the client randoms of all the connections of two ticks are different (the engine is seeded afresh for each)", (len(randoms), seen_requests), (seen_requests, seen_requests))
+    # the authority of a build with these providers: the host and port of each, the entropy and the directory, and nothing wider
+    with tempfile.TemporaryDirectory() as t:
+        m = os.path.join(t, "main.cho")
+        open(m, "w").write(substitute(open(os.path.join(ROOT, "tools/executor/main.cho")).read(), CONST, na.port, nb.port, "localhost", "127.0.0.1", (1, 1)))
+        r = subprocess.run([os.environ.get("CANCHO", "cancho"), "authority", "--std", m, *sources(os.path.join(ROOT, "lib"))], capture_output=True, text=True)
+        perf = sorted(r.stdout.split("performs")[1].split("never touches")[0].split()) if "performs" in r.stdout else []
+        check("TLS, the authority of a build for localhost and 127.0.0.1 names those two addresses and nothing wider", perf,
+              sorted(["clock", "conn_read", "conn_write", "file_read", "file_write", 'fs_read("/dev/urandom")', f'fs_read("{CONST}")', f'fs_write("{CONST}")', "heap", "io_write", f'net_out("localhost:{na.port}")', f'net_out("127.0.0.1:{nb.port}")', "poll"]))
+        check("TLS, ... and it is bounded", "UNBOUNDED" not in r.stdout, True)
     # a provider that changes its certificate between two ticks is verified afresh at each
     job, chain = fresh()
     rc, j, *_ = job.tick()
@@ -1095,6 +1132,13 @@ MUTANTS = [
 
 # Mutants no input can tell from the original, each with the reason.
 EQUIVALENT = {
+    "a call that ran out of time is said so": "-341 and -344 both make the provider unusable (`call_one` answers -1 for any negative status); only the internal code differs",
+    "a wait is bounded": "the wait is the time left of the 3,000 ms, and the 100 ms cap only makes the loop turn more often; the deadline is the same either way",
+    "the TLS engine is on for an https provider": "one connection is one engine slot either way (`fio.open` sizes the engine at `slots` or 1), and `tls_on` only decides whether more are allocated",
+    "no roots is unusable": "a trust store with no root refuses every chain, so the handshake fails and the provider is unusable anyway; the early exit only saves the connection (a roots.pem that is garbage is checked)",
+    "the entropy is read": "the failing branch cannot be reached by the harness: /dev/urandom cannot be made unreadable for the process (untested, not argued away)",
+    "a target is not empty": "an empty target file has no byte 47 at its start, and the slash check refuses it with the same code",
+    "target: below the digits": "byte 47 is `/`, which the set already holds: the mutant admits nothing new",
     "a receipt without its transaction": "NOT PROVEN equivalent: for a transaction that is not mined, tx_block is 0, so the clause is the only one that rejects only a receipt in block 0 next to a pending transaction; a test that sends exactly that from both providers is refused by the unmutated and the mutated executor alike (the cause was not traced), so no input is known that this clause alone catches",
     "the evidence is written": "an append that failed is followed by a flush that fails too (nothing was staged), so the flush check alone refuses the tick; the same refusal is checked with /dev/full",
 }
@@ -1131,7 +1175,7 @@ def mutants(cancho):
             exe2 = os.path.join(d, "executor-tls")
             try:
                 build(cancho, libdir, main, state, pa, pb, exe)
-                build(cancho, libdir, main, state2, pa, pb, exe2, "localhost", "localhost", (1, 1))
+                build(cancho, libdir, main, state2, pa, pb, exe2, "localhost", "127.0.0.1", (1, 1))
             except SystemExit as e:
                 return name, "did not build: " + str(e)[:200]
             r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--exe", exe, "--state", state, "--exe2", exe2, "--state2", state2, "--ports", str(pa), str(pb), "--trailtool", TRAILTOOL[0]], capture_output=True, text=True, timeout=3000)
@@ -1140,8 +1184,10 @@ def mutants(cancho):
             shutil.rmtree(d, ignore_errors=True)
 
     survivors, broken = [], []
+    only = [n for n in os.environ.get("ONLY", "").split("|") if n]   # re-run some, by name, separated by |
+    work = [m for m in MUTANTS if not only or m[1] in only]
     with concurrent.futures.ThreadPoolExecutor(max_workers=int(os.environ.get("JOBS", "4"))) as pool:
-        for name, verdict in pool.map(one, MUTANTS):
+        for name, verdict in pool.map(one, work):
             if verdict == "SURVIVED":
                 survivors.append(name)
                 print("SURVIVED:", name, flush=True)
@@ -1149,7 +1195,7 @@ def mutants(cancho):
                 broken.append(name)
                 print(f"INVALID: {name}: {verdict}", flush=True)
     unexplained = [n for n in survivors if n not in EQUIVALENT]
-    print(f"mutants: {len(MUTANTS) - len(survivors) - len(broken)}/{len(MUTANTS)} killed, {len(survivors) - len(unexplained)} explained, {len(unexplained)} unexplained survivors, {len(broken)} invalid")
+    print(f"mutants: {len(work) - len(survivors) - len(broken)}/{len(work)} killed, {len(survivors) - len(unexplained)} explained, {len(unexplained)} unexplained survivors, {len(broken)} invalid")
     sys.exit(1 if unexplained or broken else 0)
 
 
@@ -1192,7 +1238,7 @@ def main():
                 state2 = os.path.join(tmp, "state-tls")
                 os.mkdir(state2)
                 exe2 = os.path.join(tmp, "executor-tls")
-                build(cancho, os.path.join(ROOT, "lib"), open(os.path.join(ROOT, "tools/executor/main.cho")).read(), state2, pa, pb, exe2, "localhost", "localhost", (1, 1))
+                build(cancho, os.path.join(ROOT, "lib"), open(os.path.join(ROOT, "tools/executor/main.cho")).read(), state2, pa, pb, exe2, "localhost", "127.0.0.1", (1, 1))
             run_checks(exe2, state2, na, nb, trailtool, cancho, random.Random(2468), "tls", ctxs, roots)
             run_tls_checks(exe2, state2, na, nb, ctxs, roots, other_roots, random.Random(1357))
         finally:
