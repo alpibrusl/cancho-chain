@@ -136,13 +136,14 @@ fn secure_b() -> [] int {
     return 0;
 }
 
-// Connected by name: the provider's `Out` is `net_out("<host>:<port>")` and nothing wider. The name is resolved by the C library (blocking, outside the deadline: design 21.2 D6).
+// Dialled by name: the provider's `Out` is `net_out("<host>:<port>")` and nothing wider. `tcp_connect_start` makes the socket non-blocking before it connects, so the TCP handshake is the poller's and
+// the 3,000 ms are its deadline (`docs/native-sockets.md` 10.6); only the name's lookup (`getaddrinfo`) is a blocking call, outside the deadline (design 21.2 D6).
 fn dial_a[&o](out: &o Out("127.0.0.1:18545")) -> [net_out("127.0.0.1:18545")] Dialed {
-    return tcp_connect(out, host_a(), 18545);
+    return tcp_connect_start(out, host_a(), 18545);
 }
 
 fn dial_b[&o](out: &o Out("127.0.0.1:18546")) -> [net_out("127.0.0.1:18546")] Dialed {
-    return tcp_connect(out, host_b(), 18546);
+    return tcp_connect_start(out, host_b(), 18546);
 }
 
 // The area of network facts a tick keeps in `nb` (design 21.2): the tick's entropy, a counter, each provider's request path, and the PEM roots.
@@ -179,7 +180,7 @@ fn nb_len() -> [] int {
 }
 
 fn limits() -> [] hc.Limits {
-    return hc.Limits { connect_ms: 3000, head_ms: 3000, body_ms: 3000, total_ms: 3000, expect_ms: 1000, idle_ms: 3000, lifetime_ms: 5000, idle_per_key: 1, max_requests: 1 };
+    return hc.Limits { connect_ms: 3000, head_ms: 3000, body_ms: 3000, total_ms: 3000, expect_ms: 1000, idle_ms: 3000, lifetime_ms: 5000, idle_per_key: 1, max_requests: 100 };
 }
 
 // Entropy for one connection: the tick's, hashed with a counter, so that no two connections of a tick (nor of two ticks) start the TLS engine's generator from the same bytes.
@@ -214,28 +215,25 @@ fn fresh_seed[&k, &n, &o](st: &!k [int], nb: &!n [byte], out: &!o [byte]) -> [] 
     return code;
 }
 
-// Ask provider `which` (0 or 1) with the JSON `body`: the answer's body is in `resp[0..info[1]]` (`info[0]` is 0). 0, or -341 (the provider cannot be reached, the handshake or the framing failed), -342 (a status other than 200),
-// -344 (an answer that is too long, or the 3,000 ms are over).
-fn ask[&h, &k, &oa, &ob, &b, &w, &r, &i, &n, &s](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), body: &b [byte], wire: &!w [byte], resp: &!r [byte], info: &!i [int], nb: &!n [byte], st: &!s [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] int {
-    var status = -341;
+// A provider's connection for the calls of one query (design 21.2 D6): the driver's loop, the HTTP client with one slot, and the upstream's number (-1 if the provider cannot be used: no roots, no entropy).
+// The connection is dialled by the first request and kept for the next ones, so a tick makes one handshake per provider for its queries, not one per call.
+enum Session {
+    Up(fio.Loop, hc.Client, int),
+    Down,
+}
+
+fn open_session[&h, &n, &s](heap: &!h Heap, which: int, nb: &!n [byte], st: &!s [int]) -> [heap] Session {
     var secure = secure_a() == 1;
     var host = host_a();
     var port = port_a();
-    var tlen = int_of(nb[nb_target_len()]);
-    var toff = nb_target();
     if which == 1 {
         secure = secure_b() == 1;
         host = host_b();
         port = port_b();
-        tlen = int_of(nb[nb_target_len() + 1]);
-        toff = nb_target() + 256;
     }
-    info[0] = 0;
-    info[1] = 0;
-    let started_at = clock_ms(clock);
     match fio.open(heap, 1, secure) {
         fio.Started::Failed(e) => {
-            status = -341;
+            return Session::Down;
         }
         fio.Started::Ok(l) => {
             var iov = l;
@@ -262,176 +260,215 @@ fn ask[&h, &k, &oa, &ob, &b, &w, &r, &i, &n, &s](heap: &!h Heap, clock: &k Clock
                     }
                 }
             }
-            if upstream >= 0 {
-                var client = hc.open(heap, 1, 65536, 16384, limits());
-                borrow mut client as &!cw in {
-                    let now0 = clock_ms(clock);
-                    var t = 0;
-                    if tlen > 0 {
-                        t = hc.request(cw, now0, upstream, "POST", nb[toff..toff + tlen], host, "Content-Type: application/json\r\n", len(body), hc.flag_close());
-                    } else {
-                        t = hc.request(cw, now0, upstream, "POST", "/", host, "Content-Type: application/json\r\n", len(body), hc.flag_close());
+            return Session::Up(iov, hc.open(heap, 1, 65536, 16384, limits()), upstream);
+        }
+    }
+}
+
+// The session ends: idle connections are told to close (with close_notify if TLS), and the loop and the client are given back.
+fn close_session[&h, &k](heap: &!h Heap, clock: &k Clock, iov0: fio.Loop, client0: hc.Client) -> [heap, clock, conn_write] int {
+    var iov = iov0;
+    var client = client0;
+    borrow mut client as &!cw in {
+        hc.close_idle(cw, clock_ms(clock));
+        var closing = true;
+        while closing {
+            match hc.poll(cw, clock_ms(clock)) {
+                hc.Event::Close(slot) => {
+                    borrow mut iov as &!ioh in {
+                        fio.shut(ioh, cw, slot, clock_ms(clock));
                     }
-                    if t > 0 {
-                        var sent = 0;
-                        var got = 0;
-                        var finished = false;
-                        var now = now0;
-                        var heard = false;
-                        while status == -341 && !finished && now - started_at < 3000 {
-                            if sent < len(body) {
-                                let m = hc.send_body(cw, t, body[sent..len(body)], now);
-                                if m > 0 {
-                                    sent = sent + m;
+                }
+                hc.Event::None => {
+                    closing = false;
+                }
+                _ => {
+                }
+            }
+        }
+    }
+    hc.close(heap, client);
+    fio.close(heap, iov);
+    return 0;
+}
+
+// Ask provider `which` (0 or 1) with the JSON `body` on the session's connection: the answer's body is in `resp[0..info[1]]` (`info[0]` is 0). The loop comes back with the status: 0, or -341 (the provider cannot be reached, the handshake
+// or the framing failed), -342 (a status other than 200), -344 (an answer that is too long, or the 3,000 ms are over).
+fn ask[&h, &k, &oa, &ob, &b, &w, &r, &i, &c, &n](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), body: &b [byte], wire: &!w [byte], resp: &!r [byte], info: &!i [int], iov0: fio.Loop, cw: &!c hc.Client, upstream: int, nb: &n [byte]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] (fio.Loop, int) {
+    var status = -341;
+    var iov = iov0;
+    var host = host_a();
+    var tlen = int_of(nb[nb_target_len()]);
+    var toff = nb_target();
+    if which == 1 {
+        host = host_b();
+        tlen = int_of(nb[nb_target_len() + 1]);
+        toff = nb_target() + 256;
+    }
+    info[0] = 0;
+    info[1] = 0;
+    let started_at = clock_ms(clock);
+    if upstream >= 0 {
+        let now0 = clock_ms(clock);
+        // What the last call left for the loop (a connection that cannot be reused is told to close, and its slot is free only after that): before a new request.
+        var pre = true;
+        while pre {
+            match hc.poll(cw, now0) {
+                hc.Event::Close(slot) => {
+                    borrow mut iov as &!ioh in {
+                        fio.shut(ioh, cw, slot, now0);
+                    }
+                }
+                hc.Event::None => {
+                    pre = false;
+                }
+                _ => {
+                }
+            }
+        }
+        var t = 0;
+        if tlen > 0 {
+            t = hc.request(cw, now0, upstream, "POST", nb[toff..toff + tlen], host, "Content-Type: application/json\r\n", len(body), 0);
+        } else {
+            t = hc.request(cw, now0, upstream, "POST", "/", host, "Content-Type: application/json\r\n", len(body), 0);
+        }
+        if t > 0 {
+            var sent = 0;
+            var got = 0;
+            var finished = false;
+            var now = now0;
+            while status == -341 && !finished && now - started_at < 3000 {
+                if sent < len(body) {
+                    let m = hc.send_body(cw, t, body[sent..len(body)], now);
+                    if m > 0 {
+                        sent = sent + m;
+                    }
+                }
+                var wait = 3000 - (now - started_at);
+                if wait > 100 {
+                    wait = 100;
+                }
+                // The first turn only asks the client for what it wants (the connection to dial): nothing is there to wait for yet.
+                if now == now0 {
+                    wait = 0;
+                }
+                borrow mut iov as &!ioh in {
+                    fio.step(ioh, cw, clock, wait);
+                }
+                now = clock_ms(clock);
+                var going = true;
+                while going {
+                    match hc.poll(cw, now) {
+                        hc.Event::None => {
+                            going = false;
+                        }
+                        hc.Event::Connect(slot) => {
+                            var dialled = false;
+                            if which == 0 {
+                                match dial_a(a) {
+                                    Dialed::Ok(c) => {
+                                        iov = fio.adopt(heap, iov, c, cw, slot, now);
+                                        dialled = true;
+                                    }
+                                    Dialed::Failed(e) => {
+                                    }
+                                }
+                            } else {
+                                match dial_b(b) {
+                                    Dialed::Ok(c) => {
+                                        iov = fio.adopt(heap, iov, c, cw, slot, now);
+                                        dialled = true;
+                                    }
+                                    Dialed::Failed(e) => {
+                                    }
                                 }
                             }
-                            var wait = 3000 - (now - started_at);
-                            if wait > 100 {
-                                wait = 100;
+                            if !dialled {
+                                hc.connect_failed(cw, slot, hc.kind_connect(), now);
                             }
-                            // The first turn only asks the client for what it wants (the connection to dial): nothing is there to wait for yet.
-                            if now == now0 {
-                                wait = 0;
-                            }
+                        }
+                        hc.Event::Close(slot) => {
                             borrow mut iov as &!ioh in {
-                                fio.step(ioh, cw, clock, wait);
+                                fio.shut(ioh, cw, slot, now);
                             }
-                            now = clock_ms(clock);
-                            var going = true;
-                            while going {
-                                match hc.poll(cw, now) {
-                                    hc.Event::None => {
-                                        going = false;
-                                    }
-                                    hc.Event::Connect(slot) => {
-                                        var dialled = false;
-                                        if which == 0 {
-                                            match dial_a(a) {
-                                                Dialed::Ok(c) => {
-                                                    iov = fio.adopt(heap, iov, c, cw, slot, now);
-                                                    dialled = true;
-                                                }
-                                                Dialed::Failed(e) => {
-                                                }
-                                            }
-                                        } else {
-                                            match dial_b(b) {
-                                                Dialed::Ok(c) => {
-                                                    iov = fio.adopt(heap, iov, c, cw, slot, now);
-                                                    dialled = true;
-                                                }
-                                                Dialed::Failed(e) => {
-                                                }
-                                            }
-                                        }
-                                        if !dialled {
-                                            hc.connect_failed(cw, slot, hc.kind_connect(), now);
-                                        }
-                                    }
-                                    hc.Event::Close(slot) => {
-                                        borrow mut iov as &!ioh in {
-                                            fio.shut(ioh, cw, slot, now);
-                                        }
-                                    }
-                                    hc.Event::Head(tk) => {
-                                        heard = true;
-                                        if hc.status(cw, tk) != 200 {
-                                            status = -342;
-                                            going = false;
-                                        }
-                                    }
-                                    hc.Event::Body(tk) => {
-                                        let avail = hc.avail(cw, tk);
-                                        if got + avail > len(resp) {
-                                            status = -344;
-                                            going = false;
-                                        } else {
-                                            let piece = hc.body(cw, tk);
-                                            var z = 0;
-                                            while z < avail {
-                                                resp[got + z] = piece[z];
-                                                z = z + 1;
-                                            }
-                                            got = got + avail;
-                                            hc.consume(cw, tk, avail, now);
-                                        }
-                                    }
-                                    hc.Event::Done(tk) => {
-                                        finished = true;
-                                        info[1] = got;
-                                        status = 0;
-                                        going = false;
-                                    }
-                                    hc.Event::Failed(tk) => {
-                                        status = -341;
-                                        finished = true;
-                                        going = false;
-                                    }
-                                    hc.Event::Continue(tk) => {
-                                    }
+                        }
+                        hc.Event::Head(tk) => {
+                            if hc.status(cw, tk) != 200 {
+                                status = -342;
+                                going = false;
+                            }
+                        }
+                        hc.Event::Body(tk) => {
+                            let avail = hc.avail(cw, tk);
+                            if got + avail > len(resp) {
+                                status = -344;
+                                going = false;
+                            } else {
+                                let piece = hc.body(cw, tk);
+                                var z = 0;
+                                while z < avail {
+                                    resp[got + z] = piece[z];
+                                    z = z + 1;
                                 }
+                                got = got + avail;
+                                hc.consume(cw, tk, avail, now);
                             }
-                            hc.tick(cw, now);
                         }
-                        if status == -341 && !finished && now - started_at >= 3000 {
-                            status = -344;
+                        hc.Event::Done(tk) => {
+                            finished = true;
+                            info[1] = got;
+                            status = 0;
+                            going = false;
                         }
-                        if heard && status == -341 {
+                        hc.Event::Failed(tk) => {
                             status = -341;
+                            finished = true;
+                            going = false;
                         }
-                    }
-                    hc.close_idle(cw, clock_ms(clock));
-                    var closing = true;
-                    while closing {
-                        match hc.poll(cw, clock_ms(clock)) {
-                            hc.Event::Close(slot) => {
-                                borrow mut iov as &!ioh in {
-                                    fio.shut(ioh, cw, slot, clock_ms(clock));
-                                }
-                            }
-                            hc.Event::None => {
-                                closing = false;
-                            }
-                            _ => {
-                            }
+                        hc.Event::Continue(tk) => {
                         }
                     }
                 }
-                hc.close(heap, client);
+                hc.tick(cw, now);
             }
-            fio.close(heap, iov);
+            if status == -341 && !finished && now - started_at >= 3000 {
+                status = -344;
+            }
         }
     }
-    return status;
+    return (iov, status);
 }
 
 // The state a tick works with, in one record so that the functions below do not carry twenty arguments: `ints` and `bytes` hold the facts of each provider (§18.2 step 5), `tape`, `resp`, `wire` and `req` are the buffers.
 //   ints, provider p at 8 * p: [0] usable  [1] kind (0 not found, 1 pending, 2 mined)  [2] status_ok  [3] block  [4] latest nonce  [5] tip  [6] chain id wrong  [7] unused
 //   bytes, provider p at 64 * p: [0..32] the block hash  [32..64] the hash now at that height
-fn call_one[&h, &k, &oa, &ob, &t, &q, &w, &r, &i, &j, &nbx, &stx](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), id: int, request_len: int, req: &q [byte], wire: &!w [byte], resp: &!r [byte], hi: &!i [int], tape: &!t [int], ri: &!j [int], nb: &!nbx [byte], st: &!stx [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] int {
-    let status = ask(heap, clock, which, a, b, req[0..request_len], wire, resp, hi, nb, st);
+fn call_one[&h, &k, &oa, &ob, &t, &q, &w, &r, &i, &j, &c, &nbx](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), id: int, request_len: int, req: &q [byte], wire: &!w [byte], resp: &!r [byte], hi: &!i [int], tape: &!t [int], ri: &!j [int], nb: &nbx [byte], iov0: fio.Loop, cw: &!c hc.Client, upstream: int) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] (fio.Loop, int) {
+    let (iov, status) = ask(heap, clock, which, a, b, req[0..request_len], wire, resp, hi, iov0, cw, upstream, nb);
     if status < 0 {
-        return -1;
+        return (iov, -1);
     }
     let kind = rpc.response(resp[hi[0]..hi[0] + hi[1]], tape, id, ri);
     if kind != 0 {
-        return -1;
+        return (iov, -1);
     }
-    return ri[0];
+    return (iov, ri[0]);
 }
 
-fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &stx](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), chain: int, nonce: int, wallet: &wa [byte], token: &tk [byte], calldata: &cd [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte], ints: &!f [int], bytes_: &!x [byte], nb: &!nbx [byte], st: &!stx [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] int {
+fn query_calls[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &c](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), chain: int, nonce: int, wallet: &wa [byte], token: &tk [byte], calldata: &cd [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte], ints: &!f [int], bytes_: &!x [byte], nb: &nbx [byte], iov0: fio.Loop, cw: &!c hc.Client, upstream: int) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] fio.Loop {
     let off = 8 * which;
     let boff = 64 * which;
     ints[off] = 0;
     ints[off + 6] = 0;
     var done = 0;
+    var iov = iov0;
     region g {
         let hi = alloc_slice[g](2, 0);
         let ri = alloc_slice[g](4, 0);
         // 1. the chain id: a provider for another chain is not unusable, it is refused.
         var n = rpc.req_chain_id(1, req);
-        var node = call_one(heap, clock, which, a, b, 1, n, req, wire, resp, hi, tape, ri, nb, st);
+        let (iv1, nd1) = call_one(heap, clock, which, a, b, 1, n, req, wire, resp, hi, tape, ri, nb, iov, cw, upstream);
+        iov = iv1;
+        var node = nd1;
         if node < 0 {
             done = 1;
         } else {
@@ -446,7 +483,9 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &st
         // 2. the account's latest nonce, 3. the tip.
         if done == 0 {
             n = rpc.req_nonce(2, wallet, false, req);
-            node = call_one(heap, clock, which, a, b, 2, n, req, wire, resp, hi, tape, ri, nb, st);
+            let (iv2, nd2) = call_one(heap, clock, which, a, b, 2, n, req, wire, resp, hi, tape, ri, nb, iov, cw, upstream);
+            iov = iv2;
+            node = nd2;
             let v = rpc.quantity(resp[hi[0]..hi[0] + hi[1]], tape, node);
             if node < 0 || v < 0 {
                 done = 1;
@@ -456,7 +495,9 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &st
         }
         if done == 0 {
             n = rpc.req_block_number(3, req);
-            node = call_one(heap, clock, which, a, b, 3, n, req, wire, resp, hi, tape, ri, nb, st);
+            let (iv3, nd3) = call_one(heap, clock, which, a, b, 3, n, req, wire, resp, hi, tape, ri, nb, iov, cw, upstream);
+            iov = iv3;
+            node = nd3;
             let v = rpc.quantity(resp[hi[0]..hi[0] + hi[1]], tape, node);
             if node < 0 || v < 0 {
                 done = 1;
@@ -469,7 +510,9 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &st
         var tx_block = 0;
         if done == 0 {
             n = rpc.req_tx(4, tx_hash, req);
-            node = call_one(heap, clock, which, a, b, 4, n, req, wire, resp, hi, tape, ri, nb, st);
+            let (iv4, nd4) = call_one(heap, clock, which, a, b, 4, n, req, wire, resp, hi, tape, ri, nb, iov, cw, upstream);
+            iov = iv4;
+            node = nd4;
             if node < 0 {
                 done = 1;
             } else {
@@ -484,7 +527,9 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &st
         var block = 0;
         if done == 0 {
             n = rpc.req_receipt(5, tx_hash, req);
-            node = call_one(heap, clock, which, a, b, 5, n, req, wire, resp, hi, tape, ri, nb, st);
+            let (iv5, nd5) = call_one(heap, clock, which, a, b, 5, n, req, wire, resp, hi, tape, ri, nb, iov, cw, upstream);
+            iov = iv5;
+            node = nd5;
             if node < 0 {
                 done = 1;
             } else {
@@ -504,7 +549,9 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &st
         // 6. If it is mined, the hash now at its height.
         if done == 0 && rc != 0 {
             n = rpc.req_block(6, block, req);
-            node = call_one(heap, clock, which, a, b, 6, n, req, wire, resp, hi, tape, ri, nb, st);
+            let (iv6, nd6) = call_one(heap, clock, which, a, b, 6, n, req, wire, resp, hi, tape, ri, nb, iov, cw, upstream);
+            iov = iv6;
+            node = nd6;
             if node < 0 || rpc.block_check(resp[hi[0]..hi[0] + hi[1]], tape, node, block, bytes_[boff + 32..boff + 64]) != 1 {
                 done = 1;
             }
@@ -524,6 +571,27 @@ fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &st
                 ints[off + 2] = 0;
                 ints[off + 3] = 0;
             }
+        }
+    }
+    return iov;
+}
+
+fn query[&h, &k, &oa, &ob, &t, &w, &r, &q, &f, &x, &wa, &tk, &cd, &th, &nbx, &stx](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), chain: int, nonce: int, wallet: &wa [byte], token: &tk [byte], calldata: &cd [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte], ints: &!f [int], bytes_: &!x [byte], nb: &!nbx [byte], st: &!stx [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] int {
+    let off = 8 * which;
+    ints[off] = 0;
+    ints[off + 6] = 0;
+    match open_session(heap, which, nb, st) {
+        Session::Down => {
+        }
+        Session::Up(l0, c0, upstream) => {
+            var iov = l0;
+            var client = c0;
+            if upstream >= 0 {
+                borrow mut client as &!cw in {
+                    iov = query_calls(heap, clock, which, a, b, chain, nonce, wallet, token, calldata, tx_hash, tape, wire, resp, req, ints, bytes_, nb, iov, cw, upstream);
+                }
+            }
+            close_session(heap, clock, iov, client);
         }
     }
     return 0;
@@ -555,16 +623,30 @@ fn agree[&f, &x](ints: &f [int], bytes_: &x [byte]) -> [] bool {
 // `raw` sent to provider `which`: did it take the transaction (its `result` is this transaction's hash)?
 fn send_to[&h, &k, &oa, &ob, &t, &w, &r, &q, &y, &th, &nbx, &stx](heap: &!h Heap, clock: &k Clock, which: int, a: &oa Out("127.0.0.1:18545"), b: &ob Out("127.0.0.1:18546"), raw: &y [byte], tx_hash: &th [byte], tape: &!t [int], wire: &!w [byte], resp: &!r [byte], req: &!q [byte], nb: &!nbx [byte], st: &!stx [int]) -> [heap, net_out("127.0.0.1:18545"), net_out("127.0.0.1:18546"), poll, clock, conn_read, conn_write] bool {
     var took = false;
-    region g {
-        let hi = alloc_slice[g](2, 0);
-        let ri = alloc_slice[g](4, 0);
-        let got = alloc_slice[g](32, byte_of(0));
-        let n = rpc.req_send_raw(7, raw, req);
-        if n > 0 {
-            let node = call_one(heap, clock, which, a, b, 7, n, req, wire, resp, hi, tape, ri, nb, st);
-            if node >= 0 && rpc.hash32(resp[hi[0]..hi[0] + hi[1]], tape, node, got) == 0 && bytes.equal(got, tx_hash) {
-                took = true;
+    match open_session(heap, which, nb, st) {
+        Session::Down => {
+        }
+        Session::Up(l0, c0, upstream) => {
+            var iov = l0;
+            var client = c0;
+            if upstream >= 0 {
+                borrow mut client as &!cw in {
+                    region g {
+                        let hi = alloc_slice[g](2, 0);
+                        let ri = alloc_slice[g](4, 0);
+                        let got = alloc_slice[g](32, byte_of(0));
+                        let n = rpc.req_send_raw(7, raw, req);
+                        if n > 0 {
+                            let (iv, node) = call_one(heap, clock, which, a, b, 7, n, req, wire, resp, hi, tape, ri, nb, iov, cw, upstream);
+                            iov = iv;
+                            if node >= 0 && rpc.hash32(resp[hi[0]..hi[0] + hi[1]], tape, node, got) == 0 && bytes.equal(got, tx_hash) {
+                                took = true;
+                            }
+                        }
+                    }
+                }
             }
+            close_session(heap, clock, iov, client);
         }
     }
     return took;
