@@ -913,9 +913,13 @@ def run_checks(exe, tmp, na, nb, trailtool, cancho, rng, mode="plain", ctxs=None
     na.chain_id = job.case.tx.chain
     # evidence that cannot be flushed
     job, chain = fresh()
-    os.symlink("/dev/null", os.path.join(job.dir, "evidence.seg"))
-    rc, j, *_ = job.tick()
-    check("evidence into /dev/null: refused with an evidence rule", ((j or {}).get("rule") or "").startswith("chain.executor-evidence"), True)
+    if sys.platform == "linux":
+        os.symlink("/dev/null", os.path.join(job.dir, "evidence.seg"))
+        rc, j, *_ = job.tick()
+        check("evidence into /dev/null: refused with an evidence rule", ((j or {}).get("rule") or "").startswith("chain.executor-evidence"), True)
+    else:
+        # macOS: fsync on /dev/null succeeds (measured 2026-11-09); this check runs on Linux only
+        print("SKIP evidence into /dev/null: needs a file whose fsync fails (Linux /dev/null)")
     # an envelope that is not what it says
     for i in range(3):
         job, chain = fresh()
