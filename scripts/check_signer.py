@@ -624,8 +624,12 @@ def run_checks(st, trailtool, cancho, rng, slow):
     rc, j, out = st.run(c)
     expect_refusal("a ledger that cannot be written (/dev/full)", (rc, j, out), "signer-ledger-write")
     st.reset(c)
-    os.symlink("/dev/null", st.ledger())
-    expect_refusal("a ledger whose flush fails (/dev/null: the write succeeds, fsync does not)", st.run(c), "signer-ledger-write")
+    if sys.platform == "linux":
+        os.symlink("/dev/null", st.ledger())
+        expect_refusal("a ledger whose flush fails (/dev/null: the write succeeds, fsync does not)", st.run(c), "signer-ledger-write")
+    else:
+        # macOS: fsync on /dev/null succeeds (measured 2026-11-09), so the file cannot make a flush fail; this check runs on Linux only
+        print("SKIP a ledger whose flush fails: needs a file whose fsync fails (Linux /dev/null)")
     st.reset(c)
     os.mkdir(st.ledger())
     expect_refusal("a ledger that is a directory", st.run(c), "signer-ledger-write")

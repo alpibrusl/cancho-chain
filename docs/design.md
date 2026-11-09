@@ -8,6 +8,8 @@ Status: **phase 0, research.** Written before the code it judges. Every claim ca
 
 A claim found false is corrected here, in place. Dates: measured on 2026-11-06, Linux x86-64, cancho at `162633a7` (`main`).
 
+**macOS (measured 2026-11-09, aarch64, cancho `162633a`, cargo-built).** `scripts/gate.sh` passes on macOS with two checks **skipped, not passed**: the signer's "ledger whose flush fails" and the executor's "evidence into /dev/null" need a file whose `fsync` fails, and `fsync` on `/dev/null` succeeds on macOS (Python: `os.fsync` on an fd of `/dev/null`). They print `SKIP` and run on Linux (CI). The front's listening-address check reads `/proc/net/tcp` on Linux and `lsof` elsewhere. Mutants aimed at the two skipped checks cannot be killed on macOS; run `--mutants` for the signer and executor on Linux.
+
 ## 1. What this is, and what it is not
 
 The claim to demonstrate, and the only one:

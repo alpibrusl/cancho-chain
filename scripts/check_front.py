@@ -386,12 +386,7 @@ def run_checks(sk, rng):
     [t.join() for t in ts]
     check("six clients at once: all 200 with one signature, one ledger entry", (sorted(r[0] for r in results), len({json.loads(r[2])["signature"] for r in results}), len(cs.read_events(state.ledger()))), ([200] * 6, 1, 1))
     # the front listens on the loopback address and on no other: it believes its X-Auth-Identity, so only the gateway on this host may reach it
-    listening = []
-    for l in open("/proc/net/tcp").read().splitlines()[1:]:
-        f = l.split()
-        if f[3] == "0A" and int(f[1].split(":")[1], 16) == sk.port:
-            a = bytes.fromhex(f[1].split(":")[0])[::-1]
-            listening.append(".".join(str(b) for b in a))
+    listening = listening_addresses(sk.port)
     check("the front listens on 127.0.0.1 only, not on every interface", listening, ["127.0.0.1"])
     # (8) the authority of the front
     r = subprocess.run([cancho_path(), "authority", "--std", os.path.join(ROOT, "tools/front/main.cho"), *front_sources(None)], capture_output=True, text=True)
@@ -399,6 +394,23 @@ def run_checks(sk, rng):
     check("authority: performs exactly these (one directory)", sorted(perf), sorted(["child_signal", "clock", "conn_accept", "conn_read", "conn_write", f'exec("{FRONT_PATH}")', f'fs_read("{FRONT_DIR}")', f'fs_write("{FRONT_DIR}")', "file_read", "heap", f'net_in("127.0.0.1:{FRONT_PORT}")', "pipe_read", "pipe_write", "poll"]))
     check("authority: never touches the console, the command line, signals or foreign code", all(w in r.stdout.split("never touches")[1] for w in ("the console", "the command line", "signals", "foreign code")), True)
     check("authority: it is bounded (no UNBOUNDED line)", "UNBOUNDED" not in r.stdout, True)
+
+
+def listening_addresses(port):
+    """The IPv4 addresses a process of this machine listens on for `port`: /proc/net/tcp on Linux, `lsof` elsewhere (macOS)."""
+    found = []
+    if sys.platform == "linux":
+        for l in open("/proc/net/tcp").read().splitlines()[1:]:
+            f = l.split()
+            if f[3] == "0A" and int(f[1].split(":")[1], 16) == port:
+                a = bytes.fromhex(f[1].split(":")[0])[::-1]
+                found.append(".".join(str(b) for b in a))
+        return found
+    out = subprocess.run(["lsof", "-nP", "-F", "n", f"-iTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True).stdout
+    for l in out.splitlines():
+        if l.startswith("n") and l.endswith(f":{port}"):
+            found.append(l[1:].rsplit(":", 1)[0].replace("*", "0.0.0.0"))
+    return found
 
 
 def cancho_path():
