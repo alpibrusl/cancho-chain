@@ -154,7 +154,7 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: .5rem 1.6rem; }
   <div class="flow">
 <svg viewBox="0 0 960 300" role="img" aria-labelledby="flowt flowd">
   <title id="flowt">The pipeline from an agent's intent to a settled transaction</title>
-  <desc id="flowd">An untrusted agent proposes an intent. The intent parser and the policy engine, both built, make a decision. The transaction encoders and the final validator, built, produce and check the exact bytes. The signing gateway, the RPC and lifecycle, and the evidence log are not built yet.</desc>
+  <desc id="flowd">An untrusted agent proposes an intent. The intent parser and the policy engine, both built, make a decision. The transaction encoders and the final validator, built, produce and check the exact bytes. The signer (behind a front and the gateway), the RPC reader and lifecycle, the executor and the evidence log are built too; nothing has moved value on a real chain.</desc>
   <rect class="zone" x="8" y="8" width="130" height="284" rx="14"/>
   <text x="73" y="30" text-anchor="middle" class="sm">untrusted</text>
   <rect class="box" x="22" y="110" width="102" height="64" rx="10"/>
@@ -169,13 +169,13 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: .5rem 1.6rem; }
   <rect class="hot" x="350" y="104" width="190" height="88" rx="10"/>
   <text x="445" y="132" text-anchor="middle">Transaction</text><text x="445" y="152" text-anchor="middle" class="sm">encoders, then a validator</text><text x="445" y="167" text-anchor="middle" class="sm">that decodes the exact bytes</text>
   <path class="ar" d="M540 148 H572"/>
-  <rect class="todo" x="572" y="110" width="150" height="76" rx="10"/>
-  <text x="647" y="138" text-anchor="middle">Signing gateway</text><text x="647" y="156" text-anchor="middle" class="sm">separate process, holds</text><text x="647" y="171" text-anchor="middle" class="sm">the key: not built</text>
+  <rect class="hot" x="572" y="110" width="150" height="76" rx="10"/>
+  <text x="647" y="138" text-anchor="middle">Signing gateway</text><text x="647" y="156" text-anchor="middle" class="sm">separate process, holds</text><text x="647" y="171" text-anchor="middle" class="sm">the key: built</text>
   <path class="ar" d="M722 148 H738 M738 78 V222 M738 78 H752 M738 222 H752"/>
-  <rect class="todo" x="752" y="36" width="196" height="84" rx="10"/>
-  <text x="850" y="64" text-anchor="middle">RPC, lifecycle</text><text x="850" y="82" text-anchor="middle" class="sm">submitted, included, final;</text><text x="850" y="97" text-anchor="middle" class="sm">reconcile before retry</text><text x="850" y="112" text-anchor="middle" class="sm">not built</text>
-  <rect class="todo" x="752" y="180" width="196" height="84" rx="10"/>
-  <text x="850" y="208" text-anchor="middle">Evidence</text><text x="850" y="226" text-anchor="middle" class="sm">append-only, tamper-evident;</text><text x="850" y="241" text-anchor="middle" class="sm">authorised, signed, settled</text><text x="850" y="256" text-anchor="middle" class="sm">kept apart: not built</text>
+  <rect class="hot" x="752" y="36" width="196" height="84" rx="10"/>
+  <text x="850" y="64" text-anchor="middle">RPC, lifecycle</text><text x="850" y="82" text-anchor="middle" class="sm">submitted, included, final;</text><text x="850" y="97" text-anchor="middle" class="sm">reconcile before retry</text><text x="850" y="112" text-anchor="middle" class="sm">built (mock + one real read)</text>
+  <rect class="hot" x="752" y="180" width="196" height="84" rx="10"/>
+  <text x="850" y="208" text-anchor="middle">Evidence</text><text x="850" y="226" text-anchor="middle" class="sm">append-only, tamper-evident;</text><text x="850" y="241" text-anchor="middle" class="sm">authorised, signed, settled</text><text x="850" y="256" text-anchor="middle" class="sm">kept apart: built</text>
 </svg>
     <p class="legend"><span><i></i>built and checked</span><span><i class="d"></i>designed, not built</span></p>
   </div>
